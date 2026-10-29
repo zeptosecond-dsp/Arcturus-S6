@@ -38,8 +38,8 @@ typedef struct {                                /* owned by the audio interrupt 
     int32_t lp1, lp2;                           /* the hi cut's two poles */
     int32_t last;                               /* the last output before the filter (the other's PM source) */
 } osc_st_t;
-static osc_par_t par[NO];
-static osc_st_t st[NO];
+static osc_par_t opar[NO];
+static osc_st_t ost[NO];
 static volatile uint32_t audio_us, audio_us_max;   /* how long a render took (the device only) */
 
 static void app_audio(int32_t *out, uint32_t n)
@@ -52,27 +52,27 @@ static void app_audio(int32_t *out, uint32_t n)
     uint32_t t0 = fm1_ticks();
 #endif
     for (o = 0; o < NO; o++) {                  /* once a block: the knobs into coefficients */
-        tab[o] = &WT[par[o].table % WT_TABLES][0][0];
-        inc[o] = par[o].inc;
-        posq_t[o] = (int32_t)par[o].pos * (int32_t)((WT_WAVES - 1u) * 256u) / 127;
-        pm[o] = par[o].mod;                     /* 1, 2: PM depth 0..127 */
-        fold_g[o] = 256 + (int32_t)par[o].mod * 14;          /* A, B: drive x1..x8, Q8 */
-        fold_t[o] = 4096 + (int32_t)par[o].thr * 224;        /* threshold, Q15 */
+        tab[o] = &WT[opar[o].table % WT_TABLES][0][0];
+        inc[o] = opar[o].inc;
+        posq_t[o] = (int32_t)opar[o].pos * (int32_t)((WT_WAVES - 1u) * 256u) / 127;
+        pm[o] = opar[o].mod;                     /* 1, 2: PM depth 0..127 */
+        fold_g[o] = 256 + (int32_t)opar[o].mod * 14;          /* A, B: drive x1..x8, Q8 */
+        fold_t[o] = 4096 + (int32_t)opar[o].thr * 224;        /* threshold, Q15 */
         fold_mk[o] = (int32_t)((32767u << 12) / (uint32_t)fold_t[o]);   /* make-up gain, Q12 (divisor >= 4096) */
-        hc[o] = par[o].hicut;
-        amp_t[o] = LUT_LEVEL[par[o].level & 127u];
-        pl[o] = LUT_PAN_L[par[o].pan & 127u];
-        pr[o] = LUT_PAN_R[par[o].pan & 127u];
+        hc[o] = opar[o].hicut;
+        amp_t[o] = LUT_LEVEL[opar[o].level & 127u];
+        pl[o] = LUT_PAN_L[opar[o].pan & 127u];
+        pr[o] = LUT_PAN_R[opar[o].pan & 127u];
     }
     for (o = 0; o < NO; o++) {                  /* the wave position glides a step per block */
-        int32_t d = posq_t[o] - st[o].posq;
-        st[o].posq += d > 192 ? 192 : d < -192 ? -192 : d;
+        int32_t d = posq_t[o] - ost[o].posq;
+        ost[o].posq += d > 192 ? 192 : d < -192 ? -192 : d;
     }
     for (i = 0; i < n; i++) {
         int32_t l = 0, r = 0;
-        int32_t prev0 = st[0].last, prev1 = st[1].last;      /* 1 and 2 hear each other one sample late */
+        int32_t prev0 = ost[0].last, prev1 = ost[1].last;      /* 1 and 2 hear each other one sample late */
         for (o = 0; o < NO; o++) {
-            osc_st_t *s = &st[o];
+            osc_st_t *s = &ost[o];
             uint32_t p, idx, w, frac;
             int32_t x, v;
             const int8_t *w0, *w1;
@@ -116,7 +116,7 @@ static void app_audio(int32_t *out, uint32_t n)
 
 /* ---- the patch (main loop) */
 typedef struct { uint8_t note; int8_t fine; uint8_t pos, mod, thr, hicut, level, pan; } patch_t;
-static patch_t pt[NO] = {                       /* a fixed drone to start from: C2, G2, C3, G3 */
+static patch_t opatch[NO] = {                       /* a fixed drone to start from: C2, G2, C3, G3 */
     {36,  0, 20, 20,  0,  90, 100,  40},
     {43,  4, 50, 10,  0,  80,  85,  88},
     {48, -3, 10, 30,  90,  70,  80,  20},
@@ -128,16 +128,16 @@ static const uint32_t INC_C9[12] = {            /* MIDI 120..131 (C9..B9); lower
 
 static void push(uint32_t o)                    /* the patch into what the interrupt reads */
 {
-    patch_t *q = &pt[o];
+    patch_t *q = &opatch[o];
     uint32_t inc = INC_C9[q->note % 12u] >> (10u - q->note / 12u);
-    par[o].inc = (uint32_t)(((uint64_t)inc * LUT_FINE[q->fine + 50]) >> 16);
-    par[o].table = 0;
-    par[o].pos = q->pos;
-    par[o].mod = q->mod;
-    par[o].thr = q->thr;
-    par[o].hicut = q->hicut;
-    par[o].level = q->level;
-    par[o].pan = q->pan;
+    opar[o].inc = (uint32_t)(((uint64_t)inc * LUT_FINE[q->fine + 50]) >> 16);
+    opar[o].table = 0;
+    opar[o].pos = q->pos;
+    opar[o].mod = q->mod;
+    opar[o].thr = q->thr;
+    opar[o].hicut = q->hicut;
+    opar[o].level = q->level;
+    opar[o].pan = q->pan;
 }
 
 static int32_t clampi(int32_t v, int32_t lo, int32_t hi) { return v < lo ? lo : v > hi ? hi : v; }
@@ -148,7 +148,7 @@ static int32_t clampi(int32_t v, int32_t lo, int32_t hi) { return v < lo ? lo : 
 #define WT_TXT RGB(220, 220, 220)
 static const char *const ONAME[NO] = {"1", "2", "A", "B"};
 
-static void fmt_note(char *s, uint32_t note)
+static void wt_fmt_note(char *s, uint32_t note)
 {
     static const char *const NAME[12] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
     const char *p = NAME[note % 12u];
@@ -157,7 +157,7 @@ static void fmt_note(char *s, uint32_t note)
     if (note >= 12u) s[i++] = (char)('0' + note / 12u - 1u);
     s[i] = 0;
 }
-static void fmt_int(char *s, int32_t v, int sign)
+static void wt_fmt_int(char *s, int32_t v, int sign)
 {
     char t[8];
     uint32_t i = 0, j = 0, u = (uint32_t)(v < 0 ? -v : v);
@@ -183,17 +183,17 @@ static void draw_grid(uint32_t sel, int shift)
         int hot = shift ? (r == 1u || r == 4u) : (r != 1u && r != 4u);   /* the rows the knobs reach now */
         cv_text(2, y, &FONT_S, ROW[r], hot ? WT_TXT : WT_DIM);
         for (o = 0; o < NO; o++) {
-            patch_t *q = &pt[o];
+            patch_t *q = &opatch[o];
             int32_t x = 64 + (int32_t)o * 44;
             switch (r) {
-            case 0: fmt_note(s, q->note); break;
-            case 1: fmt_int(s, q->fine, 1); break;
-            case 2: fmt_int(s, q->pos, 0); break;
-            case 3: fmt_int(s, q->mod, 0); break;
-            case 4: if (o < 2u) { s[0] = '-'; s[1] = 0; } else fmt_int(s, q->thr, 0); break;
-            case 5: if (q->hicut >= 127u) { s[0] = 'O'; s[1] = 'P'; s[2] = 'N'; s[3] = 0; } else fmt_int(s, q->hicut, 0); break;
-            case 6: fmt_int(s, q->level, 0); break;
-            default: fmt_int(s, (int32_t)q->pan - 64, 1); break;
+            case 0: wt_fmt_note(s, q->note); break;
+            case 1: wt_fmt_int(s, q->fine, 1); break;
+            case 2: wt_fmt_int(s, q->pos, 0); break;
+            case 3: wt_fmt_int(s, q->mod, 0); break;
+            case 4: if (o < 2u) { s[0] = '-'; s[1] = 0; } else wt_fmt_int(s, q->thr, 0); break;
+            case 5: if (q->hicut >= 127u) { s[0] = 'O'; s[1] = 'P'; s[2] = 'N'; s[3] = 0; } else wt_fmt_int(s, q->hicut, 0); break;
+            case 6: wt_fmt_int(s, q->level, 0); break;
+            default: wt_fmt_int(s, (int32_t)q->pan - 64, 1); break;
             }
             cv_text(x, y, &FONT_S, s, o == sel ? WT_TXT : WT_DIM);
         }
@@ -205,7 +205,7 @@ static void draw_cpu(uint32_t us)
 {
     char s[24] = "CPU ", n[8];
     uint32_t pct = us * 100u / 5805u, i = 4, j = 0;   /* 256 frames at 44.1 kHz = 5805 us */
-    fmt_int(n, (int32_t)pct, 0);
+    wt_fmt_int(n, (int32_t)pct, 0);
     while (n[j]) s[i++] = n[j++];
     s[i++] = '%';
     s[i] = 0;
@@ -236,7 +236,7 @@ static void app_main(void)
 
         if ((e = fm1_enc_take(ENC_SELECT)) != 0) { sel = (uint32_t)clampi((int32_t)sel + e, 0, NO - 1); dirty = 1; }
         {
-            patch_t *q = &pt[sel];
+            patch_t *q = &opatch[sel];
             int ch = 0;
             if ((e = fm1_enc_take(ENC_ALGORITHM)) != 0) {
                 if (shift) q->fine = (int8_t)clampi(q->fine + e, -50, 50);
@@ -264,7 +264,7 @@ static void app_main(void)
         for (k = 0; k < 27u; k++) {             /* the keys show the stack: the selected bright, the others dim */
             uint32_t note = base + k, on = 0, glow = 0;
             for (o = 0; o < NO; o++)
-                if (pt[o].note == note) { if (o == sel) on = 1; else glow = 1; }
+                if (opatch[o].note == note) { if (o == sel) on = 1; else glow = 1; }
             fm1_led_key(KEY_LED(k), on);
             if (!on) fm1_led_key_glow(KEY_LED(k), glow);
         }
