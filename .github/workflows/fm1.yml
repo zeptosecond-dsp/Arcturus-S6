@@ -1,0 +1,59 @@
+# Build the FM-1 firmware on GitHub: on every push to main, or by hand (Actions -> fm1 -> Run workflow).
+# The .fwsc to install is attached to the run as the artifact "fm1-wavetable-firmware".
+# The build's last lines are also posted as annotations (errors on a failure, notices on success),
+# so they can be read without opening the log.
+name: fm1
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  firmware:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Python packages
+        run: python3 -m pip install Pillow
+
+      - name: JieLi toolchain (pkgman.jieliapp.com)
+        run: sh tools/get_toolchain.sh
+
+      - name: JieLi AC79 SDK
+        run: |
+          for i in 1 2 3; do                     # (gitee.com drops a clone now and then: try again)
+            git clone --depth 1 --branch AC79NN_SDK_V1.2.1_2023-12-13 \
+                https://gitee.com/Jieli-Tech/fw-AC79_AIoT_SDK.git ~/fw-AC79_AIoT_SDK && break
+            rm -rf ~/fw-AC79_AIoT_SDK
+            sleep 20
+          done
+          test -d ~/fw-AC79_AIoT_SDK
+
+      - name: Build (FM-1)
+        shell: bash
+        run: |
+          set +e
+          sh build.sh > build.log 2>&1
+          status=$?
+          cat build.log
+          if [ $status -ne 0 ]; then
+            grep -iE "error|warning|exceeds|refer|>|fail" build.log | tail -25 | while IFS= read -r l; do echo "::error::$l"; done
+            tail -15 build.log | while IFS= read -r l; do echo "::error::$l"; done
+            exit $status
+          fi
+          tail -8 build.log | while IFS= read -r l; do echo "::notice::$l"; done
+
+      - name: Host tests (the app on the runner)
+        run: sh tests/run_host.sh && sh tests/run_host.sh tests/scripts/demo.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fm1-wavetable-firmware
+          path: build/dinghy.fwsc
+          if-no-files-found: error
