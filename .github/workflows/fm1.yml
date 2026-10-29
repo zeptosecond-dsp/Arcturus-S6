@@ -52,8 +52,14 @@ jobs:
       - name: Host tests (the app on the runner)
         run: sh tests/run_host.sh && sh tests/run_host.sh tests/scripts/demo.txt
 
+      - name: Package for Windows (the firmware, the installer and a double-click install.bat)
+        run: |
+          mkdir -p dist
+          cp build/dinghy.fwsc dist/fm1-wavetable.fwsc
+          cp tools/fm1_install.py tools/windows/install.bat dist/
+
       - uses: actions/upload-artifact@v4
         with:
           name: fm1-wavetable-firmware
-          path: build/dinghy.fwsc
+          path: dist/
           if-no-files-found: error
