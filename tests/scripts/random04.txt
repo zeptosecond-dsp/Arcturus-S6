@@ -1,0 +1,29 @@
+300 btn 9
+500 enc 0 -1
+700 shot
+1000 btn 3
+1200 btn 3
+1400 btn 6
+1700 shot
+1900 btn 9
+2200 btn 3
+2400 btn 3
+2600 btn 6
+2900 shot
+3100 btn 9
+3400 btn 3
+3600 btn 3
+3800 btn 6
+4100 shot
+4300 btn 9
+4600 btn 3
+4800 btn 3
+5000 btn 6
+5300 shot
+5500 btn 9
+5800 btn 3
+6000 btn 3
+6200 btn 6
+6500 shot
+6700 btn 9
+7000 end

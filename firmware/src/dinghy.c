@@ -259,6 +259,19 @@ static void push_fg(uint32_t k)
     fgp[k].mode = fgpatch[k].mode;
 }
 
+/* ---- a random patch: at power-on, and RANDOM on page P. Happy accidents, within reason: mostly consonant
+ * intervals with the odd stray one, slow cycling FGs, a handful of pins, small pitch depths, something audible */
+static uint32_t rnd_s = 0x9E3779B9u;
+static uint32_t rnd(uint32_t n)                 /* 0..n-1 (xorshift32) */
+{
+    rnd_s ^= rnd_s << 13;
+    rnd_s ^= rnd_s >> 17;
+    rnd_s ^= rnd_s << 5;
+    return n ? rnd_s % n : 0u;
+}
+static int32_t rnd_in(int32_t lo, int32_t hi) { return lo + (int32_t)rnd((uint32_t)(hi - lo + 1)); }
+static void randomize(void);
+
 /* ---- patches in flash: 16 slots, two to a 4 KB blob, each a fixed 2040 bytes with room to grow
  * (later versions add their parts in the spare room; a patch saved now still loads) */
 #define NPATCH 16u
@@ -272,7 +285,8 @@ typedef struct {
 } pdata_t;
 typedef union { pdata_t d; uint8_t raw[2040]; } pslot_t;
 static pslot_t pbank[2];                        /* one blob's worth */
-static uint8_t pused[NPATCH + 1];               /* slot 0 = the built-in default */
+static uint8_t pused[NPATCH + 2];               /* slot 0 = the built-in default, NPATCH + 1 = RANDOM */
+#define P_RANDOM (NPATCH + 1u)
 static patch_t def_osc[NO];
 static fgpatch_t def_fg[NFG];
 static int8_t def_dep[NSRC][NDST];
@@ -288,7 +302,7 @@ static int bank_read(uint32_t blob)
 static void patches_scan(void)
 {
     uint32_t b, j;
-    pused[0] = 1;
+    pused[0] = pused[P_RANDOM] = 1;
     for (b = 0; b < NPATCH / 2u; b++) {
         bank_read(b);
         for (j = 0; j < 2u; j++)
@@ -325,6 +339,7 @@ static int patch_load(uint32_t slot)            /* 0 = the default */
 {
     uint32_t o, k, d;
     const pdata_t *q;
+    if (slot == P_RANDOM) { randomize(); return 0; }
     if (slot == 0u) {
         for (o = 0; o < NO; o++) opatch[o] = def_osc[o];
         for (k = 0; k < NFG; k++) fgpatch[k] = def_fg[k];
@@ -365,6 +380,44 @@ static const uint8_t DLIST[] = {
     D_FG(3, 0), D_FG(3, 1), D_FG(4, 0), D_FG(4, 1), D_FG(5, 0), D_FG(5, 1),
 };
 #define NDLIST (sizeof DLIST / sizeof DLIST[0])
+
+static void randomize(void)
+{
+    static const uint8_t NICE[] = {0, 5, 7, 12, 12, 17, 19, 24};   /* unisons, fourths, fifths, octaves */
+    uint32_t o, k, d, n, loud = 0;
+    int32_t root = rnd_in(33, 48);              /* A1 .. C3 */
+    for (o = 0; o < NO; o++) {
+        patch_t *p = &opatch[o];
+        int32_t iv = o == 0u ? 0 : rnd(4) ? NICE[rnd(sizeof NICE)] : rnd_in(1, 24);   /* now and then, a stray */
+        p->note = (uint8_t)cl(root + iv, 12, 108);
+        p->fine = (int8_t)rnd_in(-12, 12);
+        p->pos = (uint8_t)rnd(128);
+        n = rnd(128);
+        p->mod = (uint8_t)((n * n) >> 7);       /* PM / fold: mostly gentle */
+        p->thr = (uint8_t)rnd(128);
+        p->hicut = (uint8_t)rnd_in(50, 127);
+        p->level = (uint8_t)rnd_in(55, 110);
+        p->pan = (uint8_t)rnd(128);
+        if (p->level >= 85u) loud = 1;
+    }
+    if (!loud) opatch[rnd(NO)].level = 100;
+    for (k = 0; k < NFG; k++) {
+        fgpatch_t *f = &fgpatch[k];
+        f->rise = (uint8_t)rnd_in(30, 115);
+        f->fall = (uint8_t)rnd_in(30, 115);
+        f->curve = (uint8_t)rnd(3);
+        f->mode = rnd(5) ? M_CYCLE : (uint8_t)(1u + rnd(2));   /* mostly cycling: nothing gates them yet */
+    }
+    for (k = 0; k < NSRC; k++)
+        for (d = 0; d < NDST; d++) depth[k][d] = 0;
+    for (n = (uint32_t)rnd_in(3, 8); n; n--) {  /* 3..8 pins */
+        uint32_t src = rnd(NSRC), dst = DLIST[rnd(NDLIST)];
+        int32_t a = dst < NO * NP && dst % NP == P_PITCH ? rnd_in(2, 8) : rnd_in(10, 45);
+        depth[src][dst] = (int8_t)(rnd(10) < 7u ? a : -a);
+    }
+    for (o = 0; o < NO; o++) push_osc(o);
+    for (k = 0; k < NFG; k++) push_fg(k);
+}
 
 /* ================================================================== the screen: green phosphor */
 #define PH_HI RGB(150, 255, 160)
@@ -645,22 +698,24 @@ static void draw_patch(uint32_t cur, uint32_t confirm, const char *msg)
 {
     uint32_t i;
     cv_begin(240, BODY_H, PH_BG);
-    for (i = 0; i <= NPATCH; i++) {
-        int32_t col = i == 0u ? 0 : (int32_t)((i - 1u) / 8u), row = i == 0u ? 0 : (int32_t)((i - 1u) % 8u) + 1;
+    for (i = 0; i <= P_RANDOM; i++) {
+        int32_t col = i == 0u ? 0 : i == P_RANDOM ? 1 : (int32_t)((i - 1u) / 8u);
+        int32_t row = i == 0u || i == P_RANDOM ? 0 : (int32_t)((i - 1u) % 8u) + 1;
         int32_t x = 4 + col * 120, y = 4 + row * 18;
         char s[24] = "";
-        if (i == 0u) { x = 4; s_cat(s, "DEFAULT (BUILT IN)"); }
+        if (i == 0u) s_cat(s, "DEFAULT");
+        else if (i == P_RANDOM) s_cat(s, "RANDOM");
         else {
             if (i < 10u) s_cat(s, "0");
             s_int(s, (int32_t)i, 0);
             s_cat(s, pused[i] ? "  SAVED" : "  --");
         }
-        if (i == cur) cv_rect(x - 4, y - 1, i == 0u ? 240 : 116, 18, PH_SEL);
+        if (i == cur) cv_rect(x - 4, y - 1, 116, 18, PH_SEL);
         cv_text(x, y, &FONT_S, s, i == cur ? PH_HI : pused[i] ? PH_MID : PH_LO);
     }
     if (msg && *msg) cv_text(4, 172, &FONT_S, msg, PH_HI);
     else if (confirm == PC_SAVE) cv_text(4, 172, &FONT_S, "SAVE AGAIN: OVERWRITE", PH_HI);
-    else if (confirm == PC_LOAD) cv_text(4, 172, &FONT_S, "SEL AGAIN: LOAD IT", PH_HI);
+    else if (confirm == PC_LOAD) cv_text(4, 172, &FONT_S, cur == P_RANDOM ? "SEL AGAIN: ROLL THE DICE" : "SEL AGAIN: LOAD IT", PH_HI);
     cv_text(4, 198, &FONT_S, "SEL: LOAD  SAVE: SAVE", PH_LO);
     cv_blit(0, BODY_Y);
 }
@@ -673,8 +728,6 @@ static void app_main(void)
     const char *pmsg = "";
     int32_t oct = -1, e, shift_drawn = -1;
 
-    for (o = 0; o < NO; o++) push_osc(o);
-    for (k = 0; k < NFG; k++) push_fg(k);
     depth[0][0 * NP + P_WAVE] = 40;             /* a few pins to hear the FGs at once */
     depth[1][2 * NP + P_MOD] = 30;
     depth[2][3 * NP + P_PAN] = 45;
@@ -685,6 +738,19 @@ static void app_main(void)
     for (k = 0; k < NSRC; k++)
         for (o = 0; o < NDST; o++) def_dep[k][o] = depth[k][o];
     patches_scan();
+    {                                           /* every power-on a new patch: a boot count in flash, the timing */
+        struct { uint32_t boots; } set = {0};
+        settings_load(&set, sizeof set);
+        set.boots++;
+        settings_save(&set, sizeof set);        /* (silent yet: nothing has been pushed to the engine) */
+        rnd_s ^= set.boots * 0x85EBCA6Bu;
+#ifndef DINGHY_HOST
+        rnd_s ^= fm1_ticks() * 0xC2B2AE35u;
+#endif
+        if (!rnd_s) rnd_s = 1u;
+        rnd(1); rnd(1);
+    }
+    randomize();
     lcd_fill(0, 0, 240, 240, PH_BG);
 
     for (;;) {
@@ -714,12 +780,15 @@ static void app_main(void)
         }
         if (page == PG_PATCH) {
             if ((e = fm1_enc_take(ENC_SELECT)) != 0) {
-                pcur = (uint32_t)cl((int32_t)pcur + e, 0, NPATCH);
+                static const uint8_t ORDER[NPATCH + 2] = {0, P_RANDOM, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+                uint32_t at = 0;
+                while (ORDER[at] != pcur) at++;
+                pcur = ORDER[cl((int32_t)at + e, 0, NPATCH + 1)];
                 pconf = PC_NONE; pmsg = ""; dirty = 1;
             }
             if (b & (1u << BTN_SAVE)) {
                 newpage = PG_PATCH;
-                if (pcur == 0u) { pmsg = "THE DEFAULT CANNOT CHANGE"; t_msg = fm1_ms; }
+                if (pcur == 0u || pcur == P_RANDOM) { pmsg = "CANNOT SAVE HERE"; t_msg = fm1_ms; }
                 else if (pconf == PC_SAVE || !pused[pcur]) {
                     pmsg = patch_save(pcur) == 0 ? "SAVED" : "SAVE FAILED";
                     pconf = PC_NONE; t_msg = fm1_ms;
@@ -729,7 +798,7 @@ static void app_main(void)
             if (b & (1u << BTN_SEL)) {
                 if (!pused[pcur]) { pmsg = "EMPTY SLOT"; t_msg = fm1_ms; }
                 else if (pconf == PC_LOAD) {
-                    pmsg = patch_load(pcur) == 0 ? "LOADED" : "LOAD FAILED";
+                    pmsg = patch_load(pcur) != 0 ? "LOAD FAILED" : pcur == P_RANDOM ? "ROLLED" : "LOADED";
                     pconf = PC_NONE; t_msg = fm1_ms;
                 } else pconf = PC_LOAD;
                 dirty = 1;
