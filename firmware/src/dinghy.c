@@ -19,6 +19,8 @@
  * Rules of the road (the chip has no FPU and no libgcc): integers only, no float, no 64-bit division.
  * tests/host.c runs this file on a computer: the screen as a PNG, the sound as a WAV. */
 #define APP_NAME "FM1 WAVETABLE"
+static void app_idle(void);
+#define LCD_IDLE app_idle                       /* while the screen's DMA runs: read MIDI (the clock) */
 #define CV_MAX (240u * 218u)                    /* the page body's canvas */
 #define STORE_MAGIC 0x54574D46u                 /* "FMWT": our own flash data, never another Dinghy fork's */
 #include "platform.c"
@@ -33,8 +35,15 @@ static int32_t cl(int32_t v, int32_t lo, int32_t hi) { return v < lo ? lo : v > 
 #define NSRC NFG                                /* mod sources (more to come: SSGs, the quad LFO) */
 #define SUB 32u                                 /* frames between modulation updates (1378 Hz) */
 enum { P_PITCH, P_WAVE, P_MOD, P_THR, P_HICUT, P_LEVEL, P_PAN, NP };
+#define NGG 4u                                  /* gate generators */
 #define D_FG(k, fall) (NO * NP + 2u * (k) + (fall))   /* an FG's rise / fall time as a destination */
-#define NDST (NO * NP + 2u * NFG)
+#define D_GG(g, l, duty) (NO * NP + 2u * NFG + 4u * (g) + 2u * (l) + (duty))   /* a gate LFO's rate / duty */
+#define NDST (NO * NP + 2u * NFG + 4u * NGG)
+/* gate sources: per generator A B AND NAND OR NOR XOR XNOR NOT, then the FGs' EOCs.
+ * gate destinations: the FGs' gates, then each generator's two logic inputs (pinned: they replace A, B there) */
+#define GS_PER 9u
+#define NGSRC (NGG * GS_PER + NFG)
+#define NGDST (NFG + 2u * NGG)
 
 typedef struct {                                /* the knobs, set by the main loop */
     volatile int32_t pitch_q8;                  /* note * 256 + fine, 1/256 semitone */
@@ -60,6 +69,17 @@ static volatile int32_t fg_out[NFG];            /* 0..32767 */
 static volatile uint8_t fg_stage_v[NFG], fg_eoc_v[NFG];
 
 static volatile int8_t depth[NSRC][NDST];       /* the mod matrix: 0 = no pin */
+
+enum { LM_FREE, LM_CLK };
+typedef struct { volatile uint8_t mode[2], rate[2], duty[2], notsrc; } gg_par_t;
+static gg_par_t ggp[NGG];
+static uint32_t gg_ph[NGG][2];
+static volatile uint16_t gg_bits[NGG];          /* bit i: the generator's source i now */
+static volatile uint32_t gmat[NGSRC];           /* the gate matrix: bit j = a pin to gate destination j */
+static volatile uint32_t clk_ticks = 0xFFFFFFFFu;   /* MIDI clocks (24 a quarter), counted by the main loop */
+static volatile uint8_t fg_manual[NFG];         /* PLAY held on the FG page */
+static volatile uint8_t fg_gate_v[NFG];
+static const uint16_t CLK_DIV[10] = {6, 8, 12, 16, 24, 48, 96, 192, 384, 768};   /* 1/16 .. 8 bars */
 static volatile uint32_t audio_us, audio_us_max;
 static volatile uint32_t mute;                  /* 1: fade the output out (a flash save stalls the sound) */
 static volatile int32_t out_gain = 32767;
@@ -90,10 +110,10 @@ static int32_t fg_shape(int32_t x, uint32_t curve)   /* position Q24 -> level 0.
 
 /* one FG, one step. The position runs 0..TOP and back; the level is shape(position), so a slope that turns
  * early (a gate let go mid-rise) turns from where it is, as a Serge slope does. */
-static void fg_step(uint32_t k, uint32_t rise_k, uint32_t fall_k)
+static void fg_step(uint32_t k, uint32_t rise_k, uint32_t fall_k, uint32_t g)
 {
     fg_st_t *s = &fgs[k];
-    uint32_t mode = fgp[k].mode, g = fgp[k].gate;
+    uint32_t mode = fgp[k].mode;
     if (s->eoc) s->eoc--;
     if (mode == M_CYCLE) {
         if (s->stage == FG_IDLE || s->stage == FG_HOLD) s->stage = FG_RISE;
@@ -114,6 +134,7 @@ static void fg_step(uint32_t k, uint32_t rise_k, uint32_t fall_k)
     }
     fg_out[k] = fg_shape(s->x, fgp[k].curve);
     fg_stage_v[k] = s->stage;
+    fg_gate_v[k] = (uint8_t)g;
     fg_eoc_v[k] = s->eoc != 0;
 }
 
@@ -138,9 +159,40 @@ static void render(int32_t *out)                /* SUB frames */
     for (d = 0; d < NDST; d++) acc[d] >>= 6;    /* -> knob units, Q8: a full source at depth 63 is ~ a full knob */
     (void)src;
 
-    for (k = 0; k < NFG; k++)
-        fg_step(k, (uint32_t)cl(fgp[k].rise + (acc[D_FG(k, 0)] >> 8), 0, 127),
-                   (uint32_t)cl(fgp[k].fall + (acc[D_FG(k, 1)] >> 8), 0, 127));
+    {   /* the gates: every source as it stood a step ago, so feedback loops never lock up */
+        uint32_t gdst = 0, gpin = 0, g, l, i;
+        for (i = 0; i < NGSRC; i++) {
+            uint32_t m = gmat[i], on;
+            if (!m) continue;
+            gpin |= m;
+            on = i < NGG * GS_PER ? (uint32_t)gg_bits[i / GS_PER] >> (i % GS_PER) & 1u : fg_eoc_v[i - NGG * GS_PER];
+            if (on) gdst |= m;
+        }
+        for (g = 0; g < NGG; g++) {
+            uint32_t lv[2], a, bb, bits;
+            for (l = 0; l < 2u; l++) {
+                uint32_t rk = (uint32_t)cl(ggp[g].rate[l] + (acc[D_GG(g, l, 0)] >> 8), 0, 127);
+                uint32_t dk = (uint32_t)cl(ggp[g].duty[l] + (acc[D_GG(g, l, 1)] >> 8), 0, 127);
+                uint32_t thr = (((dk * 250u) >> 7) + 3u) << 24, ph;   /* duty ~1 .. 98 % */
+                if (ggp[g].mode[l] == LM_CLK) {
+                    uint32_t div = CLK_DIV[(rk * 10u) >> 7], t = clk_ticks % div;
+                    ph = ((t * 65536u) / div) << 16;
+                } else
+                    ph = gg_ph[g][l] += LUT_GGINC[rk];
+                lv[l] = ph < thr;
+            }
+            a = gpin >> (NFG + 2u * g) & 1u ? gdst >> (NFG + 2u * g) & 1u : lv[0];
+            bb = gpin >> (NFG + 2u * g + 1u) & 1u ? gdst >> (NFG + 2u * g + 1u) & 1u : lv[1];
+            bits = lv[0] | lv[1] << 1 | (a & bb) << 2 | (~(a & bb) & 1u) << 3 | (a | bb) << 4 | (~(a | bb) & 1u) << 5
+                 | (a ^ bb) << 6 | (~(a ^ bb) & 1u) << 7;
+            bits |= (~(bits >> (ggp[g].notsrc & 7u)) & 1u) << 8;   /* NOT: one of the eight, inverted */
+            gg_bits[g] = (uint16_t)bits;
+        }
+        for (k = 0; k < NFG; k++)
+            fg_step(k, (uint32_t)cl(fgp[k].rise + (acc[D_FG(k, 0)] >> 8), 0, 127),
+                       (uint32_t)cl(fgp[k].fall + (acc[D_FG(k, 1)] >> 8), 0, 127),
+                       fg_manual[k] | (gdst >> k & 1u));
+    }
 
     for (o = 0; o < NO; o++) {
         const osc_par_t *p = &opar[o];
@@ -251,6 +303,29 @@ static void push_osc(uint32_t o)
     opar[o].level = q->level;
     opar[o].pan = q->pan;
 }
+typedef struct { uint8_t mode[2], rate[2], duty[2], notsrc, pad; } ggpatch_t;
+static const ggpatch_t GG_DEFAULT[NGG] = {      /* free running; 3's two LFOs a hair apart: a slowly turning XOR */
+    {{LM_FREE, LM_FREE}, {60, 72}, {64, 38}, 0, 0}, {{LM_FREE, LM_FREE}, {40, 52}, {12, 76}, 0, 0},
+    {{LM_FREE, LM_FREE}, {80, 81}, {64, 64}, 0, 0}, {{LM_FREE, LM_FREE}, {20, 33}, {6, 6}, 0, 0},
+};
+static ggpatch_t ggpatch[NGG];
+static uint32_t gpatch[NGSRC];                  /* the gate matrix as the patch keeps it */
+
+static void push_gg(uint32_t g)
+{
+    uint32_t l;
+    for (l = 0; l < 2u; l++) {
+        ggp[g].mode[l] = ggpatch[g].mode[l];
+        ggp[g].rate[l] = ggpatch[g].rate[l];
+        ggp[g].duty[l] = ggpatch[g].duty[l];
+    }
+    ggp[g].notsrc = ggpatch[g].notsrc;
+}
+static void push_gmat(void)
+{
+    uint32_t i;
+    for (i = 0; i < NGSRC; i++) gmat[i] = gpatch[i];
+}
 static void push_fg(uint32_t k)
 {
     fgp[k].rise = fgpatch[k].rise;
@@ -282,14 +357,18 @@ typedef struct {
     patch_t osc[NO];
     fgpatch_t fg[8];                            /* (room for 8 FGs) */
     int8_t dep[16][64];                         /* (room for 16 sources x 64 destinations) */
+    ggpatch_t gg[NGG];                          /* version 2 on */
+    uint32_t gm[48];                            /* (room for 48 gate sources x 32 destinations) */
 } pdata_t;
 typedef union { pdata_t d; uint8_t raw[2040]; } pslot_t;
+typedef char pdata_fits_its_slot[sizeof(pdata_t) <= 2040u ? 1 : -1];   /* (the build fails if it ever grows past) */
 static pslot_t pbank[2];                        /* one blob's worth */
 static uint8_t pused[NPATCH + 2];               /* slot 0 = the built-in default, NPATCH + 1 = RANDOM */
 #define P_RANDOM (NPATCH + 1u)
 static patch_t def_osc[NO];
 static fgpatch_t def_fg[NFG];
 static int8_t def_dep[NSRC][NDST];
+static uint32_t def_gm[NGSRC];
 
 static int bank_read(uint32_t blob)
 {
@@ -321,12 +400,14 @@ static int patch_save(uint32_t slot)            /* 1..16 */
         for (k = 0; k < sizeof pbank[j].raw; k++) raw[k] = 0;
     }
     q->tag = PATCH_TAG;
-    q->ver = 1;
+    q->ver = 2;
     q->used = 1;
     for (o = 0; o < NO; o++) q->osc[o] = opatch[o];
     for (k = 0; k < NFG; k++) q->fg[k] = fgpatch[k];
     for (k = 0; k < NSRC; k++)
         for (d = 0; d < NDST; d++) q->dep[k][d] = depth[k][d];
+    for (k = 0; k < NGG; k++) q->gg[k] = ggpatch[k];
+    for (k = 0; k < NGSRC; k++) q->gm[k] = gpatch[k];
     mute = 1;                                   /* fade out, save, fade in: the erase stops the sound ~50 ms */
     t0 = fm1_ms;
     while (out_gain > 0 && fm1_ms - t0 < 100u) platform_poll();
@@ -345,6 +426,8 @@ static int patch_load(uint32_t slot)            /* 0 = the default */
         for (k = 0; k < NFG; k++) fgpatch[k] = def_fg[k];
         for (k = 0; k < NSRC; k++)
             for (d = 0; d < NDST; d++) depth[k][d] = def_dep[k][d];
+        for (k = 0; k < NGG; k++) ggpatch[k] = GG_DEFAULT[k];
+        for (k = 0; k < NGSRC; k++) gpatch[k] = def_gm[k];
     } else {
         if (bank_read((slot - 1u) / 2u)) return -1;
         q = &pbank[(slot - 1u) & 1u].d;
@@ -353,6 +436,8 @@ static int patch_load(uint32_t slot)            /* 0 = the default */
         for (k = 0; k < NFG; k++) fgpatch[k] = q->fg[k];
         for (k = 0; k < NSRC; k++)
             for (d = 0; d < NDST; d++) depth[k][d] = q->dep[k][d];
+        for (k = 0; k < NGG; k++) ggpatch[k] = q->ver >= 2u ? q->gg[k] : GG_DEFAULT[k];   /* (version 1: none) */
+        for (k = 0; k < NGSRC; k++) gpatch[k] = q->ver >= 2u ? q->gm[k] & ((1u << NGDST) - 1u) : 0u;
     }
     for (o = 0; o < NO; o++) {                  /* (a damaged value never reaches the engine) */
         patch_t *p = &opatch[o];
@@ -367,6 +452,13 @@ static int patch_load(uint32_t slot)            /* 0 = the default */
     }
     for (k = 0; k < NSRC; k++)
         for (d = 0; d < NDST; d++) depth[k][d] = (int8_t)cl(depth[k][d], -64, 63);
+    for (k = 0; k < NGG; k++) {
+        ggpatch_t *g = &ggpatch[k];
+        for (d = 0; d < 2u; d++) { g->mode[d] = (uint8_t)(g->mode[d] ? LM_CLK : LM_FREE); g->rate[d] &= 127u; g->duty[d] &= 127u; }
+        g->notsrc &= 7u;
+        push_gg(k);
+    }
+    push_gmat();
     return 0;
 }
 
@@ -378,6 +470,8 @@ static const uint8_t DLIST[] = {
     3 * NP + P_PITCH, 3 * NP + P_WAVE, 3 * NP + P_MOD, 3 * NP + P_THR, 3 * NP + P_HICUT, 3 * NP + P_LEVEL, 3 * NP + P_PAN,
     D_FG(0, 0), D_FG(0, 1), D_FG(1, 0), D_FG(1, 1), D_FG(2, 0), D_FG(2, 1),
     D_FG(3, 0), D_FG(3, 1), D_FG(4, 0), D_FG(4, 1), D_FG(5, 0), D_FG(5, 1),
+    D_GG(0, 0, 0), D_GG(0, 0, 1), D_GG(0, 1, 0), D_GG(0, 1, 1), D_GG(1, 0, 0), D_GG(1, 0, 1), D_GG(1, 1, 0), D_GG(1, 1, 1),
+    D_GG(2, 0, 0), D_GG(2, 0, 1), D_GG(2, 1, 0), D_GG(2, 1, 1), D_GG(3, 0, 0), D_GG(3, 0, 1), D_GG(3, 1, 0), D_GG(3, 1, 1),
 };
 #define NDLIST (sizeof DLIST / sizeof DLIST[0])
 
@@ -406,8 +500,24 @@ static void randomize(void)
         f->rise = (uint8_t)rnd_in(30, 115);
         f->fall = (uint8_t)rnd_in(30, 115);
         f->curve = (uint8_t)rnd(3);
-        f->mode = rnd(5) ? M_CYCLE : (uint8_t)(1u + rnd(2));   /* mostly cycling: nothing gates them yet */
+        f->mode = rnd(5) < 3u ? M_CYCLE : (uint8_t)(1u + rnd(2));   /* some wait for a gate (below) */
     }
+    for (k = 0; k < NGG; k++) {
+        ggpatch_t *g = &ggpatch[k];
+        for (d = 0; d < 2u; d++) {
+            g->mode[d] = LM_FREE;               /* (no clock may be coming) */
+            g->rate[d] = (uint8_t)rnd_in(25, 100);
+            g->duty[d] = (uint8_t)rnd_in(6, 120);
+        }
+        g->notsrc = (uint8_t)rnd(8);
+    }
+    for (k = 0; k < NGSRC; k++) gpatch[k] = 0;
+    for (k = 0; k < NFG; k++)                   /* every FG that waits gets a gate */
+        if (fgpatch[k].mode != M_CYCLE) {
+            uint32_t src = rnd(5) ? rnd(NGG * GS_PER) : NGG * GS_PER + rnd(NFG);   /* now and then: an EOC */
+            gpatch[src] |= 1u << k;
+        }
+    if (!rnd(6)) gpatch[NGG * GS_PER + rnd(NFG)] |= 1u << (NFG + rnd(2u * NGG));   /* rarely: an EOC into the logic */
     for (k = 0; k < NSRC; k++)
         for (d = 0; d < NDST; d++) depth[k][d] = 0;
     for (n = (uint32_t)rnd_in(3, 8); n; n--) {  /* 3..8 pins */
@@ -417,6 +527,8 @@ static void randomize(void)
     }
     for (o = 0; o < NO; o++) push_osc(o);
     for (k = 0; k < NFG; k++) push_fg(k);
+    for (k = 0; k < NGG; k++) push_gg(k);
+    push_gmat();
 }
 
 /* ================================================================== the screen: green phosphor */
@@ -463,10 +575,16 @@ static void dst_name(char *s, uint32_t d)
         s_cat(s, ONAME[d / NP]);
         s_cat(s, " ");
         s_cat(s, d % NP == P_MOD && d / NP >= 2u ? "FOLD" : PN[d % NP]);
-    } else {
+    } else if (d < D_GG(0, 0, 0)) {
         s_cat(s, "FG");
         s_int(s, (int32_t)(d - NO * NP) / 2 + 1, 0);
         s_cat(s, (d - NO * NP) & 1u ? " FALL" : " RISE");
+    } else {
+        uint32_t g = d - D_GG(0, 0, 0);
+        s_cat(s, "G");
+        s_int(s, (int32_t)(g / 4u) + 1, 0);
+        s_cat(s, g & 2u ? "B" : "A");
+        s_cat(s, g & 1u ? " DUTY" : " RATE");
     }
 }
 
@@ -474,7 +592,7 @@ enum { PG_INDEX, PG_OSC, PG_WAVE, PG_FG, PG_SH, PG_GATE, PG_MOD, PG_GMAT, PG_GLO
 static const char *const PG_NUM[NPG] = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "P"};
 static const char *const PG_NAME[NPG] = {"INDEX", "OSCILLATORS", "WAVEFORM", "FUNCTION GEN", "S&H / QUAD",
                                          "GATE GEN", "MOD MATRIX", "GATE MATRIX", "GLOBAL", "PATCHES"};
-static const uint8_t PG_READY[NPG] = {1, 1, 1, 1, 0, 0, 1, 0, 0, 1};
+static const uint8_t PG_READY[NPG] = {1, 1, 1, 1, 0, 1, 1, 1, 0, 1};
 
 static void draw_header(uint32_t pg, uint32_t cpu_pct)
 {
@@ -613,6 +731,7 @@ static void draw_fg(uint32_t sel)
         s_cat(s, " ");
         s_cat(s, MD[q->mode]);
         cv_text(2, y, &FONT_S, s, k == sel ? PH_HI : PH_MID);
+        if (fg_gate_v[k]) cv_rect(172, y + 4, 4, 8, PH_HI);   /* the FG's gate is high */
         cv_rect(182, y + 4, 56, 8, PH_LO);
         cv_rect(183, y + 5, bar, 6, fg_eoc_v[k] ? PH_HI : PH_MID);
     }
@@ -693,6 +812,130 @@ static void draw_mod(uint32_t cs, uint32_t cr, uint32_t top)
     cv_blit(0, BODY_Y);
 }
 
+/* ---- the gate pages */
+#define HIST 196u                               /* the logic analyser: 196 samples, one every 10 ms */
+static uint16_t ghist[NGG][HIST];
+static uint32_t ghead;
+static const char *const GSN[GS_PER] = {"A", "B", "AND", "NAND", "OR", "NOR", "XOR", "XNOR", "NOT"};
+static const char *const CLKN[10] = {"1/16", "1/8T", "1/8", "1/4T", "1/4", "1/2", "1 BAR", "2 BAR", "4 BAR", "8 BAR"};
+
+static uint32_t gsrc_on(uint32_t i)
+{
+    return i < NGG * GS_PER ? (uint32_t)gg_bits[i / GS_PER] >> (i % GS_PER) & 1u : fg_eoc_v[i - NGG * GS_PER];
+}
+static void gsrc_name(char *s, uint32_t i)
+{
+    s[0] = 0;
+    if (i < NGG * GS_PER) { s_cat(s, "G"); s_int(s, (int32_t)(i / GS_PER) + 1, 0); s_cat(s, " "); s_cat(s, GSN[i % GS_PER]); }
+    else { s_cat(s, "FG"); s_int(s, (int32_t)(i - NGG * GS_PER) + 1, 0); s_cat(s, " EOC"); }
+}
+static void gdst_name(char *s, uint32_t j, int full)
+{
+    s[0] = 0;
+    if (j < NFG) { s_cat(s, full ? "FG" : "F"); s_int(s, (int32_t)j + 1, 0); if (full) s_cat(s, " GATE"); }
+    else {
+        uint32_t g = (j - NFG) / 2u, l = (j - NFG) & 1u;
+        if (full) { s_cat(s, "G"); s_int(s, (int32_t)g + 1, 0); s_cat(s, l ? " IN B" : " IN A"); }
+        else { s_int(s, (int32_t)g + 1, 0); s_cat(s, l ? "b" : "a"); }
+    }
+}
+
+static void draw_gg(uint32_t g)
+{
+    const ggpatch_t *q = &ggpatch[g];
+    uint32_t l, r, i;
+    char s[40] = "GEN ";
+    cv_begin(240, BODY_H, PH_BG);
+    s_int(s, (int32_t)g + 1, 0);
+    cv_text(4, 2, &FONT_S, s, PH_HI);
+    s[0] = 0;
+    s_cat(s, "NOT: ");
+    s_cat(s, GSN[q->notsrc & 7u]);
+    cv_text(236 - text_w(&FONT_S, s), 2, &FONT_S, s, PH_MID);
+    for (l = 0; l < 2u; l++) {
+        uint32_t pct = (((q->duty[l] * 250u) >> 7) + 3u) * 100u >> 8;
+        s[0] = 0;
+        s_cat(s, l ? "B " : "A ");
+        if (q->mode[l] == LM_CLK) { s_cat(s, "CLK  "); s_cat(s, CLKN[(q->rate[l] * 10u) >> 7]); }
+        else {
+            uint32_t hz = (uint32_t)(((uint64_t)LUT_GGINC[q->rate[l]] * 137813u) >> 32);   /* 1/100 Hz */
+            s_cat(s, "FREE ");
+            s_int(s, (int32_t)(hz / 100u), 0);
+            s_cat(s, hz % 100u < 10u ? ".0" : ".");
+            s_int(s, (int32_t)(hz % 100u), 0);
+            s_cat(s, "HZ");
+        }
+        cv_text(4, 22 + (int32_t)l * 18, &FONT_S, s, PH_MID);
+        s[0] = 0;
+        s_cat(s, "DUTY ");
+        s_int(s, (int32_t)pct, 0);
+        s_cat(s, "%");
+        cv_text(236 - text_w(&FONT_S, s), 22 + (int32_t)l * 18, &FONT_S, s, PH_MID);
+    }
+    cv_rect(0, 59, 240, 1, PH_LO);
+    for (r = 0; r < GS_PER; r++) {              /* the logic analyser: oldest on the left */
+        int32_t yb = 62 + (int32_t)r * 15, plv = -1;
+        uint32_t on = (uint32_t)gg_bits[g] >> r & 1u;
+        cv_text(2, yb - 1, &FONT_S, GSN[r], on ? PH_HI : PH_LO);
+        for (i = 0; i < HIST; i++) {
+            int32_t lv = ghist[g][(ghead + i) % HIST] >> r & 1u, x = 40 + (int32_t)i;
+            cv_pset(x, lv ? yb + 2 : yb + 11, i + 1u == HIST && on ? PH_HI : PH_MID);
+            if (plv >= 0 && lv != plv) cv_rect(x, yb + 2, 1, 10, PH_MID);
+            plv = lv;
+        }
+    }
+    cv_text(2, 200, &FONT_S, "K1/2 A K3/4 B SEL:MODE ALG:NOT", PH_LO);
+    cv_blit(0, BODY_Y);
+}
+
+#define GCOLS 8u
+static void draw_gmat(uint32_t cc, uint32_t cr, uint32_t top, uint32_t left)
+{
+    uint32_t c, r;
+    char s[40], n[20];
+    cv_begin(240, BODY_H, PH_BG);
+    for (c = left; c < left + GCOLS && c < NGDST; c++) {
+        gdst_name(n, c, 0);
+        cv_text(76 + (int32_t)(c - left) * 20, 2, &FONT_S, n, c == cc ? PH_HI : PH_LO);
+    }
+    cv_rect(0, 19, 240, 1, PH_LO);
+    for (r = 0; r < MROWS && top + r < NGSRC; r++) {
+        uint32_t i = top + r, on = gsrc_on(i);
+        int32_t y = 24 + (int32_t)r * 17;
+        gsrc_name(n, i);
+        if (i == cr) cv_rect(0, y - 1, 72, 17, PH_SEL);
+        cv_text(2, y, &FONT_S, n, i == cr ? PH_HI : PH_MID);
+        for (c = left; c < left + GCOLS && c < NGDST; c++) {
+            int32_t x = 80 + (int32_t)(c - left) * 20;
+            if (gpatch[i] >> c & 1u) cv_rect(x, y + 4, 9, 9, on ? PH_HI : PH_LO);   /* a pin, lit by its gate */
+            else cv_rect(x + 4, y + 8, 1, 1, PH_LO);
+            if (c == cc && i == cr) {
+                cv_rect(x - 4, y, 17, 1, PH_HI); cv_rect(x - 4, y + 16, 17, 1, PH_HI);
+                cv_rect(x - 4, y, 1, 17, PH_HI); cv_rect(x + 12, y, 1, 17, PH_HI);
+            }
+        }
+    }
+    gsrc_name(s, cr);
+    s_cat(s, " > ");
+    gdst_name(n, cc, 1);
+    s_cat(s, n);
+    s_cat(s, gpatch[cr] >> cc & 1u ? "  PIN" : "");
+    cv_text(4, 180, &FONT_S, s, PH_HI);
+    cv_text(4, 198, &FONT_S, "K1 DST K2 SRC PLAY PIN", PH_LO);
+    cv_blit(0, BODY_Y);
+}
+
+static uint32_t idle_ok;
+static void midi_poll(void)                     /* the clock, START: the clocked LFOs follow them */
+{
+    uint8_t st, d1, d2;
+    while (midi_get(&st, &d1, &d2)) {
+        if (st == 0xF8u) clk_ticks++;
+        else if (st == 0xFAu) clk_ticks = 0xFFFFFFFFu;   /* the next clock is beat 1 */
+    }
+}
+static void app_idle(void) { if (idle_ok) midi_poll(); }
+
 enum { PC_NONE, PC_SAVE, PC_LOAD };
 static void draw_patch(uint32_t cur, uint32_t confirm, const char *msg)
 {
@@ -726,7 +969,10 @@ static void app_main(void)
     uint32_t o, k, sel = 0, fsel = 0, prev = 0, page = PG_OSC, icur = PG_OSC, mcs = 0, mcr = 0, mtop = 0;
     uint32_t dirty = 1, hdr_dirty = 1, cpu_pct = 0, t_cpu = 0, t_live = 0, pcur = 1, pconf = PC_NONE, t_msg = 0;
     const char *pmsg = "";
+    uint32_t gsel = 0, gcc = 0, gcr = 0, gtop = 0, gleft = 0, t_hist = 0;
     int32_t oct = -1, e, shift_drawn = -1;
+
+    for (k = 0; k < NGG; k++) ggpatch[k] = GG_DEFAULT[k];
 
     depth[0][0 * NP + P_WAVE] = 40;             /* a few pins to hear the FGs at once */
     depth[1][2 * NP + P_MOD] = 30;
@@ -757,6 +1003,12 @@ static void app_main(void)
         uint32_t rel, b, base, newpage;
         int shift, play;
         platform_poll();
+        midi_poll();
+        if (fm1_ms - t_hist >= 10u) {           /* the logic analyser's next sample */
+            t_hist = fm1_ms;
+            for (k = 0; k < NGG; k++) ghist[k][ghead] = gg_bits[k];
+            ghead = (ghead + 1u) % HIST;
+        }
 
         b = fm1_input_edges(&rel);
         shift = (fm1_in.buttons >> BTN_SEL) & 1u;
@@ -808,7 +1060,7 @@ static void app_main(void)
         if (newpage != page) { page = newpage; pconf = PC_NONE; pmsg = ""; dirty = hdr_dirty = 1; }
 
         for (k = 0; k < NFG; k++)               /* PLAY held on the FG page: the selected FG's gate */
-            fgp[k].gate = (uint8_t)(page == PG_FG && k == fsel && play);
+            fg_manual[k] = (uint8_t)(page == PG_FG && k == fsel && play);
 
         if (page == PG_OSC || page == PG_WAVE) {
             patch_t *q;
@@ -859,6 +1111,37 @@ static void app_main(void)
             if ((e = fm1_enc_take(ENC_KNOB3)) != 0) { depth[mcs][d] = (int8_t)cl(depth[mcs][d] + e, -64, 63); dirty = 1; }
             if (b & (1u << BTN_PLAY)) { depth[mcs][d] = depth[mcs][d] ? 0 : 32; dirty = 1; }
         }
+        else if (page == PG_GATE) {
+            ggpatch_t *q;
+            int ch = 0;
+            uint32_t l;
+            if ((e = fm1_enc_take(ENC_SELECT)) != 0) { gsel = (uint32_t)cl((int32_t)gsel + e, 0, NGG - 1); dirty = 1; }
+            q = &ggpatch[gsel];
+            if ((e = fm1_enc_take(ENC_ALGORITHM)) != 0) { q->notsrc = (uint8_t)cl(q->notsrc + e, 0, 7); ch = 1; }
+            for (l = 0; l < 2u; l++) {
+                if ((e = fm1_enc_take(l ? ENC_KNOB3 : ENC_KNOB1)) != 0) {
+                    if (shift) q->mode[l] = e > 0 ? LM_CLK : LM_FREE;
+                    else q->rate[l] = (uint8_t)cl(q->rate[l] + e, 0, 127);
+                    ch = 1;
+                }
+                if ((e = fm1_enc_take(l ? ENC_KNOB4 : ENC_KNOB2)) != 0) { q->duty[l] = (uint8_t)cl(q->duty[l] + e, 0, 127); ch = 1; }
+            }
+            if (ch) { push_gg(gsel); dirty = 1; }
+        } else if (page == PG_GMAT) {
+            if ((e = fm1_enc_take(ENC_KNOB1)) != 0) {
+                gcc = (uint32_t)cl((int32_t)gcc + e, 0, NGDST - 1);
+                if (gcc < gleft) gleft = gcc;
+                if (gcc >= gleft + GCOLS) gleft = gcc - GCOLS + 1u;
+                dirty = 1;
+            }
+            if ((e = fm1_enc_take(ENC_KNOB2)) != 0 || (e = fm1_enc_take(ENC_SELECT)) != 0) {
+                gcr = (uint32_t)cl((int32_t)gcr + e, 0, NGSRC - 1);
+                if (gcr < gtop) gtop = gcr;
+                if (gcr >= gtop + MROWS) gtop = gcr - MROWS + 1u;
+                dirty = 1;
+            }
+            if (b & (1u << BTN_PLAY)) { gpatch[gcr] ^= 1u << gcc; push_gmat(); dirty = 1; }
+        }
         if (page != PG_OSC) prev = fm1_in.notes;
         for (k = 0; k < 7u; k++) (void)fm1_enc_take(k);   /* turns a page does not use go nowhere */
 
@@ -868,6 +1151,10 @@ static void app_main(void)
             if (page == PG_OSC) {
                 for (o = 0; o < NO; o++)
                     if (opatch[o].note == base + k) { if (o == sel) on = 1; else glow = 1; }
+            } else if (page == PG_GATE) {          /* the nine outputs, every third key */
+                on = k % 3u == 0u && (uint32_t)gg_bits[gsel] >> (k / 3u) & 1u;
+            } else if (page == PG_GMAT) {          /* the whole keyboard flashes with the source */
+                on = gsrc_on(gcr);
             } else if (page == PG_FG || page == PG_MOD) {
                 uint32_t pos = (uint32_t)(fg_out[page == PG_FG ? fsel : mcs] * 26) >> 15;
                 on = k == pos;
@@ -883,12 +1170,15 @@ static void app_main(void)
             fm1_led_key(BTN_SEL, shift || ((page == PG_INDEX || page == PG_PATCH) && blink));
             fm1_led_key(BTN_SAVE, page == PG_PATCH && (pconf == PC_SAVE || blink));
             fm1_led_key(BTN_PLAY, (page == PG_FG && (play || blink))   /* the FG page: the manual gate */
-                                  || (page == PG_MOD && (depth[mcs][DLIST[mcr]] || blink)));   /* solid: a pin here */
+                                  || (page == PG_MOD && (depth[mcs][DLIST[mcr]] || blink))   /* solid: a pin here */
+                                  || (page == PG_GMAT && (gpatch[gcr] >> gcc & 1u || blink)));
         }
         fm1_led_key(BTN_HOME, page == PG_INDEX);
         fm1_led_key(BTN_EDIT, page == PG_OSC || page == PG_WAVE);
         fm1_led_key(BTN_ENV, page == PG_FG);
         fm1_led_key(BTN_ARP, page == PG_MOD);
+        fm1_led_key(BTN_LFO, page == PG_GATE);
+        fm1_led_key(BTN_SEQ, page == PG_GMAT);
 
         if (fm1_ms - t_cpu > 500u) {            /* the worst render of the last half second, in the header */
             uint32_t us = audio_us_max, pct;
@@ -898,8 +1188,10 @@ static void app_main(void)
             if (us && pct != cpu_pct) { cpu_pct = pct; hdr_dirty = 1; }
         }
         if (page == PG_OSC && shift != shift_drawn) { shift_drawn = shift; dirty = 1; }
-        if ((page == PG_FG || page == PG_MOD || page == PG_WAVE) && fm1_ms - t_live > 50u) { t_live = fm1_ms; dirty = 1; }
+        if ((page == PG_FG || page == PG_MOD || page == PG_WAVE || page == PG_GATE || page == PG_GMAT)
+            && fm1_ms - t_live > 50u) { t_live = fm1_ms; dirty = 1; }
 
+        idle_ok = 1;                            /* MIDI in while the screen draws */
         if (hdr_dirty) { hdr_dirty = 0; draw_header(page, cpu_pct); }
         if (dirty) {
             dirty = 0;
@@ -910,8 +1202,11 @@ static void app_main(void)
             case PG_FG: draw_fg(fsel); break;
             case PG_MOD: draw_mod(mcs, mcr, mtop); break;
             case PG_PATCH: draw_patch(pcur, pconf, pmsg); break;
+            case PG_GATE: draw_gg(gsel); break;
+            case PG_GMAT: draw_gmat(gcc, gcr, gtop, gleft); break;
             default: draw_soon(page); break;
             }
         }
+        idle_ok = 0;
     }
 }

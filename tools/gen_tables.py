@@ -81,10 +81,13 @@ def write_luts(root):
     a = 4.0
     exp_s = [round((math.exp(a * i / 256) - 1) / (math.exp(a) - 1) * 32767) for i in range(257)]
     log_s = [32767 - exp_s[256 - i] for i in range(257)]
+    # gate generator LFOs, also every 32 frames: rate knob 0..127 -> 0.02 .. 30 Hz, as a step of a 32-bit phase
+    gginc = [round(0.02 * 1500 ** (k / 127) / sub * 2 ** 32) for k in range(128)]
     semifrac = [round(2 ** (f / 256 / 12) * 65536) for f in range(256)]   # 1/256 semitone -> ratio, Q16
     arr = lambda name, typ, v: f"static const {typ} {name}[{len(v)}] = {{" + ",".join(map(str, v)) + "};"
     lines = [
         arr("LUT_FGINC", "uint32_t", fginc),
+        arr("LUT_GGINC", "uint32_t", gginc),
         arr("LUT_SHAPE_EXP", "uint16_t", exp_s),
         arr("LUT_SHAPE_LOG", "uint16_t", log_s),
         arr("LUT_SEMIFRAC", "uint32_t", semifrac),

@@ -1,0 +1,27 @@
+# gates: DEFAULT, page 6, page 8, a pin G3 XOR -> FG5, a clocked LFO (btn 3 SEL 4 ENV 5 LFO 9 SAVE 10 ARP 11 SEQ 12 PLAY)
+200 btn 9
+300 enc 0 -2
+400 btn 3
+500 btn 3
+700 btn 5
+4000 shot
+4200 enc 0 2
+6500 shot
+6700 btn 11
+6900 enc 3 24
+7100 enc 2 4
+7300 btn 12
+9000 shot
+9200 btn 4
+9400 enc 0 4
+11000 shot
+11200 btn 5
+11400 enc 0 -2
+11600 btndown 3
+11800 enc 2 1
+12000 btnup 3
+12200 enc 2 20
+12400 midi 0xFA 0 0
+12400 clock 120 480
+16000 shot
+16500 end
