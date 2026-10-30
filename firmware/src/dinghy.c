@@ -646,12 +646,16 @@ static void app_main(void)
         }
         fm1_led_key(BTN_OCT_DOWN, oct < 0);
         fm1_led_key(BTN_OCT_UP, oct > 0);
-        fm1_led_key(BTN_SEL, shift);
+        {
+            uint32_t blink = (fm1_ms / 250u) & 1u;   /* a flashing button: "press me here" */
+            fm1_led_key(BTN_SEL, shift || (page == PG_INDEX && blink));
+            fm1_led_key(BTN_PLAY, (page == PG_FG && play)
+                                  || (page == PG_MOD && (depth[mcs][DLIST[mcr]] || blink)));   /* solid: a pin here */
+        }
         fm1_led_key(BTN_HOME, page == PG_INDEX);
         fm1_led_key(BTN_EDIT, page == PG_OSC || page == PG_WAVE);
         fm1_led_key(BTN_ENV, page == PG_FG);
         fm1_led_key(BTN_ARP, page == PG_MOD);
-        fm1_led_key(BTN_PLAY, (page == PG_FG && play) || (page == PG_MOD && depth[mcs][DLIST[mcr]]));
 
         if (fm1_ms - t_cpu > 500u) {            /* the worst render of the last half second, in the header */
             uint32_t us = audio_us_max, pct;
