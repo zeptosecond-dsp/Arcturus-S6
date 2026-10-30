@@ -1,0 +1,23 @@
+# patch save / load: save slot 1, change osc 1's wave, load slot 1 back (btn 3 SEL, 6 EDIT, 9 SAVE; enc 0 SELECT, 2 KNOB1)
+500 btn 9
+1000 btn 9
+1500 shot
+2000 btn 6
+2200 enc 2 40
+2600 shot
+3000 btn 9
+3200 btn 3
+3400 btn 3
+3800 shot
+4200 btn 6
+4600 shot
+5000 btn 9
+5200 enc 0 1
+5400 btn 9
+5600 btn 9
+5800 enc 0 -1
+6000 btn 9
+6200 shot
+6400 btn 9
+6600 shot
+7000 end

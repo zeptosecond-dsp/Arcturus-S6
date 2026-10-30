@@ -11,6 +11,7 @@
  *                               threshold), K3 hi cut, K4 level, PRESETS pan; keys: the selected osc takes the note
  *   SEL+EDIT PAGE 3 WAVEFORM    the selected osc's table in 3D, its wave now in front; SELECT osc, K1 wave
  *   ENV    PAGE 4 FUNCTION GEN  SELECT FG, K1 rise, K2 fall, K3 curve, K4 mode; PLAY held: the FG's gate
+ *   SAVE   PAGE P PATCHES      SELECT: a slot; SEL, SEL: load; SAVE, SAVE: save (an empty slot: one SAVE)
  *   ARP    PAGE 7 MOD MATRIX    K1 source, K2 destination, K3 depth (turning an empty cell makes a pin),
  *                               PLAY: pin on / off
  *   the keys' LEDs follow the page: the pitch stack, the FG's slope, the source's level
@@ -19,6 +20,7 @@
  * tests/host.c runs this file on a computer: the screen as a PNG, the sound as a WAV. */
 #define APP_NAME "FM1 WAVETABLE"
 #define CV_MAX (240u * 218u)                    /* the page body's canvas */
+#define STORE_MAGIC 0x54574D46u                 /* "FMWT": our own flash data, never another Dinghy fork's */
 #include "platform.c"
 #include "wt_tables.h"
 #include "luts.h"
@@ -59,6 +61,8 @@ static volatile uint8_t fg_stage_v[NFG], fg_eoc_v[NFG];
 
 static volatile int8_t depth[NSRC][NDST];       /* the mod matrix: 0 = no pin */
 static volatile uint32_t audio_us, audio_us_max;
+static volatile uint32_t mute;                  /* 1: fade the output out (a flash save stalls the sound) */
+static volatile int32_t out_gain = 32767;
 
 static const uint32_t INC_C9[12] = {            /* MIDI 120..131 (C9..B9); lower octaves shift right */
     815363807u, 863847862u, 915214929u, 969636441u, 1027294024u, 1088380105u,
@@ -208,6 +212,14 @@ static void app_audio(int32_t *out, uint32_t n)
 #endif
     for (b = 0; b + SUB <= n; b += SUB)
         render(out + 2u * b);
+    if (mute || out_gain < 32767) {             /* a short fade, out for a save and back in */
+        int32_t g = out_gain;
+        for (b = 0; b < 2u * n; b++) {
+            if (!(b & 1u)) g = mute ? (g > 128 ? g - 128 : 0) : (g < 32767 - 128 ? g + 128 : 32767);
+            out[b] = (out[b] * g) >> 15;
+        }
+        out_gain = g;
+    }
 #ifndef DINGHY_HOST
     audio_us = (fm1_ticks() - t0) / FM1_TICKS_PER_US;
     if (audio_us > audio_us_max) audio_us_max = audio_us;
@@ -245,6 +257,102 @@ static void push_fg(uint32_t k)
     fgp[k].fall = fgpatch[k].fall;
     fgp[k].curve = fgpatch[k].curve;
     fgp[k].mode = fgpatch[k].mode;
+}
+
+/* ---- patches in flash: 16 slots, two to a 4 KB blob, each a fixed 2040 bytes with room to grow
+ * (later versions add their parts in the spare room; a patch saved now still loads) */
+#define NPATCH 16u
+#define PATCH_TAG 0x31505457u                   /* "WTP1" */
+typedef struct {
+    uint32_t tag;
+    uint16_t ver, used;
+    patch_t osc[NO];
+    fgpatch_t fg[8];                            /* (room for 8 FGs) */
+    int8_t dep[16][64];                         /* (room for 16 sources x 64 destinations) */
+} pdata_t;
+typedef union { pdata_t d; uint8_t raw[2040]; } pslot_t;
+static pslot_t pbank[2];                        /* one blob's worth */
+static uint8_t pused[NPATCH + 1];               /* slot 0 = the built-in default */
+static patch_t def_osc[NO];
+static fgpatch_t def_fg[NFG];
+static int8_t def_dep[NSRC][NDST];
+
+static int bank_read(uint32_t blob)
+{
+    uint8_t *p = (uint8_t *)pbank;
+    uint32_t i;
+    if (blob_load(blob, pbank, sizeof pbank) == 0) return 0;
+    for (i = 0; i < sizeof pbank; i++) p[i] = 0;
+    return -1;
+}
+static void patches_scan(void)
+{
+    uint32_t b, j;
+    pused[0] = 1;
+    for (b = 0; b < NPATCH / 2u; b++) {
+        bank_read(b);
+        for (j = 0; j < 2u; j++)
+            pused[1u + 2u * b + j] = pbank[j].d.tag == PATCH_TAG && pbank[j].d.used;
+    }
+}
+static int patch_save(uint32_t slot)            /* 1..16 */
+{
+    uint32_t b = (slot - 1u) / 2u, j = (slot - 1u) & 1u, o, k, d, t0;
+    pdata_t *q;
+    int r;
+    bank_read(b);
+    q = &pbank[j].d;
+    {
+        uint8_t *raw = pbank[j].raw;
+        for (k = 0; k < sizeof pbank[j].raw; k++) raw[k] = 0;
+    }
+    q->tag = PATCH_TAG;
+    q->ver = 1;
+    q->used = 1;
+    for (o = 0; o < NO; o++) q->osc[o] = opatch[o];
+    for (k = 0; k < NFG; k++) q->fg[k] = fgpatch[k];
+    for (k = 0; k < NSRC; k++)
+        for (d = 0; d < NDST; d++) q->dep[k][d] = depth[k][d];
+    mute = 1;                                   /* fade out, save, fade in: the erase stops the sound ~50 ms */
+    t0 = fm1_ms;
+    while (out_gain > 0 && fm1_ms - t0 < 100u) platform_poll();
+    r = blob_save(b, pbank, sizeof pbank);
+    mute = 0;
+    if (r == 0) pused[slot] = 1;
+    return r;
+}
+static int patch_load(uint32_t slot)            /* 0 = the default */
+{
+    uint32_t o, k, d;
+    const pdata_t *q;
+    if (slot == 0u) {
+        for (o = 0; o < NO; o++) opatch[o] = def_osc[o];
+        for (k = 0; k < NFG; k++) fgpatch[k] = def_fg[k];
+        for (k = 0; k < NSRC; k++)
+            for (d = 0; d < NDST; d++) depth[k][d] = def_dep[k][d];
+    } else {
+        if (bank_read((slot - 1u) / 2u)) return -1;
+        q = &pbank[(slot - 1u) & 1u].d;
+        if (q->tag != PATCH_TAG || !q->used) return -1;
+        for (o = 0; o < NO; o++) opatch[o] = q->osc[o];
+        for (k = 0; k < NFG; k++) fgpatch[k] = q->fg[k];
+        for (k = 0; k < NSRC; k++)
+            for (d = 0; d < NDST; d++) depth[k][d] = q->dep[k][d];
+    }
+    for (o = 0; o < NO; o++) {                  /* (a damaged value never reaches the engine) */
+        patch_t *p = &opatch[o];
+        p->note = (uint8_t)cl(p->note, 12, 108); p->fine = (int8_t)cl(p->fine, -50, 50);
+        p->pos &= 127u; p->mod &= 127u; p->thr &= 127u; p->hicut &= 127u; p->level &= 127u; p->pan &= 127u;
+        push_osc(o);
+    }
+    for (k = 0; k < NFG; k++) {
+        fgpatch_t *f = &fgpatch[k];
+        f->rise &= 127u; f->fall &= 127u; f->curve = (uint8_t)cl(f->curve, 0, 2); f->mode = (uint8_t)cl(f->mode, 0, 2);
+        push_fg(k);
+    }
+    for (k = 0; k < NSRC; k++)
+        for (d = 0; d < NDST; d++) depth[k][d] = (int8_t)cl(depth[k][d], -64, 63);
+    return 0;
 }
 
 /* the matrix's destinations as the page lists them (no threshold on 1 and 2: they have no folder) */
@@ -313,7 +421,7 @@ enum { PG_INDEX, PG_OSC, PG_WAVE, PG_FG, PG_SH, PG_GATE, PG_MOD, PG_GMAT, PG_GLO
 static const char *const PG_NUM[NPG] = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "P"};
 static const char *const PG_NAME[NPG] = {"INDEX", "OSCILLATORS", "WAVEFORM", "FUNCTION GEN", "S&H / QUAD",
                                          "GATE GEN", "MOD MATRIX", "GATE MATRIX", "GLOBAL", "PATCHES"};
-static const uint8_t PG_READY[NPG] = {1, 1, 1, 1, 0, 0, 1, 0, 0, 0};
+static const uint8_t PG_READY[NPG] = {1, 1, 1, 1, 0, 0, 1, 0, 0, 1};
 
 static void draw_header(uint32_t pg, uint32_t cpu_pct)
 {
@@ -532,11 +640,37 @@ static void draw_mod(uint32_t cs, uint32_t cr, uint32_t top)
     cv_blit(0, BODY_Y);
 }
 
+enum { PC_NONE, PC_SAVE, PC_LOAD };
+static void draw_patch(uint32_t cur, uint32_t confirm, const char *msg)
+{
+    uint32_t i;
+    cv_begin(240, BODY_H, PH_BG);
+    for (i = 0; i <= NPATCH; i++) {
+        int32_t col = i == 0u ? 0 : (int32_t)((i - 1u) / 8u), row = i == 0u ? 0 : (int32_t)((i - 1u) % 8u) + 1;
+        int32_t x = 4 + col * 120, y = 4 + row * 18;
+        char s[24] = "";
+        if (i == 0u) { x = 4; s_cat(s, "DEFAULT (BUILT IN)"); }
+        else {
+            if (i < 10u) s_cat(s, "0");
+            s_int(s, (int32_t)i, 0);
+            s_cat(s, pused[i] ? "  SAVED" : "  --");
+        }
+        if (i == cur) cv_rect(x - 4, y - 1, i == 0u ? 240 : 116, 18, PH_SEL);
+        cv_text(x, y, &FONT_S, s, i == cur ? PH_HI : pused[i] ? PH_MID : PH_LO);
+    }
+    if (msg && *msg) cv_text(4, 172, &FONT_S, msg, PH_HI);
+    else if (confirm == PC_SAVE) cv_text(4, 172, &FONT_S, "SAVE AGAIN: OVERWRITE", PH_HI);
+    else if (confirm == PC_LOAD) cv_text(4, 172, &FONT_S, "SEL AGAIN: LOAD IT", PH_HI);
+    cv_text(4, 198, &FONT_S, "SEL: LOAD  SAVE: SAVE", PH_LO);
+    cv_blit(0, BODY_Y);
+}
+
 /* ================================================================== the main loop */
 static void app_main(void)
 {
     uint32_t o, k, sel = 0, fsel = 0, prev = 0, page = PG_OSC, icur = PG_OSC, mcs = 0, mcr = 0, mtop = 0;
-    uint32_t dirty = 1, hdr_dirty = 1, cpu_pct = 0, t_cpu = 0, t_live = 0;
+    uint32_t dirty = 1, hdr_dirty = 1, cpu_pct = 0, t_cpu = 0, t_live = 0, pcur = 1, pconf = PC_NONE, t_msg = 0;
+    const char *pmsg = "";
     int32_t oct = -1, e, shift_drawn = -1;
 
     for (o = 0; o < NO; o++) push_osc(o);
@@ -546,6 +680,11 @@ static void app_main(void)
     depth[2][3 * NP + P_PAN] = 45;
     depth[2][1 * NP + P_MOD] = 20;
     depth[3][D_FG(0, 0)] = 20;                  /* FG4 bends FG1's rise: feedback */
+    for (o = 0; o < NO; o++) def_osc[o] = opatch[o];   /* the built-in default, for slot 0 */
+    for (k = 0; k < NFG; k++) def_fg[k] = fgpatch[k];
+    for (k = 0; k < NSRC; k++)
+        for (o = 0; o < NDST; o++) def_dep[k][o] = depth[k][o];
+    patches_scan();
     lcd_fill(0, 0, 240, 240, PH_BG);
 
     for (;;) {
@@ -573,7 +712,31 @@ static void app_main(void)
             if ((e = fm1_enc_take(ENC_SELECT)) != 0) { icur = (uint32_t)cl((int32_t)icur + e, 0, NPG - 1); dirty = 1; }
             if (b & (1u << BTN_SEL)) newpage = icur;
         }
-        if (newpage != page) { page = newpage; dirty = hdr_dirty = 1; }
+        if (page == PG_PATCH) {
+            if ((e = fm1_enc_take(ENC_SELECT)) != 0) {
+                pcur = (uint32_t)cl((int32_t)pcur + e, 0, NPATCH);
+                pconf = PC_NONE; pmsg = ""; dirty = 1;
+            }
+            if (b & (1u << BTN_SAVE)) {
+                newpage = PG_PATCH;
+                if (pcur == 0u) { pmsg = "THE DEFAULT CANNOT CHANGE"; t_msg = fm1_ms; }
+                else if (pconf == PC_SAVE || !pused[pcur]) {
+                    pmsg = patch_save(pcur) == 0 ? "SAVED" : "SAVE FAILED";
+                    pconf = PC_NONE; t_msg = fm1_ms;
+                } else pconf = PC_SAVE;
+                dirty = 1;
+            }
+            if (b & (1u << BTN_SEL)) {
+                if (!pused[pcur]) { pmsg = "EMPTY SLOT"; t_msg = fm1_ms; }
+                else if (pconf == PC_LOAD) {
+                    pmsg = patch_load(pcur) == 0 ? "LOADED" : "LOAD FAILED";
+                    pconf = PC_NONE; t_msg = fm1_ms;
+                } else pconf = PC_LOAD;
+                dirty = 1;
+            }
+            if (*pmsg && fm1_ms - t_msg > 2000u) { pmsg = ""; dirty = 1; }
+        }
+        if (newpage != page) { page = newpage; pconf = PC_NONE; pmsg = ""; dirty = hdr_dirty = 1; }
 
         for (k = 0; k < NFG; k++)               /* PLAY held on the FG page: the selected FG's gate */
             fgp[k].gate = (uint8_t)(page == PG_FG && k == fsel && play);
@@ -648,7 +811,8 @@ static void app_main(void)
         fm1_led_key(BTN_OCT_UP, oct > 0);
         {
             uint32_t blink = (fm1_ms / 250u) & 1u;   /* a flashing button: "press me here" */
-            fm1_led_key(BTN_SEL, shift || (page == PG_INDEX && blink));
+            fm1_led_key(BTN_SEL, shift || ((page == PG_INDEX || page == PG_PATCH) && blink));
+            fm1_led_key(BTN_SAVE, page == PG_PATCH && (pconf == PC_SAVE || blink));
             fm1_led_key(BTN_PLAY, (page == PG_FG && (play || blink))   /* the FG page: the manual gate */
                                   || (page == PG_MOD && (depth[mcs][DLIST[mcr]] || blink)));   /* solid: a pin here */
         }
@@ -676,6 +840,7 @@ static void app_main(void)
             case PG_WAVE: draw_wave(sel, ost[sel].posq); break;
             case PG_FG: draw_fg(fsel); break;
             case PG_MOD: draw_mod(mcs, mcr, mtop); break;
+            case PG_PATCH: draw_patch(pcur, pconf, pmsg); break;
             default: draw_soon(page); break;
             }
         }
