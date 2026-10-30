@@ -55,6 +55,7 @@ enum { P_PITCH, P_WAVE, P_MOD, P_THR, P_HICUT, P_LEVEL, P_PAN, NP };
 typedef struct {                                /* the knobs, set by the main loop */
     volatile int32_t pitch_q8;                  /* note * 256 + fine, 1/256 semitone */
     volatile uint8_t pos, mod, thr, hicut, level, pan;
+    volatile uint8_t table, scan;               /* scan: 0 smooth (crossfade), 1 stepped (PPG) */
 } osc_par_t;
 typedef struct {                                /* owned by the interrupt */
     uint32_t ph;
@@ -62,6 +63,14 @@ typedef struct {                                /* owned by the interrupt */
     int32_t amp, lp1, lp2, last;
 } osc_st_t;
 static osc_par_t opar[NO];
+#define T_GEN WT_TABLES                         /* the generative table, built here from a seed */
+#define NTAB (WT_TABLES + 1u)
+static int8_t gen_tab[2][WT_WAVES][WT_SAMPLES]; /* two: one plays while the other is built */
+static volatile uint32_t gen_cur;
+static const int8_t *table_of(uint32_t t)
+{
+    return t >= T_GEN ? &gen_tab[gen_cur & 1u][0][0] : &WT[t][0][0];
+}
 static osc_st_t ost[NO];
 
 enum { FG_IDLE, FG_RISE, FG_HOLD, FG_FALL };
@@ -173,7 +182,8 @@ static void render(int32_t *out)                /* SUB frames */
     uint32_t o, k, d, i;
     int32_t pm[NO], fg_g[NO], fg_t[NO], fg_mk[NO], hc[NO], amp_t[NO], amp_d[NO], pl[NO], pr[NO];
     uint32_t inc[NO];
-    const int8_t *tab = &WT[0][0][0];
+    const int8_t *tab[NO];
+    uint32_t step[NO];
 
     for (k = 0; k < NFG; k++) src[k] = fg_out[k];   /* every source as it stood a step ago */
     for (k = 0; k < NSSG; k++) src[S_SSG(k)] = ssg_out[k];
@@ -256,6 +266,8 @@ static void render(int32_t *out)                /* SUB frames */
     for (o = 0; o < NO; o++) {
         const osc_par_t *p = &opar[o];
         const int32_t *a = &acc[o * NP];
+        tab[o] = table_of(p->table);
+        step[o] = p->scan;
         int32_t q, target, dpos;
         inc[o] = pitch_inc(p->pitch_q8 + ((a[P_PITCH] * 3) >> 3));          /* full depth: ~4 octaves */
         target = (cl(p->pos * 256 + a[P_WAVE], 0, 127 * 256) * 127) >> 8;   /* -> Q8 waves, 0..63 */
@@ -286,9 +298,9 @@ static void render(int32_t *out)                /* SUB frames */
             if (o == 0u) ph += (uint32_t)(prev1 * pm[0]) << 6;           /* phase modulation (wraps: fine) */
             else if (o == 1u) ph += (uint32_t)(prev0 * pm[1]) << 6;
             idx = ph >> 25;                      /* 128 samples a wave, no interpolation: PPG grit */
-            w = (uint32_t)s->posq >> 8;
-            frac = (uint32_t)s->posq & 255u;
-            w0 = tab + w * WT_SAMPLES;
+            if (step[o]) { w = ((uint32_t)s->posq + 128u) >> 8; frac = 0; }   /* stepped: one wave, then the next */
+            else { w = (uint32_t)s->posq >> 8; frac = (uint32_t)s->posq & 255u; }
+            w0 = tab[o] + w * WT_SAMPLES;
             w1 = w + 1u < WT_WAVES ? w0 + WT_SAMPLES : w0;
             x = (int32_t)w0[idx] * (int32_t)(256u - frac) + (int32_t)w1[idx] * (int32_t)frac;   /* +-32512 */
             if (o >= 2u) {                       /* the wavefolder */
@@ -351,6 +363,52 @@ static fgpatch_t fgpatch[NFG] = {               /* four cycling, two waiting for
     {45, 55, CV_EXP, M_CYCLE}, {20, 70, CV_EXP, M_GATE}, {10, 50, CV_LOG, M_ONCE},
 };
 
+static uint8_t otab[NO], oscan[NO];             /* (kept apart from patch_t: older patches keep their layout) */
+static uint32_t gen_seed = 1u, gen_built;
+
+/* the generative table: a sine, partials from the seed creeping in (the higher, the later), bite in the last
+ * third. Built in the spare buffer, then swapped in. */
+static void gen_build(uint32_t seed)
+{
+    enum { NPART = 12 };
+    uint32_t r = seed ? seed : 1u, i, w, n;
+    uint32_t hk[NPART], ph[NPART];
+    int32_t amp[NPART], start[NPART];
+    int8_t (*dst)[WT_SAMPLES] = gen_tab[(gen_cur & 1u) ^ 1u];
+#define GRND() (r ^= r << 13, r ^= r >> 17, r ^= r << 5, r)
+    hk[0] = 1; amp[0] = 32767; start[0] = -8; ph[0] = 0;
+    for (i = 1; i < NPART; i++) {
+        uint32_t a = GRND() % 31u, b = GRND() % 31u;
+        hk[i] = 2u + (a * b) / 31u;             /* 2..32, the low ones likelier */
+        amp[i] = (int32_t)(8000u + GRND() % 20000u) / (int32_t)(1u + hk[i] / 6u);
+        start[i] = cl((int32_t)(hk[i] * 44u / 32u) + (int32_t)(GRND() % 17u) - 8, 2, 58);
+        ph[i] = GRND();
+    }
+#undef GRND
+    for (w = 0; w < WT_WAVES; w++) {
+        int32_t buf[WT_SAMPLES], peak = 1, g[NPART];
+        for (i = 0; i < NPART; i++) {
+            int32_t x = cl(((int32_t)w - start[i]) * 512, 0, 4096);   /* fades in over 8 waves, Q12 */
+            int32_t sm = (x * x >> 12) * (3 * 4096 - 2 * x) >> 12;
+            if (hk[i] >= 8u && w > 42u) sm += sm * ((int32_t)w - 42) / 21;   /* the last third: the high ones bite */
+            g[i] = (amp[i] * sm) >> 12;
+        }
+        for (n = 0; n < WT_SAMPLES; n++) {
+            int32_t v = 0;
+            for (i = 0; i < NPART; i++)
+                if (g[i]) v += (sine(hk[i] * n * (1u << 25) + ph[i]) * g[i]) >> 15;
+            buf[n] = v;
+            if (v > peak) peak = v; else if (-v > peak) peak = -v;
+        }
+        {
+            int32_t sc = (int32_t)((127u << 16) / (uint32_t)peak);
+            for (n = 0; n < WT_SAMPLES; n++) dst[w][n] = (int8_t)cl((int32_t)(((int64_t)buf[n] * sc) >> 16), -127, 127);
+        }
+    }
+    gen_cur ^= 1u;                              /* (the engine reads the new one from its next step) */
+    gen_built = seed;
+}
+
 static void push_osc(uint32_t o)
 {
     patch_t *q = &opatch[o];
@@ -361,6 +419,8 @@ static void push_osc(uint32_t o)
     opar[o].hicut = q->hicut;
     opar[o].level = q->level;
     opar[o].pan = q->pan;
+    opar[o].table = otab[o];
+    opar[o].scan = oscan[o];
 }
 typedef struct { uint8_t mode[2], rate[2], duty[2], notsrc, pad; } ggpatch_t;
 static const ggpatch_t GG_DEFAULT[NGG] = {      /* free running; 3's two LFOs a hair apart: a slowly turning XOR */
@@ -428,6 +488,8 @@ typedef struct {
     ggpatch_t gg[NGG];                          /* version 2 on */
     uint32_t gm[48];                            /* (room for 48 gate sources x 32 destinations) */
     shpatch_t sh;                               /* version 3 on */
+    uint8_t otab[NO], oscan[NO];                /* version 4 on */
+    uint32_t gseed;
 } pdata_t;
 typedef union { pdata_t d; uint8_t raw[2040]; } pslot_t;
 typedef char pdata_fits_its_slot[sizeof(pdata_t) <= 2040u ? 1 : -1];   /* (the build fails if it ever grows past) */
@@ -469,7 +531,7 @@ static int patch_save(uint32_t slot)            /* 1..16 */
         for (k = 0; k < sizeof pbank[j].raw; k++) raw[k] = 0;
     }
     q->tag = PATCH_TAG;
-    q->ver = 3;
+    q->ver = 4;
     q->used = 1;
     for (o = 0; o < NO; o++) q->osc[o] = opatch[o];
     for (k = 0; k < NFG; k++) q->fg[k] = fgpatch[k];
@@ -478,6 +540,8 @@ static int patch_save(uint32_t slot)            /* 1..16 */
     for (k = 0; k < NGG; k++) q->gg[k] = ggpatch[k];
     for (k = 0; k < NGSRC; k++) q->gm[k] = gpatch[k];
     q->sh = shpatch;
+    for (o = 0; o < NO; o++) { q->otab[o] = otab[o]; q->oscan[o] = oscan[o]; }
+    q->gseed = gen_seed;
     mute = 1;                                   /* fade out, save, fade in: the erase stops the sound ~50 ms */
     t0 = fm1_ms;
     while (out_gain > 0 && fm1_ms - t0 < 100u) platform_poll();
@@ -499,6 +563,7 @@ static int patch_load(uint32_t slot)            /* 0 = the default */
         for (k = 0; k < NGG; k++) ggpatch[k] = GG_DEFAULT[k];
         for (k = 0; k < NGSRC; k++) gpatch[k] = def_gm[k];
         shpatch = SH_DEFAULT;
+        for (o = 0; o < NO; o++) otab[o] = oscan[o] = 0;
     } else {
         if (bank_read((slot - 1u) / 2u)) return -1;
         q = &pbank[(slot - 1u) & 1u].d;
@@ -510,9 +575,17 @@ static int patch_load(uint32_t slot)            /* 0 = the default */
         for (k = 0; k < NGG; k++) ggpatch[k] = q->ver >= 2u ? q->gg[k] : GG_DEFAULT[k];   /* (version 1: none) */
         for (k = 0; k < NGSRC; k++) gpatch[k] = q->ver >= 2u ? q->gm[k] & ((1u << NGDST) - 1u) : 0u;
         shpatch = q->ver >= 3u ? q->sh : SH_DEFAULT;   /* (older: the default SSGs and quad) */
+        for (o = 0; o < NO; o++) {              /* (older: table 1, smooth) */
+            otab[o] = q->ver >= 4u ? q->otab[o] : 0u;
+            oscan[o] = q->ver >= 4u ? q->oscan[o] : 0u;
+        }
+        if (q->ver >= 4u && q->gseed) gen_seed = q->gseed;
     }
+    if (gen_seed != gen_built) gen_build(gen_seed);
     for (o = 0; o < NO; o++) {                  /* (a damaged value never reaches the engine) */
         patch_t *p = &opatch[o];
+        if (otab[o] >= NTAB) otab[o] = 0;
+        oscan[o] &= 1u;
         p->note = (uint8_t)cl(p->note, 12, 108); p->fine = (int8_t)cl(p->fine, -50, 50);
         p->pos &= 127u; p->mod &= 127u; p->thr &= 127u; p->hicut &= 127u; p->level &= 127u; p->pan &= 127u;
         push_osc(o);
@@ -571,6 +644,12 @@ static void randomize(void)
         if (p->level >= 85u) loud = 1;
     }
     if (!loud) opatch[rnd(NO)].level = 100;
+    for (o = 0; o < NO; o++) {
+        otab[o] = (uint8_t)rnd(NTAB);           /* any table, the generative one too */
+        oscan[o] = rnd(4) == 0u;                /* now and then: stepped */
+    }
+    gen_seed = rnd(0xFFFFFFFFu) | 1u;
+    gen_build(gen_seed);
     for (k = 0; k < NFG; k++) {
         fgpatch_t *f = &fgpatch[k];
         f->rise = (uint8_t)rnd_in(30, 115);
@@ -726,19 +805,23 @@ static void draw_soon(uint32_t pg)
     cv_blit(0, BODY_Y);
 }
 
+static const char *const TAB_SHORT[NTAB] = {"S>O", "T>S", "ORG1", "ORG2", "BEL1", "BEL2", "VOW1", "VOW2",
+                                             "FORM", "PWM", "SYNC", "GRIT", "GEN"};
+static const char *tab_name(uint32_t t) { return t >= T_GEN ? "GENERATIVE" : WT_NAME[t]; }
+
 static void draw_osc(uint32_t sel, int shift)
 {
-    static const char *const ROW[8] = {"NOTE", "FINE", "WAVE", "PM/FLD", "THRESH", "HI CUT", "LEVEL", "PAN"};
+    static const char *const ROW[9] = {"NOTE", "FINE", "TABLE", "WAVE", "PM/FLD", "THRESH", "HI CUT", "LEVEL", "PAN"};
     uint32_t o, r;
     cv_begin(240, BODY_H, PH_BG);
     for (o = 0; o < NO; o++) {
         int32_t x = 64 + (int32_t)o * 44;
-        if (o == sel) cv_rect(x - 2, 4, 42, 168, PH_SEL);
+        if (o == sel) cv_rect(x - 2, 4, 42, 186, PH_SEL);
         cv_text(x + 14, 6, &FONT_S, ONAME[o], o == sel ? PH_HI : PH_LO);
     }
-    for (r = 0; r < 8u; r++) {
+    for (r = 0; r < 9u; r++) {
         int32_t y = 28 + (int32_t)r * 18;
-        int hot = shift ? (r == 1u || r == 4u) : (r != 1u && r != 4u);   /* the rows the knobs reach now */
+        int hot = shift ? (r == 1u || r == 2u || r == 5u) : (r != 1u && r != 2u && r != 5u);   /* what the knobs reach now */
         cv_text(2, y, &FONT_S, ROW[r], hot ? PH_MID : PH_LO);
         for (o = 0; o < NO; o++) {
             patch_t *q = &opatch[o];
@@ -746,26 +829,30 @@ static void draw_osc(uint32_t sel, int shift)
             switch (r) {
             case 0: s_note(s, q->note); break;
             case 1: s_int(s, q->fine, 1); break;
-            case 2: s_int(s, q->pos, 0); break;
-            case 3: s_int(s, q->mod, 0); break;
-            case 4: if (o < 2u) s_cat(s, "-"); else s_int(s, q->thr, 0); break;
-            case 5: if (q->hicut >= 127u) s_cat(s, "OPN"); else s_int(s, q->hicut, 0); break;
-            case 6: s_int(s, q->level, 0); break;
+            case 2: s_cat(s, TAB_SHORT[otab[o] < NTAB ? otab[o] : 0]); break;
+            case 3: s_int(s, q->pos, 0); break;
+            case 4: s_int(s, q->mod, 0); break;
+            case 5: if (o < 2u) s_cat(s, "-"); else s_int(s, q->thr, 0); break;
+            case 6: if (q->hicut >= 127u) s_cat(s, "OPN"); else s_int(s, q->hicut, 0); break;
+            case 7: s_int(s, q->level, 0); break;
             default: s_int(s, (int32_t)q->pan - 64, 1); break;
             }
             cv_text(64 + (int32_t)o * 44, y, &FONT_S, s, o == sel ? PH_HI : PH_MID);
         }
     }
-    cv_text(4, 196, &FONT_S, shift ? "SEL: FINE, THRESH" : "KEYS: SET NOTE  SEL: MORE", PH_LO);
+    cv_text(4, 198, &FONT_S, shift ? "SEL: FINE, TABLE, THRESH" : "KEYS: SET NOTE  SEL: MORE", PH_LO);
     cv_blit(0, BODY_Y);
 }
 
-static int32_t wave_at(uint32_t w, uint32_t i) { return WT[0][w][i]; }
+static const int8_t *wave_tab;
+static int32_t wave_at(uint32_t w, uint32_t i) { return wave_tab[w * WT_SAMPLES + i]; }
 
 static void draw_wave(uint32_t sel, int32_t posq)
 {
     int32_t w, i, f = posq & 255, wc = posq >> 8;
     char s[40] = "OSC ";
+    wave_tab = table_of(otab[sel]);
+    if (oscan[sel]) { wc = (posq + 128) >> 8; f = 0; }   /* stepped: the wave it is on */
     cv_begin(240, BODY_H, PH_BG);
     for (w = 60; w >= 0; w -= 4) {              /* the table in 3D, back to front, as the Waveterm drew it */
         int32_t x0 = 8 + (w * 3) / 2, y0 = 150 - (w * 9) / 5, py = 0;
@@ -786,12 +873,15 @@ static void draw_wave(uint32_t sel, int32_t posq)
         }
     }
     s_cat(s, ONAME[sel]);
-    s_cat(s, "   ");
-    s_cat(s, WT_NAME[0]);
-    s_cat(s, "   WAVE ");
+    s_cat(s, "  ");
+    s_cat(s, tab_name(otab[sel]));
+    cv_text(4, 162, &FONT_S, s, PH_HI);
+    s[0] = 0;
+    s_cat(s, "WAVE ");
     s_int(s, (posq * 127) / (63 * 256), 0);
+    s_cat(s, oscan[sel] ? "   STEPPED" : "   SMOOTH");
     cv_text(4, 180, &FONT_S, s, PH_MID);
-    cv_text(4, 198, &FONT_S, "SELECT: OSC  K1: WAVE", PH_LO);
+    cv_text(4, 198, &FONT_S, otab[sel] >= T_GEN ? "K1 WAV K2 TAB K3 SCN PLAY:NEW" : "K1 WAVE K2 TABLE K3 SCAN", PH_LO);
     cv_blit(0, BODY_Y);
 }
 
@@ -1221,7 +1311,20 @@ static void app_main(void)
             int ch = 0;
             if ((e = fm1_enc_take(ENC_SELECT)) != 0) { sel = (uint32_t)cl((int32_t)sel + e, 0, NO - 1); dirty = 1; }
             q = &opatch[sel];
-            if ((e = fm1_enc_take(ENC_KNOB1)) != 0) { q->pos = (uint8_t)cl(q->pos + 2 * e, 0, 127); ch = 1; }
+            if ((e = fm1_enc_take(ENC_KNOB1)) != 0) {
+                if (shift && page == PG_OSC) otab[sel] = (uint8_t)cl(otab[sel] + (e > 0 ? 1 : -1), 0, NTAB - 1);   /* SEL + K1: the table */
+                else q->pos = (uint8_t)cl(q->pos + 2 * e, 0, 127);
+                ch = 1;
+            }
+            if (page == PG_WAVE) {
+                if ((e = fm1_enc_take(ENC_KNOB2)) != 0) { otab[sel] = (uint8_t)cl(otab[sel] + (e > 0 ? 1 : -1), 0, NTAB - 1); ch = 1; }
+                if ((e = fm1_enc_take(ENC_KNOB3)) != 0) { oscan[sel] = e > 0; ch = 1; }
+                if (b >> BTN_PLAY & 1u && otab[sel] >= T_GEN) {   /* a new generative table, from a new seed */
+                    gen_seed = rnd(0xFFFFFFFFu) | 1u;
+                    gen_build(gen_seed);
+                    ch = 1;
+                }
+            }
             if (page == PG_OSC) {
                 uint32_t keys = fm1_in.notes, down = keys & ~prev;
                 prev = keys;
@@ -1342,6 +1445,7 @@ static void app_main(void)
             fm1_led_key(BTN_HOME, page != PG_INDEX && blink);   /* away from the index: HOME leads back */
             fm1_led_key(BTN_SAVE, page == PG_PATCH && (pconf == PC_SAVE || blink));
             fm1_led_key(BTN_PLAY, ((page == PG_FG || page == PG_SH) && (play || blink))   /* a manual gate / sample */
+                                  || (page == PG_WAVE && otab[sel] >= T_GEN && blink)   /* a new generative table */
                                   || (page == PG_MOD && (depth[mcs][DLIST[mcr]] || blink))   /* solid: a pin here */
                                   || (page == PG_GMAT && (gpatch[gcr] >> gcc & 1u || blink)));
         }

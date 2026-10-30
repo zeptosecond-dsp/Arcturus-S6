@@ -29,9 +29,18 @@ def reach(t, top):
 
 
 # ---- the recipes ------------------------------------------------------------
+# A recipe maps a position t (0..1 across the table) to a wave: a list of partials (harmonic, amplitude, phase)
+# or, for the time-domain ones, ("wave", 128 samples). All start soft (a sine or a triangle: they suit PM and the
+# folders) and bite in the last third. A table normalises each wave to full scale, except PWM (the table as a whole,
+# so its first wave stays the silence it is).
+
+def fade(h, k, width=2.0):
+    """how far partial k is in, while the reach h passes it"""
+    return smooth((h - k) / width + 1.0)
+
 
 def sine_to_odd(t):
-    """Table 1: a sine gaining odd harmonics, ending hollow and square-ish."""
+    """1: a sine gaining odd harmonics, ending hollow and square-ish."""
     h = reach(t, 31)
     out = [(1, 1.0, 0.0)]
     for k in range(3, 32, 2):
@@ -41,20 +50,209 @@ def sine_to_odd(t):
     return out
 
 
-TABLES = [
-    ("SINE>ODD", sine_to_odd),
+def tri_to_saw(t):
+    """2: a triangle (odd, 1/k^2) turning into a saw (every harmonic, 1/k), reaching higher as it goes."""
+    h, m = reach(t, 40), smooth(t * 1.3)
+    out = []
+    for k in range(1, 41):
+        tri = (8 / math.pi ** 2) * ((-1) ** ((k - 1) // 2)) / k ** 2 if k % 2 else 0.0
+        saw = 2 / math.pi / k
+        a = ((1 - m) * tri + m * saw) * (1.0 if k == 1 else fade(h, k, 3.0))
+        if a:
+            out.append((k, a, 0.0))
+    return out
+
+
+def organ_drawbar(t):
+    """3: drawbars pulled one by one: 8', 4', 2 2/3', 2', 1 1/3', 1', 1 3/5', then the bright upper ones."""
+    order = [(1, 1.0), (2, 0.8), (3, 0.7), (4, 0.6), (6, 0.5), (8, 0.45), (5, 0.35), (10, 0.35), (12, 0.3), (16, 0.3)]
+    out = []
+    for i, (k, a) in enumerate(order):
+        start = i / len(order) * (0.75 if i < 7 else 1.0) if i else -1.0
+        g = smooth((t - start) * 5.0) if i else 1.0
+        if i >= 7:                      # the last third: the high bars come in strong
+            g *= 0.5 + 1.5 * smooth((t - 0.66) * 3.0)
+        if g > 0:
+            out.append((k, a * g, 0.0))
+    return out
+
+
+def organ_reed(t):
+    """4: reedy and nasal, clarinet-ish (odd first), the even ones creeping in, honky in the last third."""
+    h = reach(t, 24)
+    out = [(1, 1.0, 0.0)]
+    for k in range(2, 25):
+        base = (0.9 / k) if k % 2 else (0.25 / k) * smooth(t * 2.0)
+        honk = 1.0 + 4.0 * smooth((t - 0.6) * 2.5) * math.exp(-((k - 8) / 2.5) ** 2)   # a nasal bump around 6..10
+        a = base * honk * fade(h, k, 2.5)
+        if a > 1e-4:
+            out.append((k, a, 0.0))
+    return out
+
+
+def bell_harmonic(t):
+    """5: a PPG-style harmonic bell: sparse high partials glinting in over a fading fundamental."""
+    parts = [(3, 0.5), (5, 0.45), (9, 0.4), (11, 0.35), (17, 0.35), (23, 0.3), (27, 0.3), (31, 0.28), (37, 0.25)]
+    out = [(1, 1.0 - 0.45 * smooth(t * 1.5), 0.0)]
+    for i, (k, a) in enumerate(parts):
+        start = (i / len(parts)) ** 1.3 * 0.95
+        g = smooth((t - start) * 6.0)
+        if i >= 6:
+            g *= 0.6 + 1.4 * smooth((t - 0.66) * 3.0)
+        if g > 0:
+            out.append((k, a * g, 0.3 * i))
+    return out
+
+
+def bell_cluster(t):
+    """6: clangier: clusters of neighbouring upper partials, rising and widening: metallic by the end."""
+    out = [(1, 1.0 - 0.5 * smooth(t), 0.0)]
+    centre, width = 6 + 22 * t ** 1.5, 0.6 + 2.6 * t ** 2
+    level = 1.05 * smooth(t * 1.4)        # (nothing at the start: a sine)
+    for k in range(2, 50):
+        a = level * math.exp(-((k - centre) / width) ** 2)
+        a += 0.6 * smooth((t - 0.6) * 2.5) * math.exp(-((k - (centre * 1.6)) / (width * 0.8)) ** 2)   # a second, higher cluster
+        if a > 2e-3:
+            out.append((k, a, 1.1 * k))
+    return out
+
+
+F0 = 130.0                              # the voice the vowels are tuned for (they shift with pitch, as on the PPG)
+
+
+def formants(fs, k):
+    """the level of harmonic k under formants fs = [(Hz, bandwidth Hz, gain), ...]"""
+    f = k * F0
+    return sum(g / (1 + ((f - c) / (bw / 2)) ** 2) for c, bw, g in fs)
+
+
+def lerp_formants(a, b, x):
+    return [tuple(p + (q - p) * x for p, q in zip(fa, fb)) for fa, fb in zip(a, b)]
+
+
+OO = [(300, 90, 1.0), (870, 120, 0.3), (2240, 200, 0.02)]
+OH = [(500, 100, 1.0), (900, 120, 0.6), (2400, 200, 0.05)]
+AH = [(730, 120, 1.0), (1090, 130, 0.7), (2440, 180, 0.25)]
+EE = [(270, 80, 1.0), (2290, 160, 0.3), (3010, 220, 0.2)]
+EH = [(530, 100, 1.0), (1840, 150, 0.5), (2480, 200, 0.2)]
+
+
+def vowel_set(seq, t, bite):
+    seg = t * (len(seq) - 1)
+    i = min(int(seg), len(seq) - 2)
+    fs = lerp_formants(seq[i], seq[i + 1], seg - i)
+    fs = fs + [(3300, 300, bite * smooth((t - 0.6) * 2.5))]   # the last third: an edge on top
+    start = 1.0 - smooth(t * 2.0)       # the first part leans to a plain sine: delicate first
+    out = []
+    for k in range(1, 41):
+        a = formants(fs, k) * (1 - start) + (start if k == 1 else 0.0)
+        if a > 1e-3:
+            out.append((k, a, 0.0))
+    return out
+
+
+def vowel_1(t):
+    """7: oo -> oh -> ah."""
+    return vowel_set([OO, OH, AH], t, 0.35)
+
+
+def vowel_2(t):
+    """8: ee -> eh -> ah, more nasal (a low nasal murmur)."""
+    out = vowel_set([EE, EH, AH], t, 0.4)
+    return out + [(2, 0.35 * smooth(t * 2.0), 0.0)]
+
+
+def formant_sweep(t):
+    """9: a resonant hump climbing the harmonics, narrowing and growing as it goes."""
+    centre, q = 2 + 28 * t ** 1.4, 2.5 - 1.4 * t
+    gain = 1.2 * smooth(t * 2.0) + 1.4 * smooth((t - 0.5) * 2.0)   # (nothing at the start: a sine)
+    out = [(1, 1.0, 0.0)]
+    for k in range(2, 48):
+        a = gain * math.exp(-((k - centre) / q) ** 2) + 0.25 / k * smooth(t * 2)
+        if a > 1e-3:
+            out.append((k, a, 0.0))
+    return out
+
+
+def pwm(t):
+    """10: a pulse from 0 % (silence) to 50 % (a square), soft at first, reaching higher late."""
+    w, h = 0.5 * t, reach(t, 48)
+    out = []
+    for k in range(1, 49):
+        a = 2 / (k * math.pi) * math.sin(k * math.pi * w) * (1.0 if k <= 2 else fade(h, k, 4.0))
+        if abs(a) > 1e-5:
+            out.append((k, a, math.pi / 2))
+    return out
+
+
+def band_limit(wave, top):
+    """keep the harmonics up to top (soft-edged): the time-domain recipes stay soft until they are meant to bite"""
+    import numpy as np
+    sp = np.fft.rfft(np.asarray(wave, dtype=float))
+    k = np.arange(len(sp))
+    sp *= np.clip((top + 2 - k) / 3.0, 0, 1)
+    sp[0] = 0
+    return list(np.fft.irfft(sp, len(wave)))
+
+
+def soft_sync(t):
+    """11: a soft-synced sine: the slave climbs from unison, the reset softened by a window that hardens late:
+    tearing in the last third."""
+    r = 1 + 5.5 * t ** 1.3
+    p = 3.0 * smooth(t * 5.0) - 2.8 * smooth((t - 0.55) * 2.2)   # the window: none at first (a sine), soft, then hard
+    wave = [math.sin(2 * math.pi * r * (n / SAMPLES)) * math.sin(math.pi * n / SAMPLES) ** p for n in range(SAMPLES)]
+    return ("wave", band_limit(wave, reach(t, 56)))
+
+
+def grit(t):
+    """12: a sine picking up digital artefacts: fewer bits, then fewer samples: crunchy at the end."""
+    bits = 8 - 5 * smooth((t - 0.3) * 1.5)              # 8 .. 3 bits
+    hold = 1 + int(round(15 * smooth((t - 0.55) * 2.2)))   # 1 .. 16 samples held
+    wave = []
+    for n in range(SAMPLES):
+        m = (n // hold) * hold
+        v = math.sin(2 * math.pi * m / SAMPLES)
+        q = 2 ** (bits - 1)
+        wave.append(round(v * q) / q)
+    return ("wave", wave)
+
+
+TABLES = [                              # (name, recipe, normalise each wave)
+    ("SINE>ODD", sine_to_odd, True),
+    ("TRI>SAW", tri_to_saw, True),
+    ("ORGAN I", organ_drawbar, True),
+    ("ORGAN II", organ_reed, True),
+    ("BELL I", bell_harmonic, True),
+    ("BELL II", bell_cluster, True),
+    ("VOWEL I", vowel_1, True),
+    ("VOWEL II", vowel_2, True),
+    ("FORMANT", formant_sweep, True),
+    ("PWM", pwm, False),
+    ("SOFTSYNC", soft_sync, True),
+    ("GRIT", grit, True),
 ]
 
 
 # ---- building ---------------------------------------------------------------
 
-def build_wave(partials):
+def raw_wave(w):
+    if isinstance(w, tuple) and w[0] == "wave":
+        return list(w[1])
     s = []
     for n in range(SAMPLES):
         x = 2 * math.pi * n / SAMPLES
-        s.append(sum(a * math.sin(k * x + p) for k, a, p in partials))
-    peak = max(abs(v) for v in s) or 1.0
-    return [max(-127, min(127, round(v / peak * 127))) for v in s]
+        s.append(sum(a * math.sin(k * x + p) for k, a, p in w))
+    return s
+
+
+def build_table(recipe, per_wave):
+    raws = [raw_wave(recipe(w / (WAVES - 1))) for w in range(WAVES)]
+    top = max(max(abs(v) for v in r) for r in raws) or 1.0
+    out = []
+    for r in raws:
+        peak = (max(abs(v) for v in r) or 1.0) if per_wave else top
+        out.append([max(-127, min(127, round(v / peak * 127))) for v in r])
+    return out
 
 
 def write_luts(root):
@@ -118,13 +316,12 @@ def main():
         f"#define WT_WAVES {WAVES}u",
         f"#define WT_SAMPLES {SAMPLES}u",
         "static const char *const WT_NAME[WT_TABLES] = {"
-        + ", ".join(f'"{name}"' for name, _ in TABLES) + "};",
+        + ", ".join(f'"{name}"' for name, _, _ in TABLES) + "};",
         "static const int8_t WT[WT_TABLES][WT_WAVES][WT_SAMPLES] = {",
     ]
-    for name, recipe in TABLES:
+    for name, recipe, per_wave in TABLES:
         lines.append(f"  {{ /* {name} */")
-        for w in range(WAVES):
-            wave = build_wave(recipe(w / (WAVES - 1)))
+        for wave in build_table(recipe, per_wave):
             lines.append("    {" + ",".join(str(v) for v in wave) + "},")
         lines.append("  },")
     lines.append("};")
