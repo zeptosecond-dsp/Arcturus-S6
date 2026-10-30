@@ -649,7 +649,7 @@ static void app_main(void)
         {
             uint32_t blink = (fm1_ms / 250u) & 1u;   /* a flashing button: "press me here" */
             fm1_led_key(BTN_SEL, shift || (page == PG_INDEX && blink));
-            fm1_led_key(BTN_PLAY, (page == PG_FG && play)
+            fm1_led_key(BTN_PLAY, (page == PG_FG && (play || blink))   /* the FG page: the manual gate */
                                   || (page == PG_MOD && (depth[mcs][DLIST[mcr]] || blink)));   /* solid: a pin here */
         }
         fm1_led_key(BTN_HOME, page == PG_INDEX);
