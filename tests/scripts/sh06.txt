@@ -1,0 +1,31 @@
+# SSGs + quad: DEFAULT, page 5, manual samples, G1 A -> S1, FG1 EOC -> S2, S2 samples FG3 slewed, S1 -> 1 PITCH
+200 btn 9
+300 enc 0 -2
+400 btn 3
+500 btn 3
+700 btndown 3
+800 btn 4
+900 btnup 3
+1000 btn 12
+1500 btn 12
+2000 btn 12
+2400 shot
+2600 btn 11
+2800 enc 2 14
+3000 btn 12
+3200 enc 2 1
+3300 enc 3 36
+3400 btn 12
+3600 shot
+3800 btndown 3
+3900 btn 4
+4000 btnup 3
+4100 enc 4 3
+4200 enc 5 30
+7000 shot
+7200 btn 10
+7300 enc 2 6
+7400 enc 4 6
+8500 shot
+12000 shot
+12500 end

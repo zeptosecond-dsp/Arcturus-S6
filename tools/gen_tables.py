@@ -83,11 +83,17 @@ def write_luts(root):
     log_s = [32767 - exp_s[256 - i] for i in range(257)]
     # gate generator LFOs, also every 32 frames: rate knob 0..127 -> 0.02 .. 30 Hz, as a step of a 32-bit phase
     gginc = [round(0.02 * 1500 ** (k / 127) / sub * 2 ** 32) for k in range(128)]
+    # the quadrature LFO, every 32 frames: rate knob 0..127 -> a period of 120 s .. 0.1 s
+    qper = [120.0 / 1200 ** (k / 127) for k in range(128)]
+    qinc = [round(1 / t / sub * 2 ** 32) for t in qper]
+    qcs = [round(t * 100) for t in qper]          # the period in 1/100 s, for the screen
     semifrac = [round(2 ** (f / 256 / 12) * 65536) for f in range(256)]   # 1/256 semitone -> ratio, Q16
     arr = lambda name, typ, v: f"static const {typ} {name}[{len(v)}] = {{" + ",".join(map(str, v)) + "};"
     lines = [
         arr("LUT_FGINC", "uint32_t", fginc),
         arr("LUT_GGINC", "uint32_t", gginc),
+        arr("LUT_QINC", "uint32_t", qinc),
+        arr("LUT_QPER", "uint32_t", qcs),
         arr("LUT_SHAPE_EXP", "uint16_t", exp_s),
         arr("LUT_SHAPE_LOG", "uint16_t", log_s),
         arr("LUT_SEMIFRAC", "uint32_t", semifrac),
