@@ -1,0 +1,29 @@
+# Test build 0.2 tour (buttons: 3 SEL, 4 ENV, 6 EDIT, 8 HOME, 10 ARP, 12 PLAY; encoders: 0 SELECT, 2-5 KNOB1-4)
+1500 shot
+2000 btn 8
+2500 enc 0 2
+3000 shot
+3500 btn 3
+4500 shot
+5000 btndown 3
+5200 btn 6
+5400 btnup 3
+6500 shot
+7000 enc 0 2
+8000 enc 2 20
+9000 shot
+10000 btn 4
+12000 shot
+13000 enc 0 4
+13500 btndown 12
+15500 btnup 12
+14500 shot
+16000 shot
+17000 btn 10
+17500 enc 4 5
+18000 enc 3 -2
+18500 shot
+19000 enc 3 14
+19500 enc 4 -20
+20500 shot
+24000 end
