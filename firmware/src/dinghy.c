@@ -966,7 +966,7 @@ static void draw_patch(uint32_t cur, uint32_t confirm, const char *msg)
 /* ================================================================== the main loop */
 static void app_main(void)
 {
-    uint32_t o, k, sel = 0, fsel = 0, prev = 0, page = PG_OSC, icur = PG_OSC, mcs = 0, mcr = 0, mtop = 0;
+    uint32_t o, k, sel = 0, fsel = 0, prev = 0, page = PG_INDEX, icur = PG_OSC, mcs = 0, mcr = 0, mtop = 0;
     uint32_t dirty = 1, hdr_dirty = 1, cpu_pct = 0, t_cpu = 0, t_live = 0, pcur = 1, pconf = PC_NONE, t_msg = 0;
     const char *pmsg = "";
     uint32_t gsel = 0, gcc = 0, gcr = 0, gtop = 0, gleft = 0, t_hist = 0;
@@ -1168,12 +1168,12 @@ static void app_main(void)
         {
             uint32_t blink = (fm1_ms / 250u) & 1u;   /* a flashing button: "press me here" */
             fm1_led_key(BTN_SEL, shift || ((page == PG_INDEX || page == PG_PATCH) && blink));
+            fm1_led_key(BTN_HOME, page != PG_INDEX && blink);   /* away from the index: HOME leads back */
             fm1_led_key(BTN_SAVE, page == PG_PATCH && (pconf == PC_SAVE || blink));
             fm1_led_key(BTN_PLAY, (page == PG_FG && (play || blink))   /* the FG page: the manual gate */
                                   || (page == PG_MOD && (depth[mcs][DLIST[mcr]] || blink))   /* solid: a pin here */
                                   || (page == PG_GMAT && (gpatch[gcr] >> gcc & 1u || blink)));
         }
-        fm1_led_key(BTN_HOME, page == PG_INDEX);
         fm1_led_key(BTN_EDIT, page == PG_OSC || page == PG_WAVE);
         fm1_led_key(BTN_ENV, page == PG_FG);
         fm1_led_key(BTN_ARP, page == PG_MOD);
