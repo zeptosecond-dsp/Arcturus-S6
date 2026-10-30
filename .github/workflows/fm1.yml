@@ -56,7 +56,7 @@ jobs:
         run: |
           mkdir -p dist
           cp build/dinghy.fwsc dist/fm1-wavetable.fwsc
-          cp tools/fm1_install.py tools/windows/install.bat dist/
+          cp tools/fm1_install.py tools/fm1_winmidi.py tools/windows/install.bat dist/
 
       - uses: actions/upload-artifact@v4
         with:

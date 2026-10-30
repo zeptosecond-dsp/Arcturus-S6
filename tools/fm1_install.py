@@ -571,6 +571,10 @@ def main(argv=None, backend=None, out=sys.stdout, ask=ask_tty):
     if bool(a.info) == bool(a.package):
         ap.error("give a PACKAGE.fwsc or --info")
     try:
+        if backend is None and sys.platform == "win32":   # Windows' own MIDI: nothing to install
+            sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
+            from fm1_winmidi import WinBackend
+            backend = WinBackend()
         if backend is None:
             try:
                 backend = MidoBackend()
