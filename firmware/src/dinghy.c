@@ -48,7 +48,8 @@ enum { P_PITCH, P_WAVE, P_MOD, P_THR, P_HICUT, P_LEVEL, P_PAN, NP };
 #define D_GG(g, l, duty) (NO * NP + 2u * NFG + 4u * (g) + 2u * (l) + (duty))   /* a gate LFO's rate / duty */
 #define D_SSG(k) (NO * NP + 2u * NFG + 4u * NGG + (k))   /* an SSG's slew */
 #define D_QRATE (NO * NP + 2u * NFG + 4u * NGG + NSSG)    /* the quad LFO's rate */
-#define D_VERB(k) (NO * NP + 2u * NFG + 4u * NGG + NSSG + 1u + (k))   /* the reverb: size decay damp return fb */
+#define D_VERB(k) (NO * NP + 2u * NFG + 4u * NGG + NSSG + 1u + (k))   /* 0 DL TIME, 1 RV DECAY, 2 DL FEEDBACK,
+                                                                         3 RV RETURN, 4 RV FEEDBACK */
 #define NDST (NO * NP + 2u * NFG + 4u * NGG + NSSG + 1u + 5u)
 /* gate sources: per generator A B AND NAND OR NOR XOR XNOR NOT, then the FGs' EOCs.
  * gate destinations: the FGs' gates, then each generator's two logic inputs (pinned: they replace A, B there) */
@@ -420,8 +421,8 @@ static void render(int32_t *out)                /* SUB frames */
         dinb[i] = dsnd;
     }
     {   /* the delay, frame by frame: into the output, and (TO REVERB) into the reverb's input */
-        uint32_t dinc = LUT_DINC[dlp.time & 127u];
-        int32_t fbg = (int32_t)dlp.fb * (DL_FB_MAX / 127), ret = (int32_t)dlp.ret * dlp.ret * 2;
+        uint32_t dinc = LUT_DINC[cl(dlp.time + (acc[D_VERB(0)] >> 8), 0, 127)];   /* (on the matrix: DL TIME) */
+        int32_t fbg = cl(dlp.fb + (acc[D_VERB(2)] >> 8), 0, 127) * (DL_FB_MAX / 127), ret = (int32_t)dlp.ret * dlp.ret * 2;
         int32_t tov = (int32_t)dlp.toverb * 258, mask = ~((1 << (dlp.crush > 10u ? 10u : dlp.crush)) - 1);
         int32_t lpc = (int32_t)cl((int32_t)(dinc >> 16), 600, 32767);   /* the cutoff follows the clock */
         for (i = 0; i < SUB; i++) {
@@ -433,7 +434,7 @@ static void render(int32_t *out)                /* SUB frames */
         dl_w_v = dl_w;
     }
     for (o = 0; o < NO; o++) ost[o].amp = amp_t[o];
-    vm.size = acc[D_VERB(0)]; vm.decay = acc[D_VERB(1)]; vm.damp = acc[D_VERB(2)];
+    vm.size = 0; vm.decay = acc[D_VERB(1)]; vm.damp = 0;   /* (size and damp are off the matrix now) */
     vm.ret = acc[D_VERB(3)]; vm.fb = acc[D_VERB(4)];
     verb_run(vin, out, SUB, &vm);
 }
@@ -801,7 +802,7 @@ static const uint8_t DLIST[] = {
     D_FG(3, 0), D_FG(3, 1), D_FG(4, 0), D_FG(4, 1), D_FG(5, 0), D_FG(5, 1),
     D_GG(0, 0, 0), D_GG(0, 0, 1), D_GG(0, 1, 0), D_GG(0, 1, 1), D_GG(1, 0, 0), D_GG(1, 0, 1), D_GG(1, 1, 0), D_GG(1, 1, 1),
     D_GG(2, 0, 0), D_GG(2, 0, 1), D_GG(2, 1, 0), D_GG(2, 1, 1), D_GG(3, 0, 0), D_GG(3, 0, 1), D_GG(3, 1, 0), D_GG(3, 1, 1),
-    D_SSG(0), D_SSG(1), D_QRATE, D_VERB(0), D_VERB(1), D_VERB(2), D_VERB(3), D_VERB(4),
+    D_SSG(0), D_SSG(1), D_QRATE, D_VERB(1), D_VERB(3), D_VERB(4), D_VERB(0), D_VERB(2),
 };
 #define NDLIST (sizeof DLIST / sizeof DLIST[0])
 
@@ -941,7 +942,7 @@ static void dst_name(char *s, uint32_t d)
         s_int(s, (int32_t)(d - NO * NP) / 2 + 1, 0);
         s_cat(s, (d - NO * NP) & 1u ? " FALL" : " RISE");
     } else if (d >= D_VERB(0)) {
-        static const char *const VN[5] = {"RV SIZE", "RV DECAY", "RV DAMP", "RV RETURN", "RV FEEDBACK"};
+        static const char *const VN[5] = {"DL TIME", "RV DECAY", "DL FEEDBACK", "RV RETURN", "RV FEEDBACK"};
         s_cat(s, VN[(d - D_VERB(0)) % 5u]);
     } else if (d >= D_SSG(0)) {
         if (d == D_QRATE) s_cat(s, "QUAD RATE");
@@ -970,16 +971,40 @@ static uint8_t crt_b[240u * BODY_H] __attribute__((section(".pool")));   /* its 
 static uint8_t CRT_D2[240];                     /* (distance from the middle)^2: 0 .. 128 along an axis */
 static uint16_t CRT_LUT[2][256];                /* intensity -> the panel's pixel, even and odd lines */
 
-static void crt_init(void)
+/* the VDU settings (page 9, OCT): the phosphor and the brightness. Kept in the settings sector, not in a patch. */
+#define NPHOS 4u
+static const char *const PHOS_NAME[NPHOS] = {"GREEN P1", "AQUA", "AMBER P3", "WHITE P4"};
+static const uint8_t PHOS_K[NPHOS][7][4] = {    /* intensity, r, g, b: each phosphor's ramp, its top a little white */
+    {{0, 0, 0, 0}, {20, 12, 18, 14}, {60, 16, 62, 28}, {110, 28, 114, 50}, {170, 56, 192, 86}, {230, 122, 246, 142},
+     {255, 196, 255, 204}},
+    {{0, 0, 0, 0}, {20, 8, 18, 20}, {60, 10, 56, 64}, {110, 20, 108, 120}, {170, 44, 182, 198}, {230, 116, 236, 250},
+     {255, 196, 250, 255}},
+    {{0, 0, 0, 0}, {20, 20, 11, 3}, {60, 66, 34, 6}, {110, 124, 64, 10}, {170, 198, 110, 22}, {230, 250, 170, 66},
+     {255, 255, 214, 140}},
+    {{0, 0, 0, 0}, {20, 15, 16, 19}, {60, 54, 57, 64}, {110, 106, 110, 120}, {170, 176, 180, 192}, {230, 234, 238, 246},
+     {255, 255, 255, 255}},
+};
+typedef struct { uint32_t boots; uint8_t phos, bright, pad[2]; } settings_t;
+static settings_t gset = {0, 0, 7, {0, 0}};
+static uint16_t CRT_TF[257];                    /* the light's gain over the radius: 256 in the middle .. 0 the corners */
+
+static void settings_store(void)                /* the VDU settings to flash, faded as a patch save */
 {
-    static const uint8_t K[][4] = {             /* intensity, r, g, b: the phosphor */
-        {0, 0, 0, 0}, {20, 12, 18, 14}, {60, 16, 62, 28}, {110, 28, 114, 50},
-        {170, 56, 192, 86}, {230, 122, 246, 142}, {255, 196, 255, 204}};
-    uint32_t i, k;
-    for (i = 0; i < 240u; i++) {
-        int32_t d = 2 * (int32_t)i + 1 - 240;  /* -239 .. 239 */
-        CRT_D2[i] = (uint8_t)((d * d * 128) / (239 * 239));
-    }
+    uint32_t t0;
+    mute = 1;
+    t0 = fm1_ms;
+    while (out_gain > 0 && fm1_ms - t0 < 100u) platform_poll();
+    settings_save(&gset, sizeof gset);
+    mute = 0;
+}
+
+
+static void crt_build(void)                     /* the ramp and the vignette from the VDU settings */
+{
+    const uint8_t (*K)[4] = PHOS_K[gset.phos < NPHOS ? gset.phos : 0u];
+    uint32_t i, k, br = gset.bright > 10u ? 10u : gset.bright;
+    uint32_t gc = 116u + br * 20u, ge = gc * br * br * 90u / 10000u;   /* the middle's gain; the corners' (dims first) */
+    for (i = 0; i <= 256u; i++) CRT_TF[i] = (uint16_t)(ge + (gc - ge) * i / 256u);
     for (i = 0; i < 256u; i++) {
         uint32_t r, g, b, lr, lg, lb;
         for (k = 1; K[k][0] < i; k++) {}
@@ -993,6 +1018,15 @@ static void crt_init(void)
         CRT_LUT[0][i] = swap16(RGB(r, g, b));
         CRT_LUT[1][i] = swap16(RGB(lr, lg, lb));
     }
+}
+static void crt_init(void)
+{
+    uint32_t i;
+    for (i = 0; i < 240u; i++) {
+        int32_t d = 2 * (int32_t)i + 1 - 240;  /* -239 .. 239 */
+        CRT_D2[i] = (uint8_t)((d * d * 128) / (239 * 239));
+    }
+    crt_build();
 }
 
 static void cv_out(uint32_t y0)                 /* the canvas (240 wide) through the CRT, to the screen at y0 */
@@ -1015,7 +1049,7 @@ static void cv_out(uint32_t y0)                 /* the canvas (240 wide) through
         for (x = 0; x < w; x++) {
             uint32_t f = 256u - CRT_D2[x] - dy;                     /* radial: 256 in the middle, 0 in the corners */
             uint32_t glow = ((uint32_t)bu[x] + bm[x] + bd[x]) * 30u >> 8;
-            uint32_t tf = 116u + (f * 140u >> 8);                    /* the light: 45 % in the corners */
+            uint32_t tf = CRT_TF[f];                                  /* the light: dimmer toward the corners */
             uint32_t v = ((uint32_t)a[x] + glow) * tf >> 8;          /* (the background stays black: no banding) */
             px[x] = lut[v > 255u ? 255u : v];
         }
@@ -1023,6 +1057,7 @@ static void cv_out(uint32_t y0)                 /* the canvas (240 wide) through
     cv_blit(0, y0);
 }
 
+static uint32_t gsub;                           /* page 9: 0 the tuning, 1 the VDU (OCT- / OCT+) */
 static uint32_t fxsub;                          /* the FX page: 0 the reverb, 1 the delay (FX again flips it) */
 /* ---- the battery: SARADC channel 3 (the battery's divider), raw 0..1023, read every 2 s and smoothed. The scale is
  * built around the stock firmware's bar thresholds (531 / 561 / 591, as Felucca has them): BATT_EMPTY .. BATT_FULL
@@ -1068,6 +1103,7 @@ static void draw_header(uint32_t pg)
     s_cat(s, "  ");
     s_cat(s, PG_NAME[pg]);
     if (pg == PG_VERB) s_cat(s, fxsub ? ": DELAY" : ": REVERB");
+    if (pg == PG_GLOBAL) s_cat(s, gsub ? ": VDU" : ": TUNING");
     cv_begin(240, BODY_Y, PH_BG);
     cv_text(4, 2, &FONT_S, s, PH_HI);
     {                                           /* the battery, top right */
@@ -1531,6 +1567,37 @@ static void draw_sh(void)
 
 /* ---- page 9: the tuning, the scale, the quantisers */
 static const char *const NOTEN[12] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+static void draw_vdu(void)                      /* page 9's other half: the phosphor, the brightness, a test card */
+{
+    char s[24] = "";
+    uint32_t i;
+    cv_begin(240, BODY_H, PH_BG);
+    cv_text(4, 2, &FONT_S, "PHOSPHOR", PH_LO);
+    cv_text(108, 2, &FONT_S, PHOS_NAME[gset.phos % NPHOS], PH_HI);
+    cv_text(4, 20, &FONT_S, "BRIGHTNESS", PH_LO);
+    s_int(s, gset.bright, 0);
+    cv_text(108, 20, &FONT_S, s, PH_HI);
+    for (i = 0; i <= 10u; i++)                  /* the brightness as a row of ticks */
+        cv_rect(140 + (int32_t)i * 9, 24, 6, 8, i <= gset.bright ? PH_MID : PH_LO);
+    cv_rect(0, 39, 240, 1, PH_LO);
+    /* the test card: a frame, a cross-hatch, a circle, eight grey steps (the ramp) and a sweep */
+    cv_rect(6, 46, 228, 1, PH_MID); cv_rect(6, 194, 228, 1, PH_MID);
+    cv_rect(6, 46, 1, 149, PH_MID); cv_rect(233, 46, 1, 149, PH_MID);
+    for (i = 1; i < 8u; i++) {
+        uint32_t k;
+        for (k = 48; k < 194u; k += 3u) cv_pset(6 + (int32_t)i * 29, (int32_t)k, PH_LO);
+        for (k = 8; k < 233u; k += 3u) if (i < 6u) cv_pset((int32_t)k, 46 + (int32_t)i * 25, PH_LO);
+    }
+    for (i = 0; i < 128u; i++)
+        cv_pset(120 + ((sine(i << 25) * 52) >> 15), 120 - ((sine((i << 25) + 0x40000000u) * 52) >> 15), PH_HI);
+    for (i = 0; i < 8u; i++)                    /* the steps, dim to bright */
+        cv_rect(24 + (int32_t)i * 24, 104, 20, 32, RGB(0, 32 + i * 31, 0));
+    for (i = 0; i < 192u; i++)                  /* a sine sweep, bright */
+        cv_pset(24 + (int32_t)i, 160 - ((sine(i * 0x05555555u) * 14) >> 15), PH_HI);
+    cv_text(2, 200, &FONT_S, "K1 PHOSPHOR  K2 BRIGHTNESS", PH_LO);
+    cv_out(BODY_Y);
+}
+
 static void draw_global(uint32_t qsel)
 {
     uint32_t t = g_tun, n = TUN_N[t], j, o;
@@ -1763,10 +1830,13 @@ static void app_main(void)
     uint32_t o, k, sel = 0, fsel = 0, prev = 0, page = PG_INDEX, icur = PG_OSC, mcs = 0, mcr = 0, mtop = 0, mleft = 0;
     uint32_t dirty = 1, hdr_dirty = 1, batt_shown = 0xFFFFu, t_batt = 0, t_live = 0, pcur = 1, pconf = PC_NONE, t_msg = 0;
     const char *pmsg = "";
-    uint32_t gsel = 0, gcc = 0, gcr = 0, gtop = 0, gleft = 0, t_hist = 0, qsel = 0, vsel = 0;
+    uint32_t gsel = 0, gcc = 0, gcr = 0, gtop = 0, gleft = 0, t_hist = 0, qsel = 0, vsel = 0, vdu_dirty = 0, t_vdu = 0;
     int32_t oct = -1, e, shift_drawn = -1;
 
     int skip;
+    if (settings_load(&gset, sizeof gset)) { gset.boots = 0; gset.phos = 0; gset.bright = 7; }   /* (none yet) */
+    if (gset.phos >= NPHOS) gset.phos = 0;
+    if (gset.bright > 10u) gset.bright = 7;
     crt_init();
     batt_poll();                                /* (a first reading, so the header has one from the start) */
     draw_boot(0);
@@ -1790,11 +1860,9 @@ static void app_main(void)
     if (!skip) { draw_boot(1); skip = boot_wait(250); }
     if (!skip) { draw_boot(2); skip = boot_wait(250); }
     {                                           /* every power-on a new patch: a boot count in flash, the timing */
-        struct { uint32_t boots; } set = {0};
-        settings_load(&set, sizeof set);
-        set.boots++;
-        settings_save(&set, sizeof set);        /* (silent yet: nothing has been pushed to the engine) */
-        rnd_s ^= set.boots * 0x85EBCA6Bu;
+        gset.boots++;
+        settings_save(&gset, sizeof gset);      /* (silent yet: nothing has been pushed to the engine) */
+        rnd_s ^= gset.boots * 0x85EBCA6Bu;
 #ifndef DINGHY_HOST
         rnd_s ^= fm1_ticks() * 0xC2B2AE35u;
 #endif
@@ -1851,7 +1919,7 @@ static void app_main(void)
                 else if (page == PG_FG) fsel = (fsel + NFG + (uint32_t)st) % NFG;
                 else if (page == PG_SH) ssel = (ssel + NSSG + (uint32_t)st) % NSSG;
                 else if (page == PG_GATE) gsel = (gsel + NGG + (uint32_t)st) % NGG;
-                else if (page == PG_GLOBAL) qsel = (qsel + NO + (uint32_t)st) % NO;
+                else if (page == PG_GLOBAL) { gsub ^= 1u; hdr_dirty = 1; }   /* page 9: TUNING <-> VDU */
                 else if (page == PG_VERB) { fxsub = st > 0; hdr_dirty = 1; }   /* OCT-: REVERB, OCT+: DELAY */
             }
         }
@@ -1993,6 +2061,11 @@ static void app_main(void)
             if ((e = fm1_enc_take(ENC_PRESETS)) != 0) { vpatch.rate = e > 0; ch = 1; }
             if (b & (1u << BTN_PLAY)) { vpatch.freeze ^= 1u; ch = 1; }
             if (ch) { push_verb(); dirty = 1; }
+        } else if (page == PG_GLOBAL && gsub) {  /* the VDU: applied at once, saved 2 s after the last turn */
+            int ch = 0;
+            if ((e = fm1_enc_take(ENC_KNOB1)) != 0) { gset.phos = (uint8_t)cl(gset.phos + (e > 0 ? 1 : -1), 0, NPHOS - 1); ch = 1; }
+            if ((e = fm1_enc_take(ENC_KNOB2)) != 0) { gset.bright = (uint8_t)cl(gset.bright + e, 0, 10); ch = 1; }
+            if (ch) { crt_build(); dirty = hdr_dirty = 1; vdu_dirty = 1; t_vdu = fm1_ms; }
         } else if (page == PG_GLOBAL) {
             int ch = 0;
             if ((e = fm1_enc_take(ENC_KNOB1)) != 0) {   /* a new tuning keeps the scale's place where it can */
@@ -2069,7 +2142,7 @@ static void app_main(void)
             } else if (page == PG_VERB) {          /* the return's level, as a bar */
                 uint32_t lv = (uint32_t)cl(v_level, 0, 32767) * 16u >> 14;
                 on = wi >= 0 && (uint32_t)wi < lv;
-            } else if (page == PG_GLOBAL) {        /* the oscillators' notes lit; a 12-step scale glows */
+            } else if (page == PG_GLOBAL && !gsub) { /* the oscillators' notes lit; a 12-step scale glows */
                 uint32_t note = base + k;
                 for (o = 0; o < NO; o++)
                     if ((uint32_t)((q_pitch_v[o] + 128) >> 8) == note) on = 1;
@@ -2110,7 +2183,7 @@ static void app_main(void)
             fm1_led_key(BTN_FX, page == PG_VERB && blink);   /* FX again: the other half */
             fm1_led_key(BTN_PLAY, ((page == PG_FG || page == PG_SH) && (play || blink))   /* a manual gate / sample */
                                   || (page == PG_WAVE && otab[sel] >= T_GEN && blink)   /* a new generative table */
-                                  || (page == PG_GLOBAL && (oq[qsel].on || blink))   /* solid: this one quantises */
+                                  || (page == PG_GLOBAL && !gsub && (oq[qsel].on || blink))   /* solid: it quantises */
                                   || (page == PG_VERB && !fxsub && (vpatch.freeze || v_gate_freeze || blink))   /* frozen */
                                   || (page == PG_VERB && fxsub && blink)   /* the delay: PLAY clears it */
                                   || (page == PG_MOD && (depth[mcs][DLIST[mcr]] || blink))   /* solid: a pin here */
@@ -2136,6 +2209,7 @@ static void app_main(void)
             && fm1_ms - t_live > 50u) { t_live = fm1_ms; dirty = 1; }
 
         idle_ok = 1;                            /* MIDI in while the screen draws */
+        if (vdu_dirty && fm1_ms - t_vdu > 2000u) { vdu_dirty = 0; settings_store(); }   /* (a short fade) */
         if (hdr_dirty) { hdr_dirty = 0; draw_header(page); }
         if (dirty) {
             dirty = 0;
@@ -2148,7 +2222,7 @@ static void app_main(void)
             case PG_PATCH: draw_patch(pcur, pconf, pmsg); break;
             case PG_GATE: draw_gg(gsel); break;
             case PG_SH: draw_sh(); break;
-            case PG_GLOBAL: draw_global(qsel); break;
+            case PG_GLOBAL: if (gsub) draw_vdu(); else draw_global(qsel); break;
             case PG_VERB: if (fxsub) draw_delay(vsel, shift); else draw_verb(vsel, shift); break;
             case PG_GMAT: draw_gmat(gcc, gcr, gtop, gleft); break;
             default: draw_soon(page); break;
