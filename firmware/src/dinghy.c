@@ -1369,6 +1369,7 @@ static void s_secs(char *s, uint32_t cs)        /* 1/100 s -> "12.5S" or "120S" 
     else { s_int(s, (int32_t)(cs / 100u), 0); s_cat(s, "."); s_int(s, (int32_t)(cs / 10u % 10u), 0); }
     s_cat(s, "S");
 }
+static uint32_t ssel;                           /* page 5: the selected SSG (OCT- / OCT+), PLAY fires it */
 static void draw_sh(void)
 {
     uint32_t k, i;
@@ -1382,7 +1383,8 @@ static void draw_sh(void)
         s_int(s, (int32_t)k + 1, 0);
         s_cat(s, " IN ");
         s_cat(s, in == 0u || in > NSRC ? "NOISE" : SRCL[in - 1u]);
-        cv_text(4, y0 + 2, &FONT_S, s, ssg_fired[k] ? PH_HI : PH_MID);
+        if (k == ssel) cv_rect(0, y0 + 1, 116, 17, PH_SEL);
+        cv_text(4, y0 + 2, &FONT_S, s, ssg_fired[k] || k == ssel ? PH_HI : PH_MID);
         ssg_fired[k] = 0;
         s[0] = 0;
         s_cat(s, "SLEW ");
@@ -1412,7 +1414,7 @@ static void draw_sh(void)
         cv_rect(178, y, 1, 7, PH_LO);
         if (v >= 0) cv_rect(179, y + 1, v, 5, PH_MID); else cv_rect(178 + v, y + 1, -v, 5, PH_MID);
     }
-    cv_text(2, 202, &FONT_S, "K1/2 S1 K3/4 S2 ALG:RATE PLAY", PH_LO);
+    cv_text(2, 202, &FONT_S, "K1/2 S1 K3/4 S2 ALG:RATE OCT", PH_LO);
     cv_out(BODY_Y);
 }
 
@@ -1721,8 +1723,21 @@ static void app_main(void)
             newpage = PG_VERB;
         }
         if (b & (1u << BTN_SAVE)) newpage = PG_PATCH;
-        if (b & (1u << BTN_OCT_DOWN) && oct > -3) oct--;
-        if (b & (1u << BTN_OCT_UP) && oct < 2) oct++;
+        if (page == PG_OSC) {                   /* page 2: OCT is the keyboard's octave */
+            if (b & (1u << BTN_OCT_DOWN) && oct > -3) oct--;
+            if (b & (1u << BTN_OCT_UP) && oct < 2) oct++;
+        } else {                                /* elsewhere: the previous / next thing (wrapping round) */
+            int32_t st = (b >> BTN_OCT_UP & 1u) ? 1 : (b >> BTN_OCT_DOWN & 1u) ? -1 : 0;
+            if (st) {
+                dirty = 1;
+                if (page == PG_WAVE) sel = (sel + NO + (uint32_t)st) % NO;
+                else if (page == PG_FG) fsel = (fsel + NFG + (uint32_t)st) % NFG;
+                else if (page == PG_SH) ssel = (ssel + NSSG + (uint32_t)st) % NSSG;
+                else if (page == PG_GATE) gsel = (gsel + NGG + (uint32_t)st) % NGG;
+                else if (page == PG_GLOBAL) qsel = (qsel + NO + (uint32_t)st) % NO;
+                else if (page == PG_VERB) { fxsub = st > 0; hdr_dirty = 1; }   /* OCT-: REVERB, OCT+: DELAY */
+            }
+        }
         base = (uint32_t)(53 + 12 * oct);       /* key 0 = F3, shifted */
 
         if (page == PG_INDEX) {
@@ -1760,7 +1775,7 @@ static void app_main(void)
 
         for (k = 0; k < NFG; k++)               /* PLAY held on the FG page: the selected FG's gate */
             fg_manual[k] = (uint8_t)(page == PG_FG && k == fsel && play);
-        if (page == PG_SH && b >> BTN_PLAY & 1u) ssg_tap[shift ? 1 : 0]++;   /* PLAY: S1, SEL + PLAY: S2 */
+        if (page == PG_SH && b >> BTN_PLAY & 1u) ssg_tap[ssel]++;   /* PLAY: the selected SSG samples */
 
         if (page == PG_OSC || page == PG_WAVE) {
             patch_t *q;
@@ -1923,17 +1938,20 @@ static void app_main(void)
         if (page != PG_OSC) prev = fm1_in.notes;
         for (k = 0; k < 7u; k++) (void)fm1_enc_take(k);   /* turns a page does not use go nowhere */
 
-        /* the keys' LEDs follow the page */
+        /* the keys' LEDs follow the page; a moving level runs along the white keys only */
         for (k = 0; k < 27u; k++) {
+            static const int8_t WIDX[27] = {0, -1, 1, -1, 2, -1, 3, 4, -1, 5, -1, 6, 7, -1, 8, -1, 9, -1, 10, 11, -1,
+                                            12, -1, 13, 14, -1, 15};   /* key -> its white key (F3 .. G5), -1 black */
+            int32_t wi = WIDX[k];
             uint32_t on = 0, glow = 0;
             if (page == PG_OSC) {
                 for (o = 0; o < NO; o++)
                     if (opatch[o].note == base + k) { if (o == sel) on = 1; else glow = 1; }
             } else if (page == PG_VERB && fxsub) { /* the register's write head, running along the keys */
-                on = k == dl_w_v * 27u / DL_N;
+                on = wi >= 0 && (uint32_t)wi == dl_w_v * 16u / DL_N;
             } else if (page == PG_VERB) {          /* the return's level, as a bar */
-                uint32_t lv = (uint32_t)cl(v_level, 0, 32767) * 27u >> 14;
-                on = k < lv;
+                uint32_t lv = (uint32_t)cl(v_level, 0, 32767) * 16u >> 14;
+                on = wi >= 0 && (uint32_t)wi < lv;
             } else if (page == PG_GLOBAL) {        /* the oscillators' notes lit; a 12-step scale glows */
                 uint32_t note = base + k;
                 for (o = 0; o < NO; o++)
@@ -1943,27 +1961,36 @@ static void app_main(void)
                     glow = SCL_LO[g_scl] >> pc & 1u;
                 }
             } else if (page == PG_SH) {            /* S1 on the lower keys, S2 on the upper */
-                uint32_t p1 = (src_disp(S_SSG(0)) * 12u) >> 15, p2 = 14u + ((src_disp(S_SSG(1)) * 12u) >> 15);
-                on = k == p1 || k == p2;
+                uint32_t p1 = (src_disp(S_SSG(0)) * 7u) >> 15, p2 = 8u + ((src_disp(S_SSG(1)) * 7u) >> 15);
+                on = wi >= 0 && ((uint32_t)wi == p1 || (uint32_t)wi == p2);   /* (white keys 0..7 and 8..15) */
             } else if (page == PG_GATE) {          /* the nine outputs, every third key */
                 on = k % 3u == 0u && (uint32_t)gg_bits[gsel] >> (k / 3u) & 1u;
             } else if (page == PG_GMAT) {          /* the whole keyboard flashes with the source */
                 on = gsrc_on(gcr);
             } else if (page == PG_FG || page == PG_MOD) {
-                uint32_t pos = ((page == PG_FG ? (uint32_t)fg_out[fsel] : src_disp(mcs)) * 26u) >> 15;
-                on = k == pos;
-                glow = k < pos;
+                uint32_t pos = ((page == PG_FG ? (uint32_t)fg_out[fsel] : src_disp(mcs)) * 15u) >> 15;
+                on = wi >= 0 && (uint32_t)wi == pos;
+                glow = wi >= 0 && (uint32_t)wi < pos;
             }
             fm1_led_key(KEY_LED(k), on);
             if (!on) fm1_led_key_glow(KEY_LED(k), glow);
         }
-        fm1_led_key(BTN_OCT_DOWN, oct < 0);
-        fm1_led_key(BTN_OCT_UP, oct > 0);
         {
-            uint32_t blink = (fm1_ms / 250u) & 1u;   /* a flashing button: "press me here" */
-            fm1_led_key(BTN_SEL, shift || ((page == PG_INDEX || page == PG_PATCH) && blink));
+            uint32_t blink = (fm1_ms / 250u) & 1u;   /* a flashing button: "press me here" (its job here is this page's) */
+            int pn = page == PG_WAVE || page == PG_FG || page == PG_SH || page == PG_GATE || page == PG_GLOBAL
+                  || page == PG_VERB;           /* OCT- / OCT+ as previous / next: flashing in turn */
+            if (page == PG_OSC) {               /* page 2: the octave; solid on the side it is shifted to */
+                fm1_led_key(BTN_OCT_DOWN, oct < 0 || blink);
+                fm1_led_key(BTN_OCT_UP, oct > 0 || blink);
+            } else {
+                fm1_led_key(BTN_OCT_DOWN, pn && blink);
+                fm1_led_key(BTN_OCT_UP, pn && !blink);
+            }
+            fm1_led_key(BTN_SEL, shift || ((page == PG_INDEX || page == PG_PATCH || page == PG_OSC
+                                            || page == PG_GATE || page == PG_VERB) && blink));
             fm1_led_key(BTN_HOME, page != PG_INDEX && blink);   /* away from the index: HOME leads back */
             fm1_led_key(BTN_SAVE, page == PG_PATCH && (pconf == PC_SAVE || blink));
+            fm1_led_key(BTN_FX, page == PG_VERB && blink);   /* FX again: the other half */
             fm1_led_key(BTN_PLAY, ((page == PG_FG || page == PG_SH) && (play || blink))   /* a manual gate / sample */
                                   || (page == PG_WAVE && otab[sel] >= T_GEN && blink)   /* a new generative table */
                                   || (page == PG_GLOBAL && (oq[qsel].on || blink))   /* solid: this one quantises */
@@ -1978,7 +2005,6 @@ static void app_main(void)
         fm1_led_key(BTN_LFO, page == PG_GATE);
         fm1_led_key(BTN_SEQ, page == PG_GMAT);
         fm1_led_key(BTN_GLO, page == PG_GLOBAL);
-        fm1_led_key(BTN_FX, page == PG_VERB);
 
         if (fm1_ms - t_cpu > 500u) {            /* the worst render of the last half second, in the header */
             uint32_t us = audio_us_max, pct;
