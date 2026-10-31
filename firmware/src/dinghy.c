@@ -1024,7 +1024,44 @@ static void cv_out(uint32_t y0)                 /* the canvas (240 wide) through
 }
 
 static uint32_t fxsub;                          /* the FX page: 0 the reverb, 1 the delay (FX again flips it) */
-static void draw_header(uint32_t pg, uint32_t cpu_pct)
+/* ---- the battery: SARADC channel 3 (the battery's divider), raw 0..1023, read every 2 s and smoothed. The scale is
+ * built around the stock firmware's bar thresholds (531 / 561 / 591, as Felucca has them): BATT_EMPTY .. BATT_FULL
+ * are first guesses, to be set from a full and a nearly flat reading (the boot screen shows the raw one). On USB
+ * the reading is a charger's, not the battery's: the header shows USB instead. */
+#define BATT_EMPTY 515
+#define BATT_FULL 615
+static int32_t batt_avg = -1;                   /* x 16 */
+static uint32_t batt_raw(void)
+{
+#ifdef DINGHY_HOST
+    return 600u;
+#else
+    int32_t a = fm1_adc_read(FM1_ADC_BATT);
+    return a < 0 ? 0u : (uint32_t)a;
+#endif
+}
+static void batt_poll(void)
+{
+    uint32_t r = batt_raw();
+    if (!r) return;
+    if (batt_avg < 0) batt_avg = (int32_t)r * 16;
+    else batt_avg += ((int32_t)r * 16 - batt_avg) / 8;
+}
+static int batt_usb(void)
+{
+#ifdef DINGHY_HOST
+    return 0;
+#else
+    return usb.config && !usb.suspended;
+#endif
+}
+static int32_t batt_pct(void)                   /* 0..100, or -1 (not read yet) */
+{
+    if (batt_avg < 0) return -1;
+    return cl(((batt_avg / 16) - BATT_EMPTY) * 100 / (BATT_FULL - BATT_EMPTY), 0, 100);
+}
+
+static void draw_header(uint32_t pg)
 {
     char s[40] = "PAGE ";
     s_cat(s, PG_NUM[pg]);
@@ -1033,11 +1070,12 @@ static void draw_header(uint32_t pg, uint32_t cpu_pct)
     if (pg == PG_VERB) s_cat(s, fxsub ? ": DELAY" : ": REVERB");
     cv_begin(240, BODY_Y, PH_BG);
     cv_text(4, 2, &FONT_S, s, PH_HI);
-    if (cpu_pct) {
+    {                                           /* the battery, top right */
         char c[12] = "";
-        s_int(c, (int32_t)cpu_pct, 0);
-        s_cat(c, "%");
-        cv_text(236 - text_w(&FONT_S, c), 2, &FONT_S, c, PH_LO);
+        int32_t b = batt_pct();
+        if (batt_usb()) s_cat(c, "USB");
+        else if (b >= 0) { s_int(c, b, 0); s_cat(c, "%"); }
+        cv_text(236 - text_w(&FONT_S, c), 2, &FONT_S, c, b >= 0 && b < 15 && !batt_usb() ? PH_HI : PH_LO);
     }
     cv_rect(0, 19, 240, 1, PH_MID);
     cv_out(0);
@@ -1648,9 +1686,9 @@ static void big_text(int32_t x, int32_t y, const char *s, int32_t sx, int32_t sy
 }
 static void draw_boot(uint32_t step)            /* step 0..8: the loading lines appear, then READY */
 {
-    static const char *const LINE[4] = {"WAVETABLES ......  13", "TUNINGS .........  21", "PATCH MEMORY ....  16",
-                                        "VOICES ..........   4"};
+    static const char *const LINE[3] = {"WAVETABLES ......  13", "TUNINGS .........  21", "PATCH MEMORY ....  16"};
     uint32_t i;
+    char bl[32] = "BATTERY ........ ";
     cv_begin(240, BODY_Y, PH_BG);
     cv_out(0);
     cv_begin(240, BODY_H, PH_BG);
@@ -1660,7 +1698,12 @@ static void draw_boot(uint32_t step)            /* step 0..8: the loading lines 
     cv_rect(16, 90, 208, 2, PH_MID);
     cv_text(36, 96, &FONT_S, "FM-1 WAVETABLE SYSTEM", PH_MID);
     cv_text(48, 114, &FONT_S, "SERIES I   REV " WT_VERSION, PH_LO);
-    for (i = 0; i < 4u && i < step; i++) cv_text(36, 138 + (int32_t)i * 16, &FONT_S, LINE[i], PH_MID);
+    for (i = 0; i < 3u && i < step; i++) cv_text(36, 138 + (int32_t)i * 16, &FONT_S, LINE[i], PH_MID);
+    if (step >= 4u) {                           /* the raw reading (for the scale), or USB */
+        if (batt_usb()) s_cat(bl, "USB");
+        else { uint32_t r = batt_raw(); if (r < 1000u) s_cat(bl, " "); s_int(bl, (int32_t)r, 0); }
+        cv_text(36, 186, &FONT_S, bl, PH_MID);
+    }
     if (step >= 6u) cv_text(36, 202, &FONT_S, "READY", PH_HI);
     else if (step & 1u) cv_text(36, 202, &FONT_S, "SYSTEM LOADING _", PH_LO);
     else cv_text(36, 202, &FONT_S, "SYSTEM LOADING", PH_LO);
@@ -1718,13 +1761,14 @@ static void draw_patch(uint32_t cur, uint32_t confirm, const char *msg)
 static void app_main(void)
 {
     uint32_t o, k, sel = 0, fsel = 0, prev = 0, page = PG_INDEX, icur = PG_OSC, mcs = 0, mcr = 0, mtop = 0, mleft = 0;
-    uint32_t dirty = 1, hdr_dirty = 1, cpu_pct = 0, t_cpu = 0, t_live = 0, pcur = 1, pconf = PC_NONE, t_msg = 0;
+    uint32_t dirty = 1, hdr_dirty = 1, batt_shown = 0xFFFFu, t_batt = 0, t_live = 0, pcur = 1, pconf = PC_NONE, t_msg = 0;
     const char *pmsg = "";
     uint32_t gsel = 0, gcc = 0, gcr = 0, gtop = 0, gleft = 0, t_hist = 0, qsel = 0, vsel = 0;
     int32_t oct = -1, e, shift_drawn = -1;
 
     int skip;
     crt_init();
+    batt_poll();                                /* (a first reading, so the header has one from the start) */
     draw_boot(0);
     skip = boot_wait(300);
     for (k = 0; k < NGG; k++) ggpatch[k] = GG_DEFAULT[k];
@@ -2079,12 +2123,12 @@ static void app_main(void)
         fm1_led_key(BTN_SEQ, page == PG_GMAT);
         fm1_led_key(BTN_GLO, page == PG_GLOBAL);
 
-        if (fm1_ms - t_cpu > 500u) {            /* the worst render of the last half second, in the header */
-            uint32_t us = audio_us_max, pct;
-            audio_us_max = 0;
-            t_cpu = fm1_ms;
-            pct = us * 100u / 5805u;            /* 256 frames at 44.1 kHz = 5805 us */
-            if (us && pct != cpu_pct) { cpu_pct = pct; hdr_dirty = 1; }
+        if (fm1_ms - t_batt > 2000u) {          /* the battery, every 2 s, into the header when it changes */
+            uint32_t now;
+            t_batt = fm1_ms;
+            batt_poll();
+            now = batt_usb() ? 0x8000u : (uint32_t)(batt_pct() & 0x7F);
+            if (now != batt_shown) { batt_shown = now; hdr_dirty = 1; }
         }
         if ((page == PG_OSC || page == PG_VERB) && shift != shift_drawn) { shift_drawn = shift; dirty = 1; }
         if ((page == PG_FG || page == PG_MOD || page == PG_WAVE || page == PG_GATE || page == PG_GMAT || page == PG_SH
@@ -2092,7 +2136,7 @@ static void app_main(void)
             && fm1_ms - t_live > 50u) { t_live = fm1_ms; dirty = 1; }
 
         idle_ok = 1;                            /* MIDI in while the screen draws */
-        if (hdr_dirty) { hdr_dirty = 0; draw_header(page, cpu_pct); }
+        if (hdr_dirty) { hdr_dirty = 0; draw_header(page); }
         if (dirty) {
             dirty = 0;
             switch (page) {
