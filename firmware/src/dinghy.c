@@ -1215,7 +1215,7 @@ static void draw_wave(uint32_t sel, int32_t posq)
     if (oscan[sel]) { wc = (posq + 128) >> 8; f = 0; }   /* stepped: the wave it is on */
     cv_begin(240, BODY_H, PH_BG);
     for (w = 60; w >= 0; w -= 4) {              /* the table in 3D, back to front, as the Waveterm drew it */
-        int32_t x0 = 8 + (w * 3) / 2, y0 = 174 - (w * 7) / 5, py = 0;
+        int32_t x0 = 8 + (w * 3) / 2, y0 = 164 - (w * 7) / 5, py = 0;
         for (i = 0; i < 128; i++) {
             int32_t y = y0 - ((wave_at((uint32_t)w, (uint32_t)i) * 22) >> 7);
             if (i) cv_line(x0 + i - 1, py, x0 + i, y, PH_LO);
@@ -1223,7 +1223,7 @@ static void draw_wave(uint32_t sel, int32_t posq)
         }
     }
     {                                           /* the wave playing now, bright, in its place */
-        int32_t x0 = 8 + (wc * 3) / 2, y0 = 174 - (wc * 7) / 5, py = 0;
+        int32_t x0 = 8 + (wc * 3) / 2, y0 = 164 - (wc * 7) / 5, py = 0;
         uint32_t w1 = wc + 1 < (int32_t)WT_WAVES ? (uint32_t)wc + 1u : (uint32_t)wc;
         for (i = 0; i < 128; i++) {
             int32_t v = (wave_at((uint32_t)wc, (uint32_t)i) * (256 - f) + wave_at(w1, (uint32_t)i) * f) >> 8;
