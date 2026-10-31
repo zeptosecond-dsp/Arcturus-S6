@@ -26,6 +26,7 @@ static void app_idle(void);
 #include "platform.c"
 #include "wt_tables.h"
 #include "luts.h"
+#include "tunings.h"
 
 static int32_t cl(int32_t v, int32_t lo, int32_t hi) { return v < lo ? lo : v > hi ? hi : v; }
 
@@ -48,12 +49,15 @@ enum { P_PITCH, P_WAVE, P_MOD, P_THR, P_HICUT, P_LEVEL, P_PAN, NP };
 /* gate sources: per generator A B AND NAND OR NOR XOR XNOR NOT, then the FGs' EOCs.
  * gate destinations: the FGs' gates, then each generator's two logic inputs (pinned: they replace A, B there) */
 #define GS_PER 9u
-#define NGSRC (NGG * GS_PER + NFG)
+#define GS_Q(o) (NGG * GS_PER + NFG + (o))     /* ... then the quantisers' note-change gates */
+#define NGSRC (NGG * GS_PER + NFG + NO)
 #define NGDST (NFG + 2u * NGG + NSSG)              /* ... then the SSGs' sample inputs */
 #define G_SSG(k) (NFG + 2u * NGG + (k))
 
 typedef struct {                                /* the knobs, set by the main loop */
-    volatile int32_t pitch_q8;                  /* note * 256 + fine, 1/256 semitone */
+    volatile int32_t pitch_q8;                  /* note * 256, 1/256 semitone */
+    volatile int32_t fine_q8;                   /* (after the quantiser) */
+    volatile uint8_t qon, qglide;
     volatile uint8_t pos, mod, thr, hicut, level, pan;
     volatile uint8_t table, scan;               /* scan: 0 smooth (crossfade), 1 stepped (PPG) */
 } osc_par_t;
@@ -63,6 +67,11 @@ typedef struct {                                /* owned by the interrupt */
     int32_t amp, lp1, lp2, last;
 } osc_st_t;
 static osc_par_t opar[NO];
+static volatile uint8_t g_tun, g_scl, g_root;   /* the global tuning, scale (an index into SCL_*), root (0..11) */
+static int32_t q_held[NO], q_cur[NO];           /* the quantiser: the note held, the pitch gliding to it */
+static int32_t q_id[NO] = {-1, -1, -1, -1};
+static uint8_t qg_cnt[NO];                      /* the note-change gate, ~5 ms */
+static volatile int32_t q_step_v[NO], q_pitch_v[NO];   /* for the screen: the step, the pitch now */
 #define T_GEN WT_TABLES                         /* the generative table, built here from a seed */
 #define NTAB (WT_TABLES + 1u)
 static int8_t gen_tab[2][WT_WAVES][WT_SAMPLES]; /* two: one plays while the other is built */
@@ -176,6 +185,35 @@ static void fg_step(uint32_t k, uint32_t rise_k, uint32_t fall_k, uint32_t g)
     fg_eoc_v[k] = s->eoc != 0;
 }
 
+/* the nearest allowed step of the global tuning and scale to pitch q (1/256 semitone); its id (period * n + step)
+ * and its step number come back too */
+static int32_t quantise(int32_t q, int32_t *id, int32_t *stepn)
+{
+    uint32_t t = g_tun < NTUN ? g_tun : 0u, n = TUN_N[t], j, sc = g_scl;
+    int32_t per = TUN_PERIOD[t], c, k, rem, best = 0x7FFFFFFF, bv = 0, bj = 0, bk = 0;
+    const uint16_t *st = &TUN_STEPS[TUN_OFF[t]];
+    uint32_t lo, hi;
+    if (sc < TUN_SCL0[t] || sc >= TUN_SCL0[t] + TUN_NSCL[t]) sc = TUN_SCL0[t];
+    lo = SCL_LO[sc]; hi = SCL_HI[sc];
+    if (!lo && !hi) lo = 1u;
+    c = q - (int32_t)g_root * 256;
+    k = c >= 0 ? c / per : -((-c + per - 1) / per);
+    rem = c - k * per;
+    for (j = 0; j < n; j++) {                   /* this period's steps, the next one's first, the last one's last */
+        int32_t v, d, kk;
+        if (!(j < 32u ? lo >> j & 1u : hi >> (j - 32u) & 1u)) continue;
+        for (kk = -1; kk <= 1; kk++) {
+            v = (int32_t)st[j] + kk * per;
+            d = rem - v;
+            if (d < 0) d = -d;
+            if (d < best) { best = d; bv = v; bj = (int32_t)j; bk = k + kk; }
+        }
+    }
+    *id = bk * (int32_t)n + bj;
+    *stepn = bj;
+    return (int32_t)g_root * 256 + k * per + bv;
+}
+
 static void render(int32_t *out)                /* SUB frames */
 {
     int32_t acc[NDST], src[NSRC];
@@ -206,7 +244,8 @@ static void render(int32_t *out)                /* SUB frames */
             uint32_t m = gmat[i], on;
             if (!m) continue;
             gpin |= m;
-            on = i < NGG * GS_PER ? (uint32_t)gg_bits[i / GS_PER] >> (i % GS_PER) & 1u : fg_eoc_v[i - NGG * GS_PER];
+            on = i < NGG * GS_PER ? (uint32_t)gg_bits[i / GS_PER] >> (i % GS_PER) & 1u
+               : i < GS_Q(0) ? fg_eoc_v[i - NGG * GS_PER] : qg_cnt[i - GS_Q(0)] != 0u;
             if (on) gdst |= m;
         }
         for (g = 0; g < NGG; g++) {
@@ -269,7 +308,30 @@ static void render(int32_t *out)                /* SUB frames */
         tab[o] = table_of(p->table);
         step[o] = p->scan;
         int32_t q, target, dpos;
-        inc[o] = pitch_inc(p->pitch_q8 + ((a[P_PITCH] * 3) >> 3));          /* full depth: ~4 octaves */
+        {
+            int32_t pq = p->pitch_q8 + ((a[P_PITCH] * 3) >> 3);           /* full depth: ~4 octaves */
+            if (p->qon) {                       /* the quantiser, with a little hysteresis (~8 cents) */
+                int32_t id, sn, cand = quantise(pq, &id, &sn), dc = pq - cand, dh = pq - q_held[o];
+                if (dc < 0) dc = -dc;
+                if (dh < 0) dh = -dh;
+                if (q_id[o] < 0 || (id != q_id[o] && dc + 20 < dh)) {
+                    if (q_id[o] >= 0) qg_cnt[o] = 7;   /* a new note: a gate */
+                    q_id[o] = id; q_held[o] = cand; q_step_v[o] = sn;
+                }
+                if (!p->qglide) q_cur[o] = q_held[o];
+                else {
+                    int32_t g = (int32_t)(((uint64_t)LUT_FGINC[p->qglide] * 3072u) >> 24) + 1, d = q_held[o] - q_cur[o];
+                    q_cur[o] += d > g ? g : d < -g ? -g : d;   /* (an octave in the glide time) */
+                }
+                pq = q_cur[o];
+            } else {
+                q_id[o] = -1;
+                q_cur[o] = pq;
+            }
+            if (qg_cnt[o]) qg_cnt[o]--;
+            q_pitch_v[o] = pq;
+            inc[o] = pitch_inc(pq + p->fine_q8);
+        }
         target = (cl(p->pos * 256 + a[P_WAVE], 0, 127 * 256) * 127) >> 8;   /* -> Q8 waves, 0..63 */
         dpos = target - ost[o].posq;
         ost[o].posq += dpos > 128 ? 128 : dpos < -128 ? -128 : dpos;
@@ -364,6 +426,18 @@ static fgpatch_t fgpatch[NFG] = {               /* four cycling, two waiting for
 };
 
 static uint8_t otab[NO], oscan[NO];             /* (kept apart from patch_t: older patches keep their layout) */
+typedef struct { uint8_t on, glide; } oq_t;
+static oq_t oq[NO];                             /* each oscillator's quantiser */
+typedef struct { uint8_t tun, scl, root, pad; } tunpatch_t;
+static tunpatch_t tunpatch = {0, 1, 0, 0};      /* 12-TET, MAJOR, C */
+static void push_tun(void)
+{
+    uint32_t t = tunpatch.tun < NTUN ? tunpatch.tun : 0u;
+    if (tunpatch.scl < TUN_SCL0[t] || tunpatch.scl >= TUN_SCL0[t] + TUN_NSCL[t]) tunpatch.scl = TUN_SCL0[t];
+    g_tun = (uint8_t)t;
+    g_scl = tunpatch.scl;
+    g_root = (uint8_t)(tunpatch.root % 12u);
+}
 static uint32_t gen_seed = 1u, gen_built;
 
 /* the generative table: a sine, partials from the seed creeping in (the higher, the later), bite in the last
@@ -412,7 +486,10 @@ static void gen_build(uint32_t seed)
 static void push_osc(uint32_t o)
 {
     patch_t *q = &opatch[o];
-    opar[o].pitch_q8 = (int32_t)q->note * 256 + (int32_t)q->fine * 256 / 100;
+    opar[o].pitch_q8 = (int32_t)q->note * 256;
+    opar[o].fine_q8 = (int32_t)q->fine * 256 / 100;
+    opar[o].qon = oq[o].on;
+    opar[o].qglide = oq[o].glide;
     opar[o].pos = q->pos;
     opar[o].mod = q->mod;
     opar[o].thr = q->thr;
@@ -490,6 +567,8 @@ typedef struct {
     shpatch_t sh;                               /* version 3 on */
     uint8_t otab[NO], oscan[NO];                /* version 4 on */
     uint32_t gseed;
+    oq_t oq[NO];                                /* version 5 on */
+    tunpatch_t tun;
 } pdata_t;
 typedef union { pdata_t d; uint8_t raw[2040]; } pslot_t;
 typedef char pdata_fits_its_slot[sizeof(pdata_t) <= 2040u ? 1 : -1];   /* (the build fails if it ever grows past) */
@@ -531,7 +610,7 @@ static int patch_save(uint32_t slot)            /* 1..16 */
         for (k = 0; k < sizeof pbank[j].raw; k++) raw[k] = 0;
     }
     q->tag = PATCH_TAG;
-    q->ver = 4;
+    q->ver = 5;
     q->used = 1;
     for (o = 0; o < NO; o++) q->osc[o] = opatch[o];
     for (k = 0; k < NFG; k++) q->fg[k] = fgpatch[k];
@@ -542,6 +621,8 @@ static int patch_save(uint32_t slot)            /* 1..16 */
     q->sh = shpatch;
     for (o = 0; o < NO; o++) { q->otab[o] = otab[o]; q->oscan[o] = oscan[o]; }
     q->gseed = gen_seed;
+    for (o = 0; o < NO; o++) q->oq[o] = oq[o];
+    q->tun = tunpatch;
     mute = 1;                                   /* fade out, save, fade in: the erase stops the sound ~50 ms */
     t0 = fm1_ms;
     while (out_gain > 0 && fm1_ms - t0 < 100u) platform_poll();
@@ -563,7 +644,8 @@ static int patch_load(uint32_t slot)            /* 0 = the default */
         for (k = 0; k < NGG; k++) ggpatch[k] = GG_DEFAULT[k];
         for (k = 0; k < NGSRC; k++) gpatch[k] = def_gm[k];
         shpatch = SH_DEFAULT;
-        for (o = 0; o < NO; o++) otab[o] = oscan[o] = 0;
+        for (o = 0; o < NO; o++) { otab[o] = oscan[o] = 0; oq[o].on = oq[o].glide = 0; }
+        tunpatch.tun = 0; tunpatch.scl = 1; tunpatch.root = 0;
     } else {
         if (bank_read((slot - 1u) / 2u)) return -1;
         q = &pbank[(slot - 1u) & 1u].d;
@@ -580,12 +662,18 @@ static int patch_load(uint32_t slot)            /* 0 = the default */
             oscan[o] = q->ver >= 4u ? q->oscan[o] : 0u;
         }
         if (q->ver >= 4u && q->gseed) gen_seed = q->gseed;
+        for (o = 0; o < NO; o++) {              /* (older: no quantising, 12-TET major on C) */
+            oq[o].on = q->ver >= 5u ? q->oq[o].on : 0u;
+            oq[o].glide = q->ver >= 5u ? q->oq[o].glide : 0u;
+        }
+        if (q->ver >= 5u) tunpatch = q->tun; else { tunpatch.tun = 0; tunpatch.scl = 1; tunpatch.root = 0; }
     }
     if (gen_seed != gen_built) gen_build(gen_seed);
     for (o = 0; o < NO; o++) {                  /* (a damaged value never reaches the engine) */
         patch_t *p = &opatch[o];
         if (otab[o] >= NTAB) otab[o] = 0;
         oscan[o] &= 1u;
+        oq[o].on &= 1u; oq[o].glide &= 127u;
         p->note = (uint8_t)cl(p->note, 12, 108); p->fine = (int8_t)cl(p->fine, -50, 50);
         p->pos &= 127u; p->mod &= 127u; p->thr &= 127u; p->hicut &= 127u; p->level &= 127u; p->pan &= 127u;
         push_osc(o);
@@ -603,6 +691,7 @@ static int patch_load(uint32_t slot)            /* 0 = the default */
         g->notsrc &= 7u;
         push_gg(k);
     }
+    push_tun();
     for (k = 0; k < NSSG; k++) { shpatch.input[k] = (uint8_t)cl(shpatch.input[k], 0, NSRC); shpatch.slew[k] &= 127u; }
     shpatch.qrate &= 127u;
     push_sh();
@@ -650,6 +739,14 @@ static void randomize(void)
     }
     gen_seed = rnd(0xFFFFFFFFu) | 1u;
     gen_build(gen_seed);
+    tunpatch.tun = (uint8_t)(rnd(2) ? rnd(4) : rnd(NTUN));   /* half the time a 12-step tuning, else anything */
+    tunpatch.scl = (uint8_t)(TUN_SCL0[tunpatch.tun] + rnd(TUN_NSCL[tunpatch.tun]));
+    tunpatch.root = (uint8_t)rnd(12);
+    push_tun();
+    for (o = 0; o < NO; o++) {
+        oq[o].on = rnd(2) == 0u;
+        oq[o].glide = rnd(3) ? 0u : (uint8_t)rnd_in(20, 80);
+    }
     for (k = 0; k < NFG; k++) {
         fgpatch_t *f = &fgpatch[k];
         f->rise = (uint8_t)rnd_in(30, 115);
@@ -757,7 +854,7 @@ enum { PG_INDEX, PG_OSC, PG_WAVE, PG_FG, PG_SH, PG_GATE, PG_MOD, PG_GMAT, PG_GLO
 static const char *const PG_NUM[NPG] = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "P"};
 static const char *const PG_NAME[NPG] = {"INDEX", "OSCILLATORS", "WAVEFORM", "FUNCTION GEN", "S&H / QUAD",
                                          "GATE GEN", "MOD MATRIX", "GATE MATRIX", "GLOBAL", "PATCHES"};
-static const uint8_t PG_READY[NPG] = {1, 1, 1, 1, 1, 1, 1, 1, 0, 1};
+static const uint8_t PG_READY[NPG] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
 
 static void draw_header(uint32_t pg, uint32_t cpu_pct)
 {
@@ -799,7 +896,7 @@ static void draw_index(uint32_t cur)
 static void draw_soon(uint32_t pg)
 {
     cv_begin(240, BODY_H, PH_BG);
-    cv_text(4, 60, &FONT_S, PG_NAME[pg], PH_MID);
+    cv_text(4, 60, &FONT_S, PG_NAME[pg < NPG ? pg : 0], PH_MID);
     cv_text(4, 84, &FONT_S, "NOT IN THIS BUILD YET", PH_LO);
     cv_text(4, 196, &FONT_S, "HOME: INDEX", PH_LO);
     cv_blit(0, BODY_Y);
@@ -1002,13 +1099,15 @@ static const char *const CLKN[10] = {"1/16", "1/8T", "1/8", "1/4T", "1/4", "1/2"
 
 static uint32_t gsrc_on(uint32_t i)
 {
-    return i < NGG * GS_PER ? (uint32_t)gg_bits[i / GS_PER] >> (i % GS_PER) & 1u : fg_eoc_v[i - NGG * GS_PER];
+    return i < NGG * GS_PER ? (uint32_t)gg_bits[i / GS_PER] >> (i % GS_PER) & 1u
+         : i < GS_Q(0) ? fg_eoc_v[i - NGG * GS_PER] : qg_cnt[i - GS_Q(0)] != 0u;
 }
 static void gsrc_name(char *s, uint32_t i)
 {
     s[0] = 0;
     if (i < NGG * GS_PER) { s_cat(s, "G"); s_int(s, (int32_t)(i / GS_PER) + 1, 0); s_cat(s, " "); s_cat(s, GSN[i % GS_PER]); }
-    else { s_cat(s, "FG"); s_int(s, (int32_t)(i - NGG * GS_PER) + 1, 0); s_cat(s, " EOC"); }
+    else if (i < GS_Q(0)) { s_cat(s, "FG"); s_int(s, (int32_t)(i - NGG * GS_PER) + 1, 0); s_cat(s, " EOC"); }
+    else { s_cat(s, "Q"); s_cat(s, ONAME[i - GS_Q(0)]); s_cat(s, " NOTE"); }
 }
 static void gdst_name(char *s, uint32_t j, int full)
 {
@@ -1163,6 +1262,57 @@ static void draw_sh(void)
     cv_blit(0, BODY_Y);
 }
 
+/* ---- page 9: the tuning, the scale, the quantisers */
+static const char *const NOTEN[12] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+static void draw_global(uint32_t qsel)
+{
+    uint32_t t = g_tun, n = TUN_N[t], j, o;
+    int32_t per = TUN_PERIOD[t], cx = 56, cy = 122, r = 46;
+    const uint16_t *st = &TUN_STEPS[TUN_OFF[t]];
+    uint32_t lo = SCL_LO[g_scl], hi = SCL_HI[g_scl], turn = 0xFFFFFFFFu / (uint32_t)per;   /* a pitch -> an angle */
+    char s[32];
+    cv_begin(240, BODY_H, PH_BG);
+    cv_text(4, 2, &FONT_S, "TUNING", PH_LO);  cv_text(68, 2, &FONT_S, TUN_NAME[t], PH_HI);
+    cv_text(4, 20, &FONT_S, "SCALE", PH_LO);  cv_text(68, 20, &FONT_S, SCL_NAME[g_scl], PH_HI);
+    cv_text(4, 38, &FONT_S, "ROOT", PH_LO);   cv_text(68, 38, &FONT_S, NOTEN[g_root % 12u], PH_HI);
+    cv_rect(0, 58, 240, 1, PH_LO);
+    for (j = 0; j < n; j++) {                   /* the period as a wheel: a tick a step, the scale's long and bright */
+        uint32_t a = st[j] * turn;              /* (32-bit only: the chip has no 64-bit division) */
+        int32_t sx = sine(a), cy0 = sine(a + 0x40000000u), in = (j < 32u ? lo >> j & 1u : hi >> (j - 32u) & 1u);
+        int32_t r0 = in ? r - 10 : r - 4;
+        cv_line(cx + (sx * r0 >> 15), cy - (cy0 * r0 >> 15), cx + (sx * r >> 15), cy - (cy0 * r >> 15), in ? PH_HI : PH_LO);
+    }
+    for (o = 0; o < NO; o++) {                  /* each oscillator's pitch on the wheel, the outer ring 1, inner B */
+        int32_t c = q_pitch_v[o] - (int32_t)g_root * 256, rem = c % per, rr = r - 16 - (int32_t)o * 7;
+        uint32_t a;
+        if (rem < 0) rem += per;
+        a = (uint32_t)rem * turn;
+        cv_rect(cx + (sine(a) * rr >> 15) - 2, cy - (sine(a + 0x40000000u) * rr >> 15) - 2, 5, 5,
+                oq[o].on ? PH_HI : PH_LO);
+    }
+    for (o = 0; o < NO; o++) {
+        int32_t y = 66 + (int32_t)o * 20;
+        s[0] = 0;
+        s_cat(s, ONAME[o]);
+        s_cat(s, oq[o].on ? " ON  " : " OFF ");
+        s_cat(s, "G");
+        s_int(s, oq[o].glide, 0);
+        if (oq[o].on) {
+            s_cat(s, oq[o].glide < 10u ? "   " : oq[o].glide < 100u ? "  " : " ");
+            if (n == 12u) {                     /* a 12-step tuning: the note; else the step */
+                int32_t nt = (q_pitch_v[o] + 128) >> 8;
+                s_cat(s, NOTEN[nt % 12]);
+                s_int(s, nt / 12 - 1, 0);
+            } else { s_cat(s, "#"); s_int(s, q_step_v[o], 0); }
+        }
+        if (o == qsel) cv_rect(112, y - 1, 128, 18, PH_SEL);
+        cv_text(116, y, &FONT_S, s, o == qsel ? PH_HI : oq[o].on ? PH_MID : PH_LO);
+    }
+    cv_text(4, 182, &FONT_S, "K1 TUNE K2 SCALE K3 ROOT", PH_LO);
+    cv_text(4, 200, &FONT_S, "SELECT OSC K4 GLIDE PLAY Q", PH_LO);
+    cv_blit(0, BODY_Y);
+}
+
 static uint32_t idle_ok;
 static void midi_poll(void)                     /* the clock, START: the clocked LFOs follow them */
 {
@@ -1207,7 +1357,7 @@ static void app_main(void)
     uint32_t o, k, sel = 0, fsel = 0, prev = 0, page = PG_INDEX, icur = PG_OSC, mcs = 0, mcr = 0, mtop = 0, mleft = 0;
     uint32_t dirty = 1, hdr_dirty = 1, cpu_pct = 0, t_cpu = 0, t_live = 0, pcur = 1, pconf = PC_NONE, t_msg = 0;
     const char *pmsg = "";
-    uint32_t gsel = 0, gcc = 0, gcr = 0, gtop = 0, gleft = 0, t_hist = 0;
+    uint32_t gsel = 0, gcc = 0, gcr = 0, gtop = 0, gleft = 0, t_hist = 0, qsel = 0;
     int32_t oct = -1, e, shift_drawn = -1;
 
     for (k = 0; k < NGG; k++) ggpatch[k] = GG_DEFAULT[k];
@@ -1373,7 +1523,26 @@ static void app_main(void)
             if ((e = fm1_enc_take(ENC_KNOB3)) != 0) { depth[mcs][d] = (int8_t)cl(depth[mcs][d] + e, -64, 63); dirty = 1; }
             if (b & (1u << BTN_PLAY)) { depth[mcs][d] = depth[mcs][d] ? 0 : 32; dirty = 1; }
         }
-        else if (page == PG_SH) {
+        else if (page == PG_GLOBAL) {
+            int ch = 0;
+            if ((e = fm1_enc_take(ENC_KNOB1)) != 0) {   /* a new tuning keeps the scale's place where it can */
+                uint32_t rel = (uint32_t)(tunpatch.scl - TUN_SCL0[tunpatch.tun]), nt;
+                nt = (uint32_t)cl((int32_t)tunpatch.tun + e, 0, NTUN - 1);
+                if (rel >= TUN_NSCL[nt]) rel = TUN_NSCL[nt] - 1u;
+                tunpatch.tun = (uint8_t)nt;
+                tunpatch.scl = (uint8_t)(TUN_SCL0[nt] + rel);
+                ch = 1;
+            }
+            if ((e = fm1_enc_take(ENC_KNOB2)) != 0) {
+                tunpatch.scl = (uint8_t)cl(tunpatch.scl + e, TUN_SCL0[tunpatch.tun], TUN_SCL0[tunpatch.tun] + TUN_NSCL[tunpatch.tun] - 1);
+                ch = 1;
+            }
+            if ((e = fm1_enc_take(ENC_KNOB3)) != 0) { tunpatch.root = (uint8_t)((tunpatch.root + 12 + (e % 12)) % 12); ch = 1; }
+            if ((e = fm1_enc_take(ENC_SELECT)) != 0) { qsel = (uint32_t)cl((int32_t)qsel + e, 0, NO - 1); dirty = 1; }
+            if ((e = fm1_enc_take(ENC_KNOB4)) != 0) { oq[qsel].glide = (uint8_t)cl(oq[qsel].glide + e, 0, 127); push_osc(qsel); dirty = 1; }
+            if (b & (1u << BTN_PLAY)) { oq[qsel].on ^= 1u; push_osc(qsel); dirty = 1; }
+            if (ch) { push_tun(); dirty = 1; }
+        } else if (page == PG_SH) {
             int ch = 0;
             uint32_t l;
             for (l = 0; l < NSSG; l++) {
@@ -1422,6 +1591,14 @@ static void app_main(void)
             if (page == PG_OSC) {
                 for (o = 0; o < NO; o++)
                     if (opatch[o].note == base + k) { if (o == sel) on = 1; else glow = 1; }
+            } else if (page == PG_GLOBAL) {        /* the oscillators' notes lit; a 12-step scale glows */
+                uint32_t note = base + k;
+                for (o = 0; o < NO; o++)
+                    if ((uint32_t)((q_pitch_v[o] + 128) >> 8) == note) on = 1;
+                if (TUN_N[g_tun] == 12u) {
+                    uint32_t pc = (note + 12u - g_root) % 12u;
+                    glow = SCL_LO[g_scl] >> pc & 1u;
+                }
             } else if (page == PG_SH) {            /* S1 on the lower keys, S2 on the upper */
                 uint32_t p1 = (src_disp(S_SSG(0)) * 12u) >> 15, p2 = 14u + ((src_disp(S_SSG(1)) * 12u) >> 15);
                 on = k == p1 || k == p2;
@@ -1446,6 +1623,7 @@ static void app_main(void)
             fm1_led_key(BTN_SAVE, page == PG_PATCH && (pconf == PC_SAVE || blink));
             fm1_led_key(BTN_PLAY, ((page == PG_FG || page == PG_SH) && (play || blink))   /* a manual gate / sample */
                                   || (page == PG_WAVE && otab[sel] >= T_GEN && blink)   /* a new generative table */
+                                  || (page == PG_GLOBAL && (oq[qsel].on || blink))   /* solid: this one quantises */
                                   || (page == PG_MOD && (depth[mcs][DLIST[mcr]] || blink))   /* solid: a pin here */
                                   || (page == PG_GMAT && (gpatch[gcr] >> gcc & 1u || blink)));
         }
@@ -1454,6 +1632,7 @@ static void app_main(void)
         fm1_led_key(BTN_ARP, page == PG_MOD);
         fm1_led_key(BTN_LFO, page == PG_GATE);
         fm1_led_key(BTN_SEQ, page == PG_GMAT);
+        fm1_led_key(BTN_GLO, page == PG_GLOBAL);
 
         if (fm1_ms - t_cpu > 500u) {            /* the worst render of the last half second, in the header */
             uint32_t us = audio_us_max, pct;
@@ -1463,7 +1642,8 @@ static void app_main(void)
             if (us && pct != cpu_pct) { cpu_pct = pct; hdr_dirty = 1; }
         }
         if (page == PG_OSC && shift != shift_drawn) { shift_drawn = shift; dirty = 1; }
-        if ((page == PG_FG || page == PG_MOD || page == PG_WAVE || page == PG_GATE || page == PG_GMAT || page == PG_SH)
+        if ((page == PG_FG || page == PG_MOD || page == PG_WAVE || page == PG_GATE || page == PG_GMAT || page == PG_SH
+             || page == PG_GLOBAL)
             && fm1_ms - t_live > 50u) { t_live = fm1_ms; dirty = 1; }
 
         idle_ok = 1;                            /* MIDI in while the screen draws */
@@ -1479,6 +1659,7 @@ static void app_main(void)
             case PG_PATCH: draw_patch(pcur, pconf, pmsg); break;
             case PG_GATE: draw_gg(gsel); break;
             case PG_SH: draw_sh(); break;
+            case PG_GLOBAL: draw_global(qsel); break;
             case PG_GMAT: draw_gmat(gcc, gcr, gtop, gleft); break;
             default: draw_soon(page); break;
             }

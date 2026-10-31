@@ -1,0 +1,27 @@
+# tuning: DEFAULT; page 7 Q+ -> 1 PITCH; page 9 osc 1 Q on; page 8 Q1 NOTE -> F5; shruti, Bohlen-Pierce
+200 btn 9
+300 enc 0 -2
+400 btn 3
+500 btn 3
+700 btn 10
+800 enc 2 8
+900 enc 4 30
+1100 btn 7
+1200 btn 12
+1300 enc 0 1
+1400 btn 12
+1500 enc 5 30
+3500 shot
+3700 btn 11
+3800 enc 3 42
+3900 enc 2 4
+4000 btn 12
+4300 shot
+4500 btn 7
+4600 enc 2 4
+4700 enc 3 2
+6500 shot
+6700 enc 2 13
+6800 enc 3 1
+8500 shot
+9000 end
