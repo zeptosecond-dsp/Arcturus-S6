@@ -49,7 +49,7 @@ enum { P_PITCH, P_WAVE, P_MOD, P_THR, P_HICUT, P_LEVEL, P_PAN, NP };
 #define D_SSG(k) (NO * NP + 2u * NFG + 4u * NGG + (k))   /* an SSG's slew */
 #define D_QRATE (NO * NP + 2u * NFG + 4u * NGG + NSSG)    /* the quad LFO's rate */
 #define D_VERB(k) (NO * NP + 2u * NFG + 4u * NGG + NSSG + 1u + (k))   /* 0 DL TIME, 1 RV DECAY, 2 DL FEEDBACK,
-                                                                         3 RV RETURN, 4 RV FEEDBACK */
+                                                                         3 RV RETURN, 4 FL SEND (all four flanger sends, offset) */
 #define NDST (NO * NP + 2u * NFG + 4u * NGG + NSSG + 1u + 5u)
 /* gate sources: per generator A B AND NAND OR NOR XOR XNOR NOT, then the FGs' EOCs.
  * gate destinations: the FGs' gates, then each generator's two logic inputs (pinned: they replace A, B there) */
@@ -327,7 +327,7 @@ static void render(int32_t *out)                /* SUB frames */
         step[o] = p->scan;
         sendg[o] = p->send;
         dsendg[o] = p->dsend;
-        fsendg[o] = p->fsend;
+        fsendg[o] = cl((int32_t)p->fsend + (acc[D_VERB(4)] >> 8), 0, 127);   /* (FL SEND: one offset for all four) */
         int32_t q, target, dpos;
         {
             int32_t pq = p->pitch_q8 + ((a[P_PITCH] * 3) >> 3);           /* full depth: ~4 octaves */
@@ -426,7 +426,7 @@ static void render(int32_t *out)                /* SUB frames */
     }
     for (o = 0; o < NO; o++) ost[o].amp = amp_t[o];
     vm.size = 0; vm.decay = acc[D_VERB(1)]; vm.damp = 0;   /* (size and damp are off the matrix now) */
-    vm.ret = acc[D_VERB(3)]; vm.fb = acc[D_VERB(4)];
+    vm.ret = acc[D_VERB(3)]; vm.fb = 0;   /* (RV FEEDBACK is off the matrix now) */
     {   /* the effects, in the chosen order: each takes its sends and (the link) the one before's output */
         static const uint8_t ORD[6][3] = {{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}};   /* F D R */
         int32_t wet[SUB], *ins[3];
@@ -787,6 +787,8 @@ static int patch_load(uint32_t slot)            /* 0 = the default */
         dpatch = q->ver >= 7u ? q->dly : D_OFF;    /* (older: no delay) */
         fpatch = q->ver >= 8u ? q->fl : F_OFF;     /* (older: no flanger; the delay's TO VERB becomes LINK 2) */
         if (q->ver >= 8u) rpatch = q->rt; else { rpatch = R_DEFAULT; rpatch.link2 = dpatch.toverb; }
+        if (q->ver < 8u)                        /* (older: that row was RV FEEDBACK; its pins would bring the flanger in) */
+            for (k = 0; k < NSRC; k++) depth[k][D_VERB(4)] = 0;
     }
     if (gen_seed != gen_built) gen_build(gen_seed);
     for (o = 0; o < NO; o++) {                  /* (a damaged value never reaches the engine) */
@@ -850,7 +852,7 @@ static const uint8_t DLIST[] = {
     D_FG(3, 0), D_FG(3, 1), D_FG(4, 0), D_FG(4, 1), D_FG(5, 0), D_FG(5, 1),
     D_GG(0, 0, 0), D_GG(0, 0, 1), D_GG(0, 1, 0), D_GG(0, 1, 1), D_GG(1, 0, 0), D_GG(1, 0, 1), D_GG(1, 1, 0), D_GG(1, 1, 1),
     D_GG(2, 0, 0), D_GG(2, 0, 1), D_GG(2, 1, 0), D_GG(2, 1, 1), D_GG(3, 0, 0), D_GG(3, 0, 1), D_GG(3, 1, 0), D_GG(3, 1, 1),
-    D_SSG(0), D_SSG(1), D_QRATE, D_VERB(1), D_VERB(3), D_VERB(4), D_VERB(0), D_VERB(2),
+    D_SSG(0), D_SSG(1), D_QRATE, D_VERB(1), D_VERB(3), D_VERB(0), D_VERB(2), D_VERB(4),
 };
 #define NDLIST (sizeof DLIST / sizeof DLIST[0])
 
@@ -996,7 +998,7 @@ static void dst_name(char *s, uint32_t d)
         s_int(s, (int32_t)(d - NO * NP) / 2 + 1, 0);
         s_cat(s, (d - NO * NP) & 1u ? " FALL" : " RISE");
     } else if (d >= D_VERB(0)) {
-        static const char *const VN[5] = {"DL TIME", "RV DECAY", "DL FEEDBACK", "RV RETURN", "RV FEEDBACK"};
+        static const char *const VN[5] = {"DL TIME", "RV DECAY", "DL FEEDBACK", "RV RETURN", "FL SEND"};
         s_cat(s, VN[(d - D_VERB(0)) % 5u]);
     } else if (d >= D_SSG(0)) {
         if (d == D_QRATE) s_cat(s, "QUAD RATE");
