@@ -19,11 +19,14 @@
  * Rules of the road (the chip has no FPU and no libgcc): integers only, no float, no 64-bit division.
  * tests/host.c runs this file on a computer: the screen as a PNG, the sound as a WAV. */
 #define APP_NAME "FM1 WAVETABLE"
+#define WT_VERSION "1.1"                        /* (shown on the boot screen; APP_VER is the build's) */
 static void app_idle(void);
 #define LCD_IDLE app_idle                       /* while the screen's DMA runs: read MIDI (the clock) */
 #define CV_MAX (240u * 218u)                    /* the page body's canvas */
 #define STORE_MAGIC 0x54574D46u                 /* "FMWT": our own flash data, never another Dinghy fork's */
 #include "platform.c"
+#include "font_chunky.h"
+#define FONT_S FONT_C                           /* the chunky font everywhere (same 8 x 16 cell as Felucca's) */
 #include "wt_tables.h"
 #include "luts.h"
 #include "tunings.h"
@@ -942,6 +945,68 @@ static const char *const PG_NAME[NPG] = {"INDEX", "OSCILLATORS", "WAVEFORM", "FU
                                          "GATE GEN", "MOD MATRIX", "GATE MATRIX", "GLOBAL", "FX", "PATCHES"};
 static const uint8_t PG_READY[NPG] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
 
+/* ---- the CRT: every canvas is drawn as phosphor light (its green is the intensity), then cv_out() adds the
+ * screen's own glow (a deep grey-green in the middle, black at the edges), dims the light toward the edges, adds a
+ * soft halo around what is bright, darkens every other line (the scanlines) and maps it all through a phosphor
+ * ramp, the brightest a little white. */
+static uint8_t crt_a[240u * BODY_H] __attribute__((section(".pool")));   /* the intensity */
+static uint8_t crt_b[240u * BODY_H] __attribute__((section(".pool")));   /* its rows blurred */
+static uint8_t CRT_V[240];                      /* the window: 255 in the middle, 0 at the edge */
+static uint16_t CRT_LUT[2][256];                /* intensity -> the panel's pixel, even and odd lines */
+
+static void crt_init(void)
+{
+    static const uint8_t K[][4] = {             /* intensity, r, g, b: the phosphor */
+        {0, 0, 0, 0}, {20, 12, 18, 14}, {60, 16, 62, 28}, {110, 28, 114, 50},
+        {170, 56, 192, 86}, {230, 122, 246, 142}, {255, 196, 255, 204}};
+    uint32_t i, k;
+    for (i = 0; i < 240u; i++) {
+        int32_t d = 2 * (int32_t)i + 1 - 240;  /* -239 .. 239 */
+        CRT_V[i] = (uint8_t)(255 - (d * d * 255) / (239 * 239));
+    }
+    for (i = 0; i < 256u; i++) {
+        uint32_t r, g, b, lr, lg, lb;
+        for (k = 1; K[k][0] < i; k++) {}
+        {
+            uint32_t a = K[k - 1][0], z = K[k][0], f = z > a ? (i - a) * 256u / (z - a) : 0u;
+            r = (K[k - 1][1] * (256u - f) + K[k][1] * f) >> 8;
+            g = (K[k - 1][2] * (256u - f) + K[k][2] * f) >> 8;
+            b = (K[k - 1][3] * (256u - f) + K[k][3] * f) >> 8;
+        }
+        lr = r * 70u / 100u; lg = g * 70u / 100u; lb = b * 70u / 100u;   /* the scanline: 70 % */
+        CRT_LUT[0][i] = swap16(RGB(r, g, b));
+        CRT_LUT[1][i] = swap16(RGB(lr, lg, lb));
+    }
+}
+
+static void cv_out(uint32_t y0)                 /* the canvas (240 wide) through the CRT, to the screen at y0 */
+{
+    uint32_t w = cv_w, h = cv_h, x, y, n = w * h;
+    for (x = 0; x < n; x++) crt_a[x] = (uint8_t)(((swap16(cv_px[x]) >> 5) & 63u) << 2);
+    for (y = 0; y < h; y++) {                   /* the halo: a 3 x 3 box, rows first */
+        const uint8_t *a = &crt_a[y * w];
+        uint8_t *b = &crt_b[y * w];
+        b[0] = (uint8_t)((a[0] * 2u + a[1]) * 85u >> 8);
+        for (x = 1; x + 1u < w; x++) b[x] = (uint8_t)(((uint32_t)a[x - 1] + a[x] + a[x + 1]) * 85u >> 8);
+        b[w - 1] = (uint8_t)((a[w - 2] + a[w - 1] * 2u) * 85u >> 8);
+    }
+    for (y = 0; y < h; y++) {
+        uint32_t sy = y0 + y, vy = CRT_V[sy < 240u ? sy : 239u];
+        const uint8_t *a = &crt_a[y * w], *bu = &crt_b[(y ? y - 1u : 0u) * w], *bm = &crt_b[y * w];
+        const uint8_t *bd = &crt_b[(y + 1u < h ? y + 1u : y) * w];
+        const uint16_t *lut = CRT_LUT[sy & 1u];
+        uint16_t *px = &cv_px[y * w];
+        for (x = 0; x < w; x++) {
+            uint32_t vxy = (uint32_t)CRT_V[x] * vy >> 8;            /* 0 at the edges .. 255 in the middle */
+            uint32_t glow = ((uint32_t)bu[x] + bm[x] + bd[x]) * 30u >> 8;
+            uint32_t tf = 176u + (vxy * 80u >> 8);                   /* the light: 69 % at the edges */
+            uint32_t v = (vxy * 22u >> 8) + (((uint32_t)a[x] + glow) * tf >> 8);
+            px[x] = lut[v > 255u ? 255u : v];
+        }
+    }
+    cv_blit(0, y0);
+}
+
 static uint32_t fxsub;                          /* the FX page: 0 the reverb, 1 the delay (FX again flips it) */
 static void draw_header(uint32_t pg, uint32_t cpu_pct)
 {
@@ -959,7 +1024,7 @@ static void draw_header(uint32_t pg, uint32_t cpu_pct)
         cv_text(236 - text_w(&FONT_S, c), 2, &FONT_S, c, PH_LO);
     }
     cv_rect(0, 19, 240, 1, PH_MID);
-    cv_blit(0, 0);
+    cv_out(0);
 }
 
 static void draw_index(uint32_t cur)
@@ -978,7 +1043,7 @@ static void draw_index(uint32_t cur)
         if (!PG_READY[i]) cv_text(196, y, &FONT_S, "--", PH_LO);
     }
     cv_text(4, 196, &FONT_S, "SELECT: CHOOSE  SEL: OPEN", PH_LO);
-    cv_blit(0, BODY_Y);
+    cv_out(BODY_Y);
 }
 
 static void draw_soon(uint32_t pg)
@@ -987,7 +1052,7 @@ static void draw_soon(uint32_t pg)
     cv_text(4, 60, &FONT_S, PG_NAME[pg < NPG ? pg : 0], PH_MID);
     cv_text(4, 84, &FONT_S, "NOT IN THIS BUILD YET", PH_LO);
     cv_text(4, 196, &FONT_S, "HOME: INDEX", PH_LO);
-    cv_blit(0, BODY_Y);
+    cv_out(BODY_Y);
 }
 
 static const char *const TAB_SHORT[NTAB] = {"S>O", "T>S", "ORG1", "ORG2", "BEL1", "BEL2", "VOW1", "VOW2",
@@ -1026,7 +1091,7 @@ static void draw_osc(uint32_t sel, int shift)
         }
     }
     cv_text(4, 198, &FONT_S, shift ? "SEL: FINE, TABLE, THRESH" : "KEYS: SET NOTE  SEL: MORE", PH_LO);
-    cv_blit(0, BODY_Y);
+    cv_out(BODY_Y);
 }
 
 static const int8_t *wave_tab;
@@ -1067,7 +1132,7 @@ static void draw_wave(uint32_t sel, int32_t posq)
     s_cat(s, oscan[sel] ? "   STEPPED" : "   SMOOTH");
     cv_text(4, 180, &FONT_S, s, PH_MID);
     cv_text(4, 198, &FONT_S, otab[sel] >= T_GEN ? "K1 WAV K2 TAB K3 SCN PLAY:NEW" : "K1 WAVE K2 TABLE K3 SCAN", PH_LO);
-    cv_blit(0, BODY_Y);
+    cv_out(BODY_Y);
 }
 
 static void draw_fg(uint32_t sel)
@@ -1122,7 +1187,7 @@ static void draw_fg(uint32_t sel)
     cv_rect(dot_x - 2, top + h - ((lvl * h) >> 15) - 2, 5, 5, PH_HI);
     if (fg_eoc_v[sel]) cv_text(200, top, &FONT_S, "EOC", PH_HI);
     cv_text(4, 198, &FONT_S, "K1 RISE K2 FALL K3 CRV K4 MOD", PH_LO);
-    cv_blit(0, BODY_Y);
+    cv_out(BODY_Y);
 }
 
 #define MROWS 9
@@ -1175,7 +1240,7 @@ static void draw_mod(uint32_t cs, uint32_t cr, uint32_t top, uint32_t left)
     if (depth[cs][DLIST[cr]]) s_int(s, depth[cs][DLIST[cr]], 1); else s_cat(s, "NO PIN");
     cv_text(4, 180, &FONT_S, s, PH_HI);
     cv_text(4, 198, &FONT_S, "K1 SRC K2 DST K3 AMT PLAY PIN", PH_LO);
-    cv_blit(0, BODY_Y);
+    cv_out(BODY_Y);
 }
 
 /* ---- the gate pages */
@@ -1255,7 +1320,7 @@ static void draw_gg(uint32_t g)
         }
     }
     cv_text(2, 200, &FONT_S, "K1/2 A K3/4 B SEL:MODE ALG:NOT", PH_LO);
-    cv_blit(0, BODY_Y);
+    cv_out(BODY_Y);
 }
 
 #define GCOLS 8u
@@ -1292,7 +1357,7 @@ static void draw_gmat(uint32_t cc, uint32_t cr, uint32_t top, uint32_t left)
     s_cat(s, gpatch[cr] >> cc & 1u ? "  PIN" : "");
     cv_text(4, 180, &FONT_S, s, PH_HI);
     cv_text(4, 198, &FONT_S, "K1 DST K2 SRC PLAY PIN", PH_LO);
-    cv_blit(0, BODY_Y);
+    cv_out(BODY_Y);
 }
 
 /* ---- page 5: the SSGs and the quad LFO */
@@ -1348,7 +1413,7 @@ static void draw_sh(void)
         if (v >= 0) cv_rect(179, y + 1, v, 5, PH_MID); else cv_rect(178 + v, y + 1, -v, 5, PH_MID);
     }
     cv_text(2, 202, &FONT_S, "K1/2 S1 K3/4 S2 ALG:RATE PLAY", PH_LO);
-    cv_blit(0, BODY_Y);
+    cv_out(BODY_Y);
 }
 
 /* ---- page 9: the tuning, the scale, the quantisers */
@@ -1399,7 +1464,7 @@ static void draw_global(uint32_t qsel)
     }
     cv_text(4, 182, &FONT_S, "K1 TUNE K2 SCALE K3 ROOT", PH_LO);
     cv_text(4, 200, &FONT_S, "SELECT OSC K4 GLIDE PLAY Q", PH_LO);
-    cv_blit(0, BODY_Y);
+    cv_out(BODY_Y);
 }
 
 /* ---- page R: the reverb */
@@ -1445,7 +1510,7 @@ static void draw_verb(uint32_t vsel, int shift)
     }
     cv_text(4, 176, &FONT_S, "OUT", PH_LO);
     cv_text(0, 200, &FONT_S, "FX:FLIP SEL:MORE PLAY:FREEZE", PH_LO);
-    cv_blit(0, BODY_Y);
+    cv_out(BODY_Y);
 }
 
 static void draw_delay(uint32_t vsel, int shift)
@@ -1490,7 +1555,49 @@ static void draw_delay(uint32_t vsel, int shift)
     }
     cv_rect(40 + (int32_t)(w * 196u / DL_N), 118, 1, 76, PH_HI);
     cv_text(0, 200, &FONT_S, "FX:FLIP SEL:MORE PLAY:CLEAR", PH_LO);
-    cv_blit(0, BODY_Y);
+    cv_out(BODY_Y);
+}
+
+/* ---- the boot screen */
+static void big_text(int32_t x, int32_t y, const char *s, int32_t sx, int32_t sy, uint16_t c)   /* 8 x 8, scaled */
+{
+    for (; *s; s++, x += 8 * sx) {
+        uint32_t ch = (uint8_t)*s, r, k;
+        if (ch < 32u || ch > 126u) ch = '?';
+        for (r = 0; r < 8u; r++) {
+            uint32_t bits = FONT8_RAW[(ch - 32u) * 8u + r];
+            for (k = 0; k < 8u; k++)
+                if (bits >> k & 1u) cv_rect(x + (int32_t)k * sx, y + (int32_t)r * sy, sx, sy, c);
+        }
+    }
+}
+static void draw_boot(uint32_t step)            /* step 0..8: the loading lines appear, then READY */
+{
+    static const char *const LINE[4] = {"WAVETABLES ......  13", "TUNINGS .........  21", "PATCH MEMORY ....  16",
+                                        "VOICES ..........   4"};
+    uint32_t i;
+    cv_begin(240, BODY_Y, PH_BG);
+    cv_out(0);
+    cv_begin(240, BODY_H, PH_BG);
+    big_text(32, 6, "ZEPTOSECOND", 2, 3, PH_HI);
+    big_text(72, 36, "DSP", 4, 5, PH_HI);
+    cv_rect(16, 84, 208, 2, PH_MID);
+    cv_text(36, 92, &FONT_S, "FM-1 WAVETABLE SYSTEM", PH_MID);
+    cv_text(48, 110, &FONT_S, "SERIES I   REV " WT_VERSION, PH_LO);
+    for (i = 0; i < 4u && i < step; i++) cv_text(36, 132 + (int32_t)i * 16, &FONT_S, LINE[i], PH_MID);
+    if (step >= 6u) cv_text(36, 202, &FONT_S, "READY", PH_HI);
+    else if (step & 1u) cv_text(36, 202, &FONT_S, "SYSTEM LOADING _", PH_LO);
+    else cv_text(36, 202, &FONT_S, "SYSTEM LOADING", PH_LO);
+    cv_out(BODY_Y);
+}
+static int boot_wait(uint32_t ms)               /* wait, polling; 1 = a button pressed (skip the rest) */
+{
+    uint32_t t0 = fm1_ms, rel;
+    while (fm1_ms - t0 < ms) {
+        platform_poll();
+        if (fm1_input_edges(&rel)) return 1;
+    }
+    return 0;
 }
 
 static uint32_t idle_ok;
@@ -1528,7 +1635,7 @@ static void draw_patch(uint32_t cur, uint32_t confirm, const char *msg)
     else if (confirm == PC_SAVE) cv_text(4, 172, &FONT_S, "SAVE AGAIN: OVERWRITE", PH_HI);
     else if (confirm == PC_LOAD) cv_text(4, 172, &FONT_S, cur == P_RANDOM ? "SEL AGAIN: ROLL THE DICE" : "SEL AGAIN: LOAD IT", PH_HI);
     cv_text(4, 198, &FONT_S, "SEL: LOAD  SAVE: SAVE", PH_LO);
-    cv_blit(0, BODY_Y);
+    cv_out(BODY_Y);
 }
 
 /* ================================================================== the main loop */
@@ -1540,6 +1647,10 @@ static void app_main(void)
     uint32_t gsel = 0, gcc = 0, gcr = 0, gtop = 0, gleft = 0, t_hist = 0, qsel = 0, vsel = 0;
     int32_t oct = -1, e, shift_drawn = -1;
 
+    int skip;
+    crt_init();
+    draw_boot(0);
+    skip = boot_wait(300);
     for (k = 0; k < NGG; k++) ggpatch[k] = GG_DEFAULT[k];
     shpatch = SH_DEFAULT;
     vpatch = V_DEFAULT;
@@ -1556,6 +1667,8 @@ static void app_main(void)
     for (k = 0; k < NSRC; k++)
         for (o = 0; o < NDST; o++) def_dep[k][o] = depth[k][o];
     patches_scan();
+    if (!skip) { draw_boot(1); skip = boot_wait(250); }
+    if (!skip) { draw_boot(2); skip = boot_wait(250); }
     {                                           /* every power-on a new patch: a boot count in flash, the timing */
         struct { uint32_t boots; } set = {0};
         settings_load(&set, sizeof set);
@@ -1568,8 +1681,11 @@ static void app_main(void)
         if (!rnd_s) rnd_s = 1u;
         rnd(1); rnd(1);
     }
-    randomize();
-    lcd_fill(0, 0, 240, 240, PH_BG);
+    if (!skip) { draw_boot(3); skip = boot_wait(250); }
+    randomize();                                /* (the sound starts here) */
+    if (!skip) { draw_boot(4); skip = boot_wait(250); }
+    if (!skip) { draw_boot(5); skip = boot_wait(200); }
+    if (!skip) { draw_boot(6); boot_wait(700); }
 
     for (;;) {
         uint32_t rel, b, base, newpage;
