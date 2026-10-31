@@ -945,13 +945,13 @@ static const char *const PG_NAME[NPG] = {"INDEX", "OSCILLATORS", "WAVEFORM", "FU
                                          "GATE GEN", "MOD MATRIX", "GATE MATRIX", "GLOBAL", "FX", "PATCHES"};
 static const uint8_t PG_READY[NPG] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
 
-/* ---- the CRT: every canvas is drawn as phosphor light (its green is the intensity), then cv_out() adds the
- * screen's own glow (a deep grey-green in the middle, black at the edges), dims the light toward the edges, adds a
- * soft halo around what is bright, darkens every other line (the scanlines) and maps it all through a phosphor
- * ramp, the brightest a little white. */
+/* ---- the CRT: every canvas is drawn as phosphor light (its green is the intensity), then cv_out() dims the light
+ * toward the edges and corners (the vignette, radial), adds a soft halo around what is bright, darkens every other
+ * line (the scanlines) and maps it all through a phosphor ramp, the brightest a little white. The background stays
+ * black: a gradient there bands on the panel's 16-bit colour. */
 static uint8_t crt_a[240u * BODY_H] __attribute__((section(".pool")));   /* the intensity */
 static uint8_t crt_b[240u * BODY_H] __attribute__((section(".pool")));   /* its rows blurred */
-static uint8_t CRT_V[240];                      /* the window: 255 in the middle, 0 at the edge */
+static uint8_t CRT_D2[240];                     /* (distance from the middle)^2: 0 .. 128 along an axis */
 static uint16_t CRT_LUT[2][256];                /* intensity -> the panel's pixel, even and odd lines */
 
 static void crt_init(void)
@@ -962,7 +962,7 @@ static void crt_init(void)
     uint32_t i, k;
     for (i = 0; i < 240u; i++) {
         int32_t d = 2 * (int32_t)i + 1 - 240;  /* -239 .. 239 */
-        CRT_V[i] = (uint8_t)(255 - (d * d * 255) / (239 * 239));
+        CRT_D2[i] = (uint8_t)((d * d * 128) / (239 * 239));
     }
     for (i = 0; i < 256u; i++) {
         uint32_t r, g, b, lr, lg, lb;
@@ -991,16 +991,16 @@ static void cv_out(uint32_t y0)                 /* the canvas (240 wide) through
         b[w - 1] = (uint8_t)((a[w - 2] + a[w - 1] * 2u) * 85u >> 8);
     }
     for (y = 0; y < h; y++) {
-        uint32_t sy = y0 + y, vy = CRT_V[sy < 240u ? sy : 239u];
+        uint32_t sy = y0 + y, dy = CRT_D2[sy < 240u ? sy : 239u];
         const uint8_t *a = &crt_a[y * w], *bu = &crt_b[(y ? y - 1u : 0u) * w], *bm = &crt_b[y * w];
         const uint8_t *bd = &crt_b[(y + 1u < h ? y + 1u : y) * w];
         const uint16_t *lut = CRT_LUT[sy & 1u];
         uint16_t *px = &cv_px[y * w];
         for (x = 0; x < w; x++) {
-            uint32_t vxy = (uint32_t)CRT_V[x] * vy >> 8;            /* 0 at the edges .. 255 in the middle */
+            uint32_t f = 256u - CRT_D2[x] - dy;                     /* radial: 256 in the middle, 0 in the corners */
             uint32_t glow = ((uint32_t)bu[x] + bm[x] + bd[x]) * 30u >> 8;
-            uint32_t tf = 176u + (vxy * 80u >> 8);                   /* the light: 69 % at the edges */
-            uint32_t v = (vxy * 22u >> 8) + (((uint32_t)a[x] + glow) * tf >> 8);
+            uint32_t tf = 116u + (f * 140u >> 8);                    /* the light: 45 % in the corners */
+            uint32_t v = ((uint32_t)a[x] + glow) * tf >> 8;          /* (the background stays black: no banding) */
             px[x] = lut[v > 255u ? 255u : v];
         }
     }
@@ -1579,12 +1579,13 @@ static void draw_boot(uint32_t step)            /* step 0..8: the loading lines 
     cv_begin(240, BODY_Y, PH_BG);
     cv_out(0);
     cv_begin(240, BODY_H, PH_BG);
-    big_text(32, 6, "ZEPTOSECOND", 2, 3, PH_HI);
-    big_text(72, 36, "DSP", 4, 5, PH_HI);
-    cv_rect(16, 84, 208, 2, PH_MID);
-    cv_text(36, 92, &FONT_S, "FM-1 WAVETABLE SYSTEM", PH_MID);
-    cv_text(48, 110, &FONT_S, "SERIES I   REV " WT_VERSION, PH_LO);
-    for (i = 0; i < 4u && i < step; i++) cv_text(36, 132 + (int32_t)i * 16, &FONT_S, LINE[i], PH_MID);
+    big_text(32, 4, "ZEPTOSECOND", 2, 3, PH_HI);
+    big_text(72, 32, "DSP", 4, 4, PH_HI);
+    cv_text(20, 68, &FONT_S, "Pleasure is our business!", PH_MID);
+    cv_rect(16, 90, 208, 2, PH_MID);
+    cv_text(36, 96, &FONT_S, "FM-1 WAVETABLE SYSTEM", PH_MID);
+    cv_text(48, 114, &FONT_S, "SERIES I   REV " WT_VERSION, PH_LO);
+    for (i = 0; i < 4u && i < step; i++) cv_text(36, 138 + (int32_t)i * 16, &FONT_S, LINE[i], PH_MID);
     if (step >= 6u) cv_text(36, 202, &FONT_S, "READY", PH_HI);
     else if (step & 1u) cv_text(36, 202, &FONT_S, "SYSTEM LOADING _", PH_LO);
     else cv_text(36, 202, &FONT_S, "SYSTEM LOADING", PH_LO);
