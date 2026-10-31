@@ -59,7 +59,7 @@ enum { P_PITCH, P_WAVE, P_MOD, P_THR, P_HICUT, P_LEVEL, P_PAN, NP };
 typedef struct {                                /* the knobs, set by the main loop */
     volatile int32_t pitch_q8;                  /* note * 256, 1/256 semitone */
     volatile int32_t fine_q8;                   /* (after the quantiser) */
-    volatile uint8_t qon, qglide, send;         /* send: to the reverb, 0..127 */
+    volatile uint8_t qon, qglide, send, dsend;  /* send: to the reverb, dsend: to the delay, 0..127 */
     volatile uint8_t pos, mod, thr, hicut, level, pan;
     volatile uint8_t table, scan;               /* scan: 0 smooth (crossfade), 1 stepped (PPG) */
 } osc_par_t;
@@ -226,7 +226,7 @@ static void render(int32_t *out)                /* SUB frames */
     uint32_t inc[NO];
     const int8_t *tab[NO];
     uint32_t step[NO];
-    int32_t vin[SUB], sendg[NO];
+    int32_t vin[SUB], sendg[NO], dsendg[NO], dinb[SUB];
     verb_mod_t vm;
 
     for (k = 0; k < NFG; k++) src[k] = fg_out[k];   /* every source as it stood a step ago */
@@ -315,6 +315,7 @@ static void render(int32_t *out)                /* SUB frames */
         tab[o] = table_of(p->table);
         step[o] = p->scan;
         sendg[o] = p->send;
+        dsendg[o] = p->dsend;
         int32_t q, target, dpos;
         {
             int32_t pq = p->pitch_q8 + ((a[P_PITCH] * 3) >> 3);           /* full depth: ~4 octaves */
@@ -358,7 +359,7 @@ static void render(int32_t *out)                /* SUB frames */
 
     for (i = 0; i < SUB; i++) {
         int32_t l = 0, r = 0, prev0 = ost[0].last, prev1 = ost[1].last;    /* 1 and 2 hear each other a sample late */
-        int32_t snd = 0;
+        int32_t snd = 0, dsnd = 0;
         for (o = 0; o < NO; o++) {
             osc_st_t *s = &ost[o];
             uint32_t ph, idx, w, frac;
@@ -389,13 +390,28 @@ static void render(int32_t *out)                /* SUB frames */
             }
             s->amp += amp_d[o];
             v = (x * s->amp) >> 15;              /* <= 10000 */
-            snd += (v * sendg[o]) >> 7;          /* the send, before the pan */
+            snd += (v * sendg[o]) >> 7;          /* the sends, before the pan */
+            dsnd += (v * dsendg[o]) >> 7;
             l += (v * pl[o]) >> 15;
             r += (v * pr[o]) >> 15;
         }
         out[2u * i] += l;
         out[2u * i + 1u] += r;
         vin[i] = snd;
+        dinb[i] = dsnd;
+    }
+    {   /* the delay, frame by frame: into the output, and (TO REVERB) into the reverb's input */
+        uint32_t dinc = LUT_DINC[dlp.time & 127u];
+        int32_t fbg = (int32_t)dlp.fb * (DL_FB_MAX / 127), ret = (int32_t)dlp.ret * dlp.ret * 2;
+        int32_t tov = (int32_t)dlp.toverb * 258, mask = ~((1 << (dlp.crush > 10u ? 10u : dlp.crush)) - 1);
+        int32_t lpc = (int32_t)cl((int32_t)(dinc >> 16), 600, 32767);   /* the cutoff follows the clock */
+        for (i = 0; i < SUB; i++) {
+            int32_t y = dl_frame(dinb[i], dinc, fbg, mask, lpc), w = (y * ret) >> 15;
+            out[2u * i] += w;
+            out[2u * i + 1u] += w;
+            vin[i] += (y * tov) >> 15;
+        }
+        dl_w_v = dl_w;
     }
     for (o = 0; o < NO; o++) ost[o].amp = amp_t[o];
     vm.size = acc[D_VERB(0)]; vm.decay = acc[D_VERB(1)]; vm.damp = acc[D_VERB(2)];
@@ -448,6 +464,16 @@ typedef struct { uint8_t send[NO], size, decay, damp, pre, mod, crush, ret, fb, 
 static const vpatch_t V_DEFAULT = {{50, 50, 50, 50}, 100, 95, 50, 20, 40, 0, 70, 0, 0, 0, {0, 0}};
 static const vpatch_t V_OFF = {{0, 0, 0, 0}, 100, 95, 50, 20, 40, 0, 0, 0, 0, 0, {0, 0}};   /* (older patches) */
 static vpatch_t vpatch;
+typedef struct { uint8_t send[NO], time, fb, crush, ret, toverb, pad[3]; } dpatch_t;
+static const dpatch_t D_OFF = {{0, 0, 0, 0}, 80, 60, 0, 80, 30, {0, 0, 0}};   /* no sends: silent */
+static dpatch_t dpatch;
+static void push_dl(void)
+{
+    uint32_t o;
+    for (o = 0; o < NO; o++) opar[o].dsend = dpatch.send[o];
+    dlp.time = dpatch.time; dlp.fb = dpatch.fb; dlp.crush = dpatch.crush; dlp.ret = dpatch.ret;
+    dlp.toverb = dpatch.toverb;
+}
 static void push_verb(void)
 {
     uint32_t o;
@@ -596,6 +622,7 @@ typedef struct {
     oq_t oq[NO];                                /* version 5 on */
     tunpatch_t tun;
     vpatch_t verb;                              /* version 6 on */
+    dpatch_t dly;                               /* version 7 on */
 } pdata_t;
 typedef union { pdata_t d; uint8_t raw[2040]; } pslot_t;
 typedef char pdata_fits_its_slot[sizeof(pdata_t) <= 2040u ? 1 : -1];   /* (the build fails if it ever grows past) */
@@ -637,7 +664,7 @@ static int patch_save(uint32_t slot)            /* 1..16 */
         for (k = 0; k < sizeof pbank[j].raw; k++) raw[k] = 0;
     }
     q->tag = PATCH_TAG;
-    q->ver = 6;
+    q->ver = 7;
     q->used = 1;
     for (o = 0; o < NO; o++) q->osc[o] = opatch[o];
     for (k = 0; k < NFG; k++) q->fg[k] = fgpatch[k];
@@ -651,6 +678,7 @@ static int patch_save(uint32_t slot)            /* 1..16 */
     for (o = 0; o < NO; o++) q->oq[o] = oq[o];
     q->tun = tunpatch;
     q->verb = vpatch;
+    q->dly = dpatch;
     mute = 1;                                   /* fade out, save, fade in: the erase stops the sound ~50 ms */
     t0 = fm1_ms;
     while (out_gain > 0 && fm1_ms - t0 < 100u) platform_poll();
@@ -675,6 +703,7 @@ static int patch_load(uint32_t slot)            /* 0 = the default */
         for (o = 0; o < NO; o++) { otab[o] = oscan[o] = 0; oq[o].on = oq[o].glide = 0; }
         tunpatch.tun = 0; tunpatch.scl = 1; tunpatch.root = 0;
         vpatch = V_DEFAULT;
+        dpatch = D_OFF;
     } else {
         if (bank_read((slot - 1u) / 2u)) return -1;
         q = &pbank[(slot - 1u) & 1u].d;
@@ -697,6 +726,7 @@ static int patch_load(uint32_t slot)            /* 0 = the default */
         }
         if (q->ver >= 5u) tunpatch = q->tun; else { tunpatch.tun = 0; tunpatch.scl = 1; tunpatch.root = 0; }
         vpatch = q->ver >= 6u ? q->verb : V_OFF;   /* (older: no reverb) */
+        dpatch = q->ver >= 7u ? q->dly : D_OFF;    /* (older: no delay) */
     }
     if (gen_seed != gen_built) gen_build(gen_seed);
     for (o = 0; o < NO; o++) {                  /* (a damaged value never reaches the engine) */
@@ -728,6 +758,12 @@ static int patch_load(uint32_t slot)            /* 0 = the default */
         v->size &= 127u; v->decay &= 127u; v->damp &= 127u; v->pre &= 127u; v->mod &= 127u;
         v->crush = (uint8_t)cl(v->crush, 0, 10); v->ret &= 127u; v->fb &= 127u; v->rate &= 1u; v->freeze &= 1u;
         push_verb();
+    }
+    {
+        dpatch_t *d = &dpatch;
+        for (k = 0; k < NO; k++) d->send[k] &= 127u;
+        d->time &= 127u; d->fb &= 127u; d->crush = (uint8_t)cl(d->crush, 0, 10); d->ret &= 127u; d->toverb &= 127u;
+        push_dl();
     }
     for (k = 0; k < NSSG; k++) { shpatch.input[k] = (uint8_t)cl(shpatch.input[k], 0, NSRC); shpatch.slew[k] &= 127u; }
     shpatch.qrate &= 127u;
@@ -790,6 +826,10 @@ static void randomize(void)
     vpatch.crush = rnd(4) ? 0u : (uint8_t)rnd_in(2, 7); vpatch.fb = rnd(3) ? 0u : (uint8_t)rnd_in(20, 110);
     vpatch.rate = (uint8_t)rnd(2); vpatch.freeze = 0;
     push_verb();
+    for (o = 0; o < NO; o++) dpatch.send[o] = (uint8_t)(rnd(3) ? 0 : rnd_in(20, 90));   /* the delay: now and then */
+    dpatch.time = (uint8_t)rnd(128); dpatch.fb = (uint8_t)rnd(110); dpatch.crush = rnd(3) ? 0u : (uint8_t)rnd_in(2, 6);
+    dpatch.ret = (uint8_t)rnd_in(50, 100); dpatch.toverb = (uint8_t)rnd(80);
+    push_dl();
     for (k = 0; k < NFG; k++) {
         fgpatch_t *f = &fgpatch[k];
         f->rise = (uint8_t)rnd_in(30, 115);
@@ -899,15 +939,17 @@ static void dst_name(char *s, uint32_t d)
 enum { PG_INDEX, PG_OSC, PG_WAVE, PG_FG, PG_SH, PG_GATE, PG_MOD, PG_GMAT, PG_GLOBAL, PG_VERB, PG_PATCH, NPG };
 static const char *const PG_NUM[NPG] = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "R", "P"};
 static const char *const PG_NAME[NPG] = {"INDEX", "OSCILLATORS", "WAVEFORM", "FUNCTION GEN", "S&H / QUAD",
-                                         "GATE GEN", "MOD MATRIX", "GATE MATRIX", "GLOBAL", "REVERB", "PATCHES"};
+                                         "GATE GEN", "MOD MATRIX", "GATE MATRIX", "GLOBAL", "FX", "PATCHES"};
 static const uint8_t PG_READY[NPG] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
 
+static uint32_t fxsub;                          /* the FX page: 0 the reverb, 1 the delay (FX again flips it) */
 static void draw_header(uint32_t pg, uint32_t cpu_pct)
 {
     char s[40] = "PAGE ";
     s_cat(s, PG_NUM[pg]);
     s_cat(s, "  ");
     s_cat(s, PG_NAME[pg]);
+    if (pg == PG_VERB) s_cat(s, fxsub ? ": DELAY" : ": REVERB");
     cv_begin(240, BODY_Y, PH_BG);
     cv_text(4, 2, &FONT_S, s, PH_HI);
     if (cpu_pct) {
@@ -1402,7 +1444,52 @@ static void draw_verb(uint32_t vsel, int shift)
         if (h) cv_rect(40 + (int32_t)i, 192 - h, 1, h, i + 1u == HIST ? PH_HI : PH_MID);
     }
     cv_text(4, 176, &FONT_S, "OUT", PH_LO);
-    cv_text(0, 200, &FONT_S, "SEL:MORE PRST:RATE PLAY:FREEZE", PH_LO);
+    cv_text(0, 200, &FONT_S, "FX:FLIP SEL:MORE PLAY:FREEZE", PH_LO);
+    cv_blit(0, BODY_Y);
+}
+
+static void draw_delay(uint32_t vsel, int shift)
+{
+    static const char *const L[4] = {"TIME", "FEEDBK", "CRUSH", "RETURN"};
+    const uint8_t v[4] = {dpatch.time, dpatch.fb, dpatch.crush, dpatch.ret};
+    uint32_t o, k, c, w = dl_w_v;
+    char s[24];
+    cv_begin(240, BODY_H, PH_BG);
+    cv_text(4, 2, &FONT_S, "SEND", PH_LO);
+    for (o = 0; o < NO; o++) {
+        int32_t x = 48 + (int32_t)o * 48;
+        s[0] = 0;
+        s_cat(s, ONAME[o]);
+        s_cat(s, " ");
+        s_int(s, dpatch.send[o], 0);
+        if (o == vsel) cv_rect(x - 3, 1, 46, 17, PH_SEL);
+        cv_text(x, 2, &FONT_S, s, o == vsel ? PH_HI : PH_MID);
+    }
+    for (k = 0; k < 4u; k++) {
+        int32_t y = 24 + (int32_t)k * 18;
+        cv_text(4, y, &FONT_S, L[k], shift ? PH_LO : PH_MID);
+        s[0] = 0;
+        if (k == 0u) { s_int(s, LUT_DMS[dpatch.time & 127u], 0); s_cat(s, "MS"); }
+        else s_int(s, v[k], 0);
+        cv_text(112 - text_w(&FONT_S, s), y, &FONT_S, s, shift ? PH_MID : PH_HI);
+    }
+    cv_text(124, 24, &FONT_S, "TO VERB", shift ? PH_MID : PH_LO);
+    s[0] = 0;
+    s_int(s, dpatch.toverb, 0);
+    cv_text(236 - text_w(&FONT_S, s), 24, &FONT_S, s, shift ? PH_HI : PH_MID);
+    cv_rect(0, 98, 240, 1, PH_LO);
+    cv_text(4, 102, &FONT_S, "REGISTER", PH_LO);
+    for (c = 0; c < 196u; c++) {                /* the register: each column ~10 cells, the write head bright */
+        uint32_t a = c * DL_N / 196u, b = (c + 1u) * DL_N / 196u, n = 0, i;
+        int32_t m = 0, h;
+        for (i = a; i < b; i++, n++) { int32_t x = dl_buf[i]; m += x < 0 ? -x : x; }
+        h = n ? (m / (int32_t)n) * 36 / 12000 : 0;
+        if (h > 36) h = 36;
+        if (h) cv_rect(40 + (int32_t)c, 156 - h, 1, 2 * h + 1, PH_MID);
+        else cv_pset(40 + (int32_t)c, 156, PH_LO);
+    }
+    cv_rect(40 + (int32_t)(w * 196u / DL_N), 118, 1, 76, PH_HI);
+    cv_text(0, 200, &FONT_S, "FX:FLIP SEL:MORE PLAY:CLEAR", PH_LO);
     cv_blit(0, BODY_Y);
 }
 
@@ -1456,6 +1543,7 @@ static void app_main(void)
     for (k = 0; k < NGG; k++) ggpatch[k] = GG_DEFAULT[k];
     shpatch = SH_DEFAULT;
     vpatch = V_DEFAULT;
+    dpatch = D_OFF;
     verb_init();
 
     depth[0][0 * NP + P_WAVE] = 40;             /* a few pins to hear the FGs at once */
@@ -1511,7 +1599,10 @@ static void app_main(void)
         if (b & (1u << BTN_ARP)) newpage = PG_MOD;
         if (b & (1u << BTN_SEQ)) newpage = PG_GMAT;
         if (b & (1u << BTN_GLO)) newpage = PG_GLOBAL;
-        if (b & (1u << BTN_FX)) newpage = PG_VERB;
+        if (b & (1u << BTN_FX)) {               /* FX again on the FX page: the other half */
+            if (page == PG_VERB) { fxsub ^= 1u; dirty = hdr_dirty = 1; }
+            newpage = PG_VERB;
+        }
         if (b & (1u << BTN_SAVE)) newpage = PG_PATCH;
         if (b & (1u << BTN_OCT_DOWN) && oct > -3) oct--;
         if (b & (1u << BTN_OCT_UP) && oct < 2) oct++;
@@ -1621,7 +1712,22 @@ static void app_main(void)
             if ((e = fm1_enc_take(ENC_KNOB3)) != 0) { depth[mcs][d] = (int8_t)cl(depth[mcs][d] + e, -64, 63); dirty = 1; }
             if (b & (1u << BTN_PLAY)) { depth[mcs][d] = depth[mcs][d] ? 0 : 32; dirty = 1; }
         }
-        else if (page == PG_VERB) {
+        else if (page == PG_VERB && fxsub) {     /* the delay */
+            uint8_t *kn[4] = {&dpatch.time, &dpatch.fb, &dpatch.crush, &dpatch.ret};
+            static const uint8_t KE[4] = {ENC_KNOB1, ENC_KNOB2, ENC_KNOB3, ENC_KNOB4};
+            int ch = 0;
+            uint32_t j;
+            for (j = 0; j < 4u; j++)
+                if ((e = fm1_enc_take(KE[j])) != 0) {
+                    uint8_t *q = shift && j == 0u ? &dpatch.toverb : kn[j];
+                    *q = (uint8_t)cl(*q + e, 0, q == &dpatch.crush ? 10 : 127);
+                    ch = 1;
+                }
+            if ((e = fm1_enc_take(ENC_SELECT)) != 0) { vsel = (uint32_t)cl((int32_t)vsel + e, 0, NO - 1); dirty = 1; }
+            if ((e = fm1_enc_take(ENC_ALGORITHM)) != 0) { dpatch.send[vsel] = (uint8_t)cl(dpatch.send[vsel] + e, 0, 127); ch = 1; }
+            if (b & (1u << BTN_PLAY)) { uint32_t i; for (i = 0; i < DL_N; i++) dl_buf[i] = 0; dirty = 1; }   /* clear */
+            if (ch) { push_dl(); dirty = 1; }
+        } else if (page == PG_VERB) {
             uint8_t *kn[8] = {&vpatch.size, &vpatch.decay, &vpatch.damp, &vpatch.ret,
                               &vpatch.pre, &vpatch.mod, &vpatch.crush, &vpatch.fb};
             static const uint8_t KE[4] = {ENC_KNOB1, ENC_KNOB2, ENC_KNOB3, ENC_KNOB4};
@@ -1706,6 +1812,8 @@ static void app_main(void)
             if (page == PG_OSC) {
                 for (o = 0; o < NO; o++)
                     if (opatch[o].note == base + k) { if (o == sel) on = 1; else glow = 1; }
+            } else if (page == PG_VERB && fxsub) { /* the register's write head, running along the keys */
+                on = k == dl_w_v * 27u / DL_N;
             } else if (page == PG_VERB) {          /* the return's level, as a bar */
                 uint32_t lv = (uint32_t)cl(v_level, 0, 32767) * 27u >> 14;
                 on = k < lv;
@@ -1742,7 +1850,8 @@ static void app_main(void)
             fm1_led_key(BTN_PLAY, ((page == PG_FG || page == PG_SH) && (play || blink))   /* a manual gate / sample */
                                   || (page == PG_WAVE && otab[sel] >= T_GEN && blink)   /* a new generative table */
                                   || (page == PG_GLOBAL && (oq[qsel].on || blink))   /* solid: this one quantises */
-                                  || (page == PG_VERB && (vpatch.freeze || v_gate_freeze || blink))   /* solid: frozen */
+                                  || (page == PG_VERB && !fxsub && (vpatch.freeze || v_gate_freeze || blink))   /* frozen */
+                                  || (page == PG_VERB && fxsub && blink)   /* the delay: PLAY clears it */
                                   || (page == PG_MOD && (depth[mcs][DLIST[mcr]] || blink))   /* solid: a pin here */
                                   || (page == PG_GMAT && (gpatch[gcr] >> gcc & 1u || blink)));
         }
@@ -1780,7 +1889,7 @@ static void app_main(void)
             case PG_GATE: draw_gg(gsel); break;
             case PG_SH: draw_sh(); break;
             case PG_GLOBAL: draw_global(qsel); break;
-            case PG_VERB: draw_verb(vsel, shift); break;
+            case PG_VERB: if (fxsub) draw_delay(vsel, shift); else draw_verb(vsel, shift); break;
             case PG_GMAT: draw_gmat(gcc, gcr, gtop, gleft); break;
             default: draw_soon(page); break;
             }

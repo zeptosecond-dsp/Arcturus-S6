@@ -183,3 +183,33 @@ static void verb_run(const int32_t *in, int32_t *out, uint32_t n, const verb_mod
 #undef TAP
     v_level = lvl;
 }
+
+/* ---- the delay: a shift register of DL_N cells, clocked: the clock sets the time, so a turned TIME bends the
+ * repeats' pitch, and a slow clock is a low sample rate (darker, grainier). The input is sampled at each tick,
+ * the output held between ticks and smoothed a little (a cutoff that follows the clock, as a BBD's filters do).
+ * Safe from the first interrupt: a static buffer, no setup. */
+#define DL_N 2048u
+static int16_t dl_buf[DL_N] __attribute__((section(".pool")));
+typedef struct { volatile uint8_t time, fb, crush, ret, toverb; } dl_par_t;
+static dl_par_t dlp;
+static uint32_t dl_ph, dl_w;
+static int32_t dl_hold, dl_lp, dl_in;
+static volatile uint32_t dl_w_v;                /* the write head, for the screen */
+#define DL_FB_MAX 29500                         /* ~0.9: long, never runaway (and the loop's saturated) */
+
+/* one frame: in = the sends' sum; returns the delayed signal (before the return level) */
+static inline __attribute__((always_inline)) int32_t dl_frame(int32_t in, uint32_t inc, int32_t fbg, int32_t mask,
+                                                             int32_t lpc)
+{
+    uint32_t ph = dl_ph + inc;
+    dl_in = in;
+    if (ph < dl_ph || inc == 0xFFFFFFFFu) {     /* a clock tick: the oldest cell out, the input (and feedback) in */
+        int32_t old = dl_buf[dl_w];
+        dl_buf[dl_w] = (int16_t)(sat16(softclip((dl_in >> 1) + ((old * fbg) >> 15))) & mask);
+        if (++dl_w >= DL_N) dl_w = 0;
+        dl_hold = old;
+    }
+    dl_ph = ph;
+    dl_lp += ((dl_hold - dl_lp) * lpc) >> 15;
+    return dl_lp;
+}

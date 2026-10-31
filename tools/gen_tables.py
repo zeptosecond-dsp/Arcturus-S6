@@ -285,6 +285,11 @@ def write_luts(root):
     qper = [120.0 / 1200 ** (k / 127) for k in range(128)]
     qinc = [round(1 / t / sub * 2 ** 32) for t in qper]
     qcs = [round(t * 100) for t in qper]          # the period in 1/100 s, for the screen
+    # the shift-register delay: 2048 cells; time knob 0..127 -> 46 ms .. 2 s, as the register clock's phase step per frame
+    dcells = 2048
+    tmin = dcells / fs
+    dinc = [min(0xFFFFFFFF, round(dcells / (tmin * (2.0 / tmin) ** (k / 127)) / fs * 2 ** 32)) for k in range(128)]
+    dms = [round(tmin * (2.0 / tmin) ** (k / 127) * 1000) for k in range(128)]
     semifrac = [round(2 ** (f / 256 / 12) * 65536) for f in range(256)]   # 1/256 semitone -> ratio, Q16
     arr = lambda name, typ, v: f"static const {typ} {name}[{len(v)}] = {{" + ",".join(map(str, v)) + "};"
     lines = [
@@ -292,6 +297,8 @@ def write_luts(root):
         arr("LUT_GGINC", "uint32_t", gginc),
         arr("LUT_QINC", "uint32_t", qinc),
         arr("LUT_QPER", "uint32_t", qcs),
+        arr("LUT_DINC", "uint32_t", dinc),
+        arr("LUT_DMS", "uint16_t", dms),
         arr("LUT_SHAPE_EXP", "uint16_t", exp_s),
         arr("LUT_SHAPE_LOG", "uint16_t", log_s),
         arr("LUT_SEMIFRAC", "uint32_t", semifrac),
