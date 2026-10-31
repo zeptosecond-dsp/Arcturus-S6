@@ -133,6 +133,12 @@ static int32_t sine(uint32_t ph)                /* a full cycle over 2^32 -> -32
     return y > 32767 ? 32767 : y < -32767 ? -32767 : y;
 }
 static volatile uint32_t audio_us, audio_us_max;
+/* page 3's scope: the main loop asks (scope_req), the interrupt waits for the oscillator's cycle to start, then
+ * keeps scope_len samples of its output (after PM / fold and the hi cut, before the level) */
+#define SCOPE_MAX 512u
+static int16_t scope_buf[SCOPE_MAX];
+static volatile uint32_t scope_osc, scope_req, scope_len, scope_n, scope_done, scope_dec;   /* dec: keep 1 in dec */
+static uint32_t scope_cnt;
 static volatile uint32_t mute;                  /* 1: fade the output out (a flash save stalls the sound) */
 static volatile int32_t out_gain = 32767;
 
@@ -390,6 +396,16 @@ static void render(int32_t *out)                /* SUB frames */
                 s->lp1 += ((x - s->lp1) * c) >> 15;
                 s->lp2 += ((s->lp1 - s->lp2) * c) >> 15;
                 x = s->lp2;
+            }
+            if (o == scope_osc && scope_req) {  /* the scope: from the start of a cycle */
+                if (scope_n == 0u && s->ph >= inc[o]) {}   /* (waiting for the phase to wrap) */
+                else if (scope_n < scope_len) {
+                    if (scope_n == 0u || ++scope_cnt >= scope_dec) {
+                        scope_cnt = 0;
+                        scope_buf[scope_n++] = (int16_t)(x >> 1);
+                        if (scope_n >= scope_len) { scope_req = 0; scope_done = 1; }
+                    }
+                }
             }
             s->amp += amp_d[o];
             v = (x * s->amp) >> 15;              /* <= 10000 */
@@ -1008,7 +1024,44 @@ static void cv_out(uint32_t y0)                 /* the canvas (240 wide) through
 }
 
 static uint32_t fxsub;                          /* the FX page: 0 the reverb, 1 the delay (FX again flips it) */
-static void draw_header(uint32_t pg, uint32_t cpu_pct)
+/* ---- the battery: SARADC channel 3 (the battery's divider), raw 0..1023, read every 2 s and smoothed. The scale is
+ * built around the stock firmware's bar thresholds (531 / 561 / 591, as Felucca has them): BATT_EMPTY .. BATT_FULL
+ * are first guesses, to be set from a full and a nearly flat reading (the boot screen shows the raw one). On USB
+ * the reading is a charger's, not the battery's: the header shows USB instead. */
+#define BATT_EMPTY 515
+#define BATT_FULL 615
+static int32_t batt_avg = -1;                   /* x 16 */
+static uint32_t batt_raw(void)
+{
+#ifdef DINGHY_HOST
+    return 600u;
+#else
+    int32_t a = fm1_adc_read(FM1_ADC_BATT);
+    return a < 0 ? 0u : (uint32_t)a;
+#endif
+}
+static void batt_poll(void)
+{
+    uint32_t r = batt_raw();
+    if (!r) return;
+    if (batt_avg < 0) batt_avg = (int32_t)r * 16;
+    else batt_avg += ((int32_t)r * 16 - batt_avg) / 8;
+}
+static int batt_usb(void)
+{
+#ifdef DINGHY_HOST
+    return 0;
+#else
+    return usb.config && !usb.suspended;
+#endif
+}
+static int32_t batt_pct(void)                   /* 0..100, or -1 (not read yet) */
+{
+    if (batt_avg < 0) return -1;
+    return cl(((batt_avg / 16) - BATT_EMPTY) * 100 / (BATT_FULL - BATT_EMPTY), 0, 100);
+}
+
+static void draw_header(uint32_t pg)
 {
     char s[40] = "PAGE ";
     s_cat(s, PG_NUM[pg]);
@@ -1017,11 +1070,12 @@ static void draw_header(uint32_t pg, uint32_t cpu_pct)
     if (pg == PG_VERB) s_cat(s, fxsub ? ": DELAY" : ": REVERB");
     cv_begin(240, BODY_Y, PH_BG);
     cv_text(4, 2, &FONT_S, s, PH_HI);
-    if (cpu_pct) {
+    {                                           /* the battery, top right */
         char c[12] = "";
-        s_int(c, (int32_t)cpu_pct, 0);
-        s_cat(c, "%");
-        cv_text(236 - text_w(&FONT_S, c), 2, &FONT_S, c, PH_LO);
+        int32_t b = batt_pct();
+        if (batt_usb()) s_cat(c, "USB");
+        else if (b >= 0) { s_int(c, b, 0); s_cat(c, "%"); }
+        cv_text(236 - text_w(&FONT_S, c), 2, &FONT_S, c, b >= 0 && b < 15 && !batt_usb() ? PH_HI : PH_LO);
     }
     cv_rect(0, 19, 240, 1, PH_MID);
     cv_out(0);
@@ -1097,6 +1151,62 @@ static void draw_osc(uint32_t sel, int shift)
 static const int8_t *wave_tab;
 static int32_t wave_at(uint32_t w, uint32_t i) { return wave_tab[w * WT_SAMPLES + i]; }
 
+static uint32_t wmode;                          /* page 3: 0 the table, 1 the scope (OCT- / OCT+) */
+static int16_t scope_show[SCOPE_MAX];           /* the last whole capture, as drawn */
+static uint32_t scope_show_n, scope_show_osc = 99u;
+static void draw_scope(uint32_t sel)
+{
+    uint32_t inc = pitch_inc(q_pitch_v[sel] + opar[sel].fine_q8), n = scope_len, i;
+    uint32_t hz100 = (uint32_t)(((uint64_t)inc * 4410000u) >> 32);   /* 1/100 Hz */
+    int32_t py = 0;
+    char s[40] = "OSC ";
+    cv_begin(240, BODY_H, PH_BG);
+    for (i = 0; i <= 8u; i++) {                 /* the graticule: dotted */
+        uint32_t x;
+        for (x = 8; x <= 232u; x += 4u) cv_pset((int32_t)x, 8 + (int32_t)i * 18, i == 4u ? PH_MID : PH_LO);
+    }
+    for (i = 0; i <= 8u; i++) {
+        uint32_t y;
+        for (y = 8; y <= 152u; y += 4u) cv_pset(8 + (int32_t)i * 28, (int32_t)y, i == 4u ? PH_MID : PH_LO);
+    }
+    if (scope_done) {                           /* a new capture: keep it to draw */
+        for (i = 0; i < n; i++) scope_show[i] = scope_buf[i];
+        scope_show_n = n;
+        scope_show_osc = scope_osc;
+    }
+    n = scope_show_osc == sel ? scope_show_n : 0u;
+    if (n > 1u)
+        for (i = 0; i < 225u; i++) {            /* two cycles across the screen */
+            int32_t v = scope_show[i * (n - 1u) / 224u], y = 80 - (v * 70 >> 14);
+            y = cl(y, 9, 151);
+            if (i) { cv_line(8 + (int32_t)i - 1, py, 8 + (int32_t)i, y, PH_HI); cv_line(8 + (int32_t)i - 1, py + 1, 8 + (int32_t)i, y + 1, PH_HI); }
+            py = y;
+        }
+    s_cat(s, ONAME[sel]);
+    s_cat(s, "  SCOPE");
+    cv_text(4, 162, &FONT_S, s, PH_HI);
+    s[0] = 0;
+    s_int(s, (int32_t)(hz100 / 100u), 0);
+    s_cat(s, ".");
+    s_int(s, (int32_t)(hz100 / 10u % 10u), 0);
+    s_cat(s, "HZ   2 CYCLES");
+    cv_text(4, 180, &FONT_S, s, PH_MID);
+    cv_text(4, 198, &FONT_S, "SELECT OSC  OCT: TABLE/SCOPE", PH_LO);
+    cv_out(BODY_Y);
+    if (scope_done || !scope_req || scope_osc != sel) {   /* the next capture: two cycles (as much as fits) */
+        uint32_t per = inc ? 0xFFFFFFFFu / inc : SCOPE_MAX;
+        scope_req = 0;
+        scope_dec = per * 2u / SCOPE_MAX + 1u;   /* low notes: every dec-th sample, two cycles always */
+        scope_len = per * 2u / scope_dec;
+        if (scope_len < 16u) scope_len = 16u;
+        if (scope_len > SCOPE_MAX) scope_len = SCOPE_MAX;
+        scope_osc = sel;
+        scope_n = 0;
+        scope_done = 0;
+        scope_req = 1;                          /* (last: the interrupt starts on this) */
+    }
+}
+
 static void draw_wave(uint32_t sel, int32_t posq)
 {
     int32_t w, i, f = posq & 255, wc = posq >> 8;
@@ -1105,19 +1215,19 @@ static void draw_wave(uint32_t sel, int32_t posq)
     if (oscan[sel]) { wc = (posq + 128) >> 8; f = 0; }   /* stepped: the wave it is on */
     cv_begin(240, BODY_H, PH_BG);
     for (w = 60; w >= 0; w -= 4) {              /* the table in 3D, back to front, as the Waveterm drew it */
-        int32_t x0 = 8 + (w * 3) / 2, y0 = 150 - (w * 9) / 5, py = 0;
+        int32_t x0 = 8 + (w * 3) / 2, y0 = 164 - (w * 7) / 5, py = 0;
         for (i = 0; i < 128; i++) {
-            int32_t y = y0 - ((wave_at((uint32_t)w, (uint32_t)i) * 28) >> 7);
+            int32_t y = y0 - ((wave_at((uint32_t)w, (uint32_t)i) * 22) >> 7);
             if (i) cv_line(x0 + i - 1, py, x0 + i, y, PH_LO);
             py = y;
         }
     }
     {                                           /* the wave playing now, bright, in its place */
-        int32_t x0 = 8 + (wc * 3) / 2, y0 = 150 - (wc * 9) / 5, py = 0;
+        int32_t x0 = 8 + (wc * 3) / 2, y0 = 164 - (wc * 7) / 5, py = 0;
         uint32_t w1 = wc + 1 < (int32_t)WT_WAVES ? (uint32_t)wc + 1u : (uint32_t)wc;
         for (i = 0; i < 128; i++) {
             int32_t v = (wave_at((uint32_t)wc, (uint32_t)i) * (256 - f) + wave_at(w1, (uint32_t)i) * f) >> 8;
-            int32_t y = y0 - ((v * 28) >> 7);
+            int32_t y = y0 - ((v * 22) >> 7);
             if (i) { cv_line(x0 + i - 1, py, x0 + i, y, PH_HI); cv_line(x0 + i - 1, py + 1, x0 + i, y + 1, PH_HI); }
             py = y;
         }
@@ -1125,12 +1235,13 @@ static void draw_wave(uint32_t sel, int32_t posq)
     s_cat(s, ONAME[sel]);
     s_cat(s, "  ");
     s_cat(s, tab_name(otab[sel]));
-    cv_text(4, 162, &FONT_S, s, PH_HI);
+    cv_text(4, 2, &FONT_S, s, PH_HI);
     s[0] = 0;
     s_cat(s, "WAVE ");
     s_int(s, (posq * 127) / (63 * 256), 0);
     s_cat(s, oscan[sel] ? "   STEPPED" : "   SMOOTH");
-    cv_text(4, 180, &FONT_S, s, PH_MID);
+    cv_text(4, 20, &FONT_S, s, PH_MID);
+    cv_rect(0, 39, 240, 1, PH_LO);
     cv_text(4, 198, &FONT_S, otab[sel] >= T_GEN ? "K1 WAV K2 TAB K3 SCN PLAY:NEW" : "K1 WAVE K2 TABLE K3 SCAN", PH_LO);
     cv_out(BODY_Y);
 }
@@ -1369,6 +1480,7 @@ static void s_secs(char *s, uint32_t cs)        /* 1/100 s -> "12.5S" or "120S" 
     else { s_int(s, (int32_t)(cs / 100u), 0); s_cat(s, "."); s_int(s, (int32_t)(cs / 10u % 10u), 0); }
     s_cat(s, "S");
 }
+static uint32_t ssel;                           /* page 5: the selected SSG (OCT- / OCT+), PLAY fires it */
 static void draw_sh(void)
 {
     uint32_t k, i;
@@ -1382,7 +1494,8 @@ static void draw_sh(void)
         s_int(s, (int32_t)k + 1, 0);
         s_cat(s, " IN ");
         s_cat(s, in == 0u || in > NSRC ? "NOISE" : SRCL[in - 1u]);
-        cv_text(4, y0 + 2, &FONT_S, s, ssg_fired[k] ? PH_HI : PH_MID);
+        if (k == ssel) cv_rect(0, y0 + 1, 116, 17, PH_SEL);
+        cv_text(4, y0 + 2, &FONT_S, s, ssg_fired[k] || k == ssel ? PH_HI : PH_MID);
         ssg_fired[k] = 0;
         s[0] = 0;
         s_cat(s, "SLEW ");
@@ -1412,7 +1525,7 @@ static void draw_sh(void)
         cv_rect(178, y, 1, 7, PH_LO);
         if (v >= 0) cv_rect(179, y + 1, v, 5, PH_MID); else cv_rect(178 + v, y + 1, -v, 5, PH_MID);
     }
-    cv_text(2, 202, &FONT_S, "K1/2 S1 K3/4 S2 ALG:RATE PLAY", PH_LO);
+    cv_text(2, 202, &FONT_S, "K1/2 S1 K3/4 S2 ALG:RATE OCT", PH_LO);
     cv_out(BODY_Y);
 }
 
@@ -1573,9 +1686,9 @@ static void big_text(int32_t x, int32_t y, const char *s, int32_t sx, int32_t sy
 }
 static void draw_boot(uint32_t step)            /* step 0..8: the loading lines appear, then READY */
 {
-    static const char *const LINE[4] = {"WAVETABLES ......  13", "TUNINGS .........  21", "PATCH MEMORY ....  16",
-                                        "VOICES ..........   4"};
+    static const char *const LINE[3] = {"WAVETABLES ......  13", "TUNINGS .........  21", "PATCH MEMORY ....  16"};
     uint32_t i;
+    char bl[32] = "BATTERY ........ ";
     cv_begin(240, BODY_Y, PH_BG);
     cv_out(0);
     cv_begin(240, BODY_H, PH_BG);
@@ -1585,7 +1698,12 @@ static void draw_boot(uint32_t step)            /* step 0..8: the loading lines 
     cv_rect(16, 90, 208, 2, PH_MID);
     cv_text(36, 96, &FONT_S, "FM-1 WAVETABLE SYSTEM", PH_MID);
     cv_text(48, 114, &FONT_S, "SERIES I   REV " WT_VERSION, PH_LO);
-    for (i = 0; i < 4u && i < step; i++) cv_text(36, 138 + (int32_t)i * 16, &FONT_S, LINE[i], PH_MID);
+    for (i = 0; i < 3u && i < step; i++) cv_text(36, 138 + (int32_t)i * 16, &FONT_S, LINE[i], PH_MID);
+    if (step >= 4u) {                           /* the raw reading (for the scale), or USB */
+        if (batt_usb()) s_cat(bl, "USB");
+        else { uint32_t r = batt_raw(); if (r < 1000u) s_cat(bl, " "); s_int(bl, (int32_t)r, 0); }
+        cv_text(36, 186, &FONT_S, bl, PH_MID);
+    }
     if (step >= 6u) cv_text(36, 202, &FONT_S, "READY", PH_HI);
     else if (step & 1u) cv_text(36, 202, &FONT_S, "SYSTEM LOADING _", PH_LO);
     else cv_text(36, 202, &FONT_S, "SYSTEM LOADING", PH_LO);
@@ -1643,13 +1761,14 @@ static void draw_patch(uint32_t cur, uint32_t confirm, const char *msg)
 static void app_main(void)
 {
     uint32_t o, k, sel = 0, fsel = 0, prev = 0, page = PG_INDEX, icur = PG_OSC, mcs = 0, mcr = 0, mtop = 0, mleft = 0;
-    uint32_t dirty = 1, hdr_dirty = 1, cpu_pct = 0, t_cpu = 0, t_live = 0, pcur = 1, pconf = PC_NONE, t_msg = 0;
+    uint32_t dirty = 1, hdr_dirty = 1, batt_shown = 0xFFFFu, t_batt = 0, t_live = 0, pcur = 1, pconf = PC_NONE, t_msg = 0;
     const char *pmsg = "";
     uint32_t gsel = 0, gcc = 0, gcr = 0, gtop = 0, gleft = 0, t_hist = 0, qsel = 0, vsel = 0;
     int32_t oct = -1, e, shift_drawn = -1;
 
     int skip;
     crt_init();
+    batt_poll();                                /* (a first reading, so the header has one from the start) */
     draw_boot(0);
     skip = boot_wait(300);
     for (k = 0; k < NGG; k++) ggpatch[k] = GG_DEFAULT[k];
@@ -1721,8 +1840,21 @@ static void app_main(void)
             newpage = PG_VERB;
         }
         if (b & (1u << BTN_SAVE)) newpage = PG_PATCH;
-        if (b & (1u << BTN_OCT_DOWN) && oct > -3) oct--;
-        if (b & (1u << BTN_OCT_UP) && oct < 2) oct++;
+        if (page == PG_OSC) {                   /* page 2: OCT is the keyboard's octave */
+            if (b & (1u << BTN_OCT_DOWN) && oct > -3) oct--;
+            if (b & (1u << BTN_OCT_UP) && oct < 2) oct++;
+        } else {                                /* elsewhere: the previous / next thing (wrapping round) */
+            int32_t st = (b >> BTN_OCT_UP & 1u) ? 1 : (b >> BTN_OCT_DOWN & 1u) ? -1 : 0;
+            if (st) {
+                dirty = 1;
+                if (page == PG_WAVE) wmode ^= 1u;   /* page 3: the table <-> the scope */
+                else if (page == PG_FG) fsel = (fsel + NFG + (uint32_t)st) % NFG;
+                else if (page == PG_SH) ssel = (ssel + NSSG + (uint32_t)st) % NSSG;
+                else if (page == PG_GATE) gsel = (gsel + NGG + (uint32_t)st) % NGG;
+                else if (page == PG_GLOBAL) qsel = (qsel + NO + (uint32_t)st) % NO;
+                else if (page == PG_VERB) { fxsub = st > 0; hdr_dirty = 1; }   /* OCT-: REVERB, OCT+: DELAY */
+            }
+        }
         base = (uint32_t)(53 + 12 * oct);       /* key 0 = F3, shifted */
 
         if (page == PG_INDEX) {
@@ -1760,7 +1892,7 @@ static void app_main(void)
 
         for (k = 0; k < NFG; k++)               /* PLAY held on the FG page: the selected FG's gate */
             fg_manual[k] = (uint8_t)(page == PG_FG && k == fsel && play);
-        if (page == PG_SH && b >> BTN_PLAY & 1u) ssg_tap[shift ? 1 : 0]++;   /* PLAY: S1, SEL + PLAY: S2 */
+        if (page == PG_SH && b >> BTN_PLAY & 1u) ssg_tap[ssel]++;   /* PLAY: the selected SSG samples */
 
         if (page == PG_OSC || page == PG_WAVE) {
             patch_t *q;
@@ -1923,17 +2055,20 @@ static void app_main(void)
         if (page != PG_OSC) prev = fm1_in.notes;
         for (k = 0; k < 7u; k++) (void)fm1_enc_take(k);   /* turns a page does not use go nowhere */
 
-        /* the keys' LEDs follow the page */
+        /* the keys' LEDs follow the page; a moving level runs along the white keys only */
         for (k = 0; k < 27u; k++) {
+            static const int8_t WIDX[27] = {0, -1, 1, -1, 2, -1, 3, 4, -1, 5, -1, 6, 7, -1, 8, -1, 9, -1, 10, 11, -1,
+                                            12, -1, 13, 14, -1, 15};   /* key -> its white key (F3 .. G5), -1 black */
+            int32_t wi = WIDX[k];
             uint32_t on = 0, glow = 0;
             if (page == PG_OSC) {
                 for (o = 0; o < NO; o++)
                     if (opatch[o].note == base + k) { if (o == sel) on = 1; else glow = 1; }
             } else if (page == PG_VERB && fxsub) { /* the register's write head, running along the keys */
-                on = k == dl_w_v * 27u / DL_N;
+                on = wi >= 0 && (uint32_t)wi == dl_w_v * 16u / DL_N;
             } else if (page == PG_VERB) {          /* the return's level, as a bar */
-                uint32_t lv = (uint32_t)cl(v_level, 0, 32767) * 27u >> 14;
-                on = k < lv;
+                uint32_t lv = (uint32_t)cl(v_level, 0, 32767) * 16u >> 14;
+                on = wi >= 0 && (uint32_t)wi < lv;
             } else if (page == PG_GLOBAL) {        /* the oscillators' notes lit; a 12-step scale glows */
                 uint32_t note = base + k;
                 for (o = 0; o < NO; o++)
@@ -1943,27 +2078,36 @@ static void app_main(void)
                     glow = SCL_LO[g_scl] >> pc & 1u;
                 }
             } else if (page == PG_SH) {            /* S1 on the lower keys, S2 on the upper */
-                uint32_t p1 = (src_disp(S_SSG(0)) * 12u) >> 15, p2 = 14u + ((src_disp(S_SSG(1)) * 12u) >> 15);
-                on = k == p1 || k == p2;
+                uint32_t p1 = (src_disp(S_SSG(0)) * 7u) >> 15, p2 = 8u + ((src_disp(S_SSG(1)) * 7u) >> 15);
+                on = wi >= 0 && ((uint32_t)wi == p1 || (uint32_t)wi == p2);   /* (white keys 0..7 and 8..15) */
             } else if (page == PG_GATE) {          /* the nine outputs, every third key */
                 on = k % 3u == 0u && (uint32_t)gg_bits[gsel] >> (k / 3u) & 1u;
             } else if (page == PG_GMAT) {          /* the whole keyboard flashes with the source */
                 on = gsrc_on(gcr);
             } else if (page == PG_FG || page == PG_MOD) {
-                uint32_t pos = ((page == PG_FG ? (uint32_t)fg_out[fsel] : src_disp(mcs)) * 26u) >> 15;
-                on = k == pos;
-                glow = k < pos;
+                uint32_t pos = ((page == PG_FG ? (uint32_t)fg_out[fsel] : src_disp(mcs)) * 15u) >> 15;
+                on = wi >= 0 && (uint32_t)wi == pos;
+                glow = wi >= 0 && (uint32_t)wi < pos;
             }
             fm1_led_key(KEY_LED(k), on);
             if (!on) fm1_led_key_glow(KEY_LED(k), glow);
         }
-        fm1_led_key(BTN_OCT_DOWN, oct < 0);
-        fm1_led_key(BTN_OCT_UP, oct > 0);
         {
-            uint32_t blink = (fm1_ms / 250u) & 1u;   /* a flashing button: "press me here" */
-            fm1_led_key(BTN_SEL, shift || ((page == PG_INDEX || page == PG_PATCH) && blink));
+            uint32_t blink = (fm1_ms / 250u) & 1u;   /* a flashing button: "press me here" (its job here is this page's) */
+            int pn = page == PG_WAVE || page == PG_FG || page == PG_SH || page == PG_GATE || page == PG_GLOBAL
+                  || page == PG_VERB;           /* OCT- / OCT+ as previous / next: flashing in turn */
+            if (page == PG_OSC) {               /* page 2: the octave; solid on the side it is shifted to */
+                fm1_led_key(BTN_OCT_DOWN, oct < 0 || blink);
+                fm1_led_key(BTN_OCT_UP, oct > 0 || blink);
+            } else {
+                fm1_led_key(BTN_OCT_DOWN, pn && blink);
+                fm1_led_key(BTN_OCT_UP, pn && !blink);
+            }
+            fm1_led_key(BTN_SEL, shift || ((page == PG_INDEX || page == PG_PATCH || page == PG_OSC
+                                            || page == PG_GATE || page == PG_VERB) && blink));
             fm1_led_key(BTN_HOME, page != PG_INDEX && blink);   /* away from the index: HOME leads back */
             fm1_led_key(BTN_SAVE, page == PG_PATCH && (pconf == PC_SAVE || blink));
+            fm1_led_key(BTN_FX, page == PG_VERB && blink);   /* FX again: the other half */
             fm1_led_key(BTN_PLAY, ((page == PG_FG || page == PG_SH) && (play || blink))   /* a manual gate / sample */
                                   || (page == PG_WAVE && otab[sel] >= T_GEN && blink)   /* a new generative table */
                                   || (page == PG_GLOBAL && (oq[qsel].on || blink))   /* solid: this one quantises */
@@ -1978,14 +2122,13 @@ static void app_main(void)
         fm1_led_key(BTN_LFO, page == PG_GATE);
         fm1_led_key(BTN_SEQ, page == PG_GMAT);
         fm1_led_key(BTN_GLO, page == PG_GLOBAL);
-        fm1_led_key(BTN_FX, page == PG_VERB);
 
-        if (fm1_ms - t_cpu > 500u) {            /* the worst render of the last half second, in the header */
-            uint32_t us = audio_us_max, pct;
-            audio_us_max = 0;
-            t_cpu = fm1_ms;
-            pct = us * 100u / 5805u;            /* 256 frames at 44.1 kHz = 5805 us */
-            if (us && pct != cpu_pct) { cpu_pct = pct; hdr_dirty = 1; }
+        if (fm1_ms - t_batt > 2000u) {          /* the battery, every 2 s, into the header when it changes */
+            uint32_t now;
+            t_batt = fm1_ms;
+            batt_poll();
+            now = batt_usb() ? 0x8000u : (uint32_t)(batt_pct() & 0x7F);
+            if (now != batt_shown) { batt_shown = now; hdr_dirty = 1; }
         }
         if ((page == PG_OSC || page == PG_VERB) && shift != shift_drawn) { shift_drawn = shift; dirty = 1; }
         if ((page == PG_FG || page == PG_MOD || page == PG_WAVE || page == PG_GATE || page == PG_GMAT || page == PG_SH
@@ -1993,13 +2136,13 @@ static void app_main(void)
             && fm1_ms - t_live > 50u) { t_live = fm1_ms; dirty = 1; }
 
         idle_ok = 1;                            /* MIDI in while the screen draws */
-        if (hdr_dirty) { hdr_dirty = 0; draw_header(page, cpu_pct); }
+        if (hdr_dirty) { hdr_dirty = 0; draw_header(page); }
         if (dirty) {
             dirty = 0;
             switch (page) {
             case PG_INDEX: draw_index(icur); break;
             case PG_OSC: draw_osc(sel, shift); break;
-            case PG_WAVE: draw_wave(sel, ost[sel].posq); break;
+            case PG_WAVE: if (wmode) draw_scope(sel); else draw_wave(sel, ost[sel].posq); break;
             case PG_FG: draw_fg(fsel); break;
             case PG_MOD: draw_mod(mcs, mcr, mtop, mleft); break;
             case PG_PATCH: draw_patch(pcur, pconf, pmsg); break;
