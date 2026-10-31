@@ -45,19 +45,21 @@ enum { P_PITCH, P_WAVE, P_MOD, P_THR, P_HICUT, P_LEVEL, P_PAN, NP };
 #define D_GG(g, l, duty) (NO * NP + 2u * NFG + 4u * (g) + 2u * (l) + (duty))   /* a gate LFO's rate / duty */
 #define D_SSG(k) (NO * NP + 2u * NFG + 4u * NGG + (k))   /* an SSG's slew */
 #define D_QRATE (NO * NP + 2u * NFG + 4u * NGG + NSSG)    /* the quad LFO's rate */
-#define NDST (NO * NP + 2u * NFG + 4u * NGG + NSSG + 1u)
+#define D_VERB(k) (NO * NP + 2u * NFG + 4u * NGG + NSSG + 1u + (k))   /* the reverb: size decay damp return fb */
+#define NDST (NO * NP + 2u * NFG + 4u * NGG + NSSG + 1u + 5u)
 /* gate sources: per generator A B AND NAND OR NOR XOR XNOR NOT, then the FGs' EOCs.
  * gate destinations: the FGs' gates, then each generator's two logic inputs (pinned: they replace A, B there) */
 #define GS_PER 9u
 #define GS_Q(o) (NGG * GS_PER + NFG + (o))     /* ... then the quantisers' note-change gates */
 #define NGSRC (NGG * GS_PER + NFG + NO)
-#define NGDST (NFG + 2u * NGG + NSSG)              /* ... then the SSGs' sample inputs */
+#define NGDST (NFG + 2u * NGG + NSSG + 1u)         /* ... then the SSGs' sample inputs, the reverb's FREEZE */
+#define G_FREEZE (NFG + 2u * NGG + NSSG)
 #define G_SSG(k) (NFG + 2u * NGG + (k))
 
 typedef struct {                                /* the knobs, set by the main loop */
     volatile int32_t pitch_q8;                  /* note * 256, 1/256 semitone */
     volatile int32_t fine_q8;                   /* (after the quantiser) */
-    volatile uint8_t qon, qglide;
+    volatile uint8_t qon, qglide, send;         /* send: to the reverb, 0..127 */
     volatile uint8_t pos, mod, thr, hicut, level, pan;
     volatile uint8_t table, scan;               /* scan: 0 smooth (crossfade), 1 stepped (PPG) */
 } osc_par_t;
@@ -185,6 +187,8 @@ static void fg_step(uint32_t k, uint32_t rise_k, uint32_t fall_k, uint32_t g)
     fg_eoc_v[k] = s->eoc != 0;
 }
 
+#include "verb.h"
+
 /* the nearest allowed step of the global tuning and scale to pitch q (1/256 semitone); its id (period * n + step)
  * and its step number come back too */
 static int32_t quantise(int32_t q, int32_t *id, int32_t *stepn)
@@ -222,6 +226,8 @@ static void render(int32_t *out)                /* SUB frames */
     uint32_t inc[NO];
     const int8_t *tab[NO];
     uint32_t step[NO];
+    int32_t vin[SUB], sendg[NO];
+    verb_mod_t vm;
 
     for (k = 0; k < NFG; k++) src[k] = fg_out[k];   /* every source as it stood a step ago */
     for (k = 0; k < NSSG; k++) src[S_SSG(k)] = ssg_out[k];
@@ -272,6 +278,7 @@ static void render(int32_t *out)                /* SUB frames */
             fg_step(k, (uint32_t)cl(fgp[k].rise + (acc[D_FG(k, 0)] >> 8), 0, 127),
                        (uint32_t)cl(fgp[k].fall + (acc[D_FG(k, 1)] >> 8), 0, 127),
                        fg_manual[k] | (gdst >> k & 1u));
+        v_gate_freeze = gdst >> G_FREEZE & 1u;
         for (k = 0; k < NSSG; k++) {            /* the SSGs: sample on a gate's start, then slew to it */
             uint32_t gt = gdst >> G_SSG(k) & 1u, sk, tap = ssg_tap[k] != ssg_tap_seen[k];
             int32_t o = ssg_out[k], t;
@@ -307,6 +314,7 @@ static void render(int32_t *out)                /* SUB frames */
         const int32_t *a = &acc[o * NP];
         tab[o] = table_of(p->table);
         step[o] = p->scan;
+        sendg[o] = p->send;
         int32_t q, target, dpos;
         {
             int32_t pq = p->pitch_q8 + ((a[P_PITCH] * 3) >> 3);           /* full depth: ~4 octaves */
@@ -350,6 +358,7 @@ static void render(int32_t *out)                /* SUB frames */
 
     for (i = 0; i < SUB; i++) {
         int32_t l = 0, r = 0, prev0 = ost[0].last, prev1 = ost[1].last;    /* 1 and 2 hear each other a sample late */
+        int32_t snd = 0;
         for (o = 0; o < NO; o++) {
             osc_st_t *s = &ost[o];
             uint32_t ph, idx, w, frac;
@@ -380,13 +389,18 @@ static void render(int32_t *out)                /* SUB frames */
             }
             s->amp += amp_d[o];
             v = (x * s->amp) >> 15;              /* <= 10000 */
+            snd += (v * sendg[o]) >> 7;          /* the send, before the pan */
             l += (v * pl[o]) >> 15;
             r += (v * pr[o]) >> 15;
         }
         out[2u * i] += l;
         out[2u * i + 1u] += r;
+        vin[i] = snd;
     }
     for (o = 0; o < NO; o++) ost[o].amp = amp_t[o];
+    vm.size = acc[D_VERB(0)]; vm.decay = acc[D_VERB(1)]; vm.damp = acc[D_VERB(2)];
+    vm.ret = acc[D_VERB(3)]; vm.fb = acc[D_VERB(4)];
+    verb_run(vin, out, SUB, &vm);
 }
 
 static void app_audio(int32_t *out, uint32_t n)
@@ -430,6 +444,18 @@ typedef struct { uint8_t on, glide; } oq_t;
 static oq_t oq[NO];                             /* each oscillator's quantiser */
 typedef struct { uint8_t tun, scl, root, pad; } tunpatch_t;
 static tunpatch_t tunpatch = {0, 1, 0, 0};      /* 12-TET, MAJOR, C */
+typedef struct { uint8_t send[NO], size, decay, damp, pre, mod, crush, ret, fb, rate, freeze, pad[2]; } vpatch_t;
+static const vpatch_t V_DEFAULT = {{50, 50, 50, 50}, 100, 95, 50, 20, 40, 0, 70, 0, 0, 0, {0, 0}};
+static const vpatch_t V_OFF = {{0, 0, 0, 0}, 100, 95, 50, 20, 40, 0, 0, 0, 0, 0, {0, 0}};   /* (older patches) */
+static vpatch_t vpatch;
+static void push_verb(void)
+{
+    uint32_t o;
+    for (o = 0; o < NO; o++) opar[o].send = vpatch.send[o];
+    vp.size = vpatch.size; vp.decay = vpatch.decay; vp.damp = vpatch.damp; vp.pre = vpatch.pre;
+    vp.mod = vpatch.mod; vp.crush = vpatch.crush; vp.ret = vpatch.ret; vp.fb = vpatch.fb;
+    vp.rate = vpatch.rate; vp.freeze = vpatch.freeze;
+}
 static void push_tun(void)
 {
     uint32_t t = tunpatch.tun < NTUN ? tunpatch.tun : 0u;
@@ -569,6 +595,7 @@ typedef struct {
     uint32_t gseed;
     oq_t oq[NO];                                /* version 5 on */
     tunpatch_t tun;
+    vpatch_t verb;                              /* version 6 on */
 } pdata_t;
 typedef union { pdata_t d; uint8_t raw[2040]; } pslot_t;
 typedef char pdata_fits_its_slot[sizeof(pdata_t) <= 2040u ? 1 : -1];   /* (the build fails if it ever grows past) */
@@ -610,7 +637,7 @@ static int patch_save(uint32_t slot)            /* 1..16 */
         for (k = 0; k < sizeof pbank[j].raw; k++) raw[k] = 0;
     }
     q->tag = PATCH_TAG;
-    q->ver = 5;
+    q->ver = 6;
     q->used = 1;
     for (o = 0; o < NO; o++) q->osc[o] = opatch[o];
     for (k = 0; k < NFG; k++) q->fg[k] = fgpatch[k];
@@ -623,6 +650,7 @@ static int patch_save(uint32_t slot)            /* 1..16 */
     q->gseed = gen_seed;
     for (o = 0; o < NO; o++) q->oq[o] = oq[o];
     q->tun = tunpatch;
+    q->verb = vpatch;
     mute = 1;                                   /* fade out, save, fade in: the erase stops the sound ~50 ms */
     t0 = fm1_ms;
     while (out_gain > 0 && fm1_ms - t0 < 100u) platform_poll();
@@ -646,6 +674,7 @@ static int patch_load(uint32_t slot)            /* 0 = the default */
         shpatch = SH_DEFAULT;
         for (o = 0; o < NO; o++) { otab[o] = oscan[o] = 0; oq[o].on = oq[o].glide = 0; }
         tunpatch.tun = 0; tunpatch.scl = 1; tunpatch.root = 0;
+        vpatch = V_DEFAULT;
     } else {
         if (bank_read((slot - 1u) / 2u)) return -1;
         q = &pbank[(slot - 1u) & 1u].d;
@@ -667,6 +696,7 @@ static int patch_load(uint32_t slot)            /* 0 = the default */
             oq[o].glide = q->ver >= 5u ? q->oq[o].glide : 0u;
         }
         if (q->ver >= 5u) tunpatch = q->tun; else { tunpatch.tun = 0; tunpatch.scl = 1; tunpatch.root = 0; }
+        vpatch = q->ver >= 6u ? q->verb : V_OFF;   /* (older: no reverb) */
     }
     if (gen_seed != gen_built) gen_build(gen_seed);
     for (o = 0; o < NO; o++) {                  /* (a damaged value never reaches the engine) */
@@ -692,6 +722,13 @@ static int patch_load(uint32_t slot)            /* 0 = the default */
         push_gg(k);
     }
     push_tun();
+    {
+        vpatch_t *v = &vpatch;
+        for (k = 0; k < NO; k++) v->send[k] &= 127u;
+        v->size &= 127u; v->decay &= 127u; v->damp &= 127u; v->pre &= 127u; v->mod &= 127u;
+        v->crush = (uint8_t)cl(v->crush, 0, 10); v->ret &= 127u; v->fb &= 127u; v->rate &= 1u; v->freeze &= 1u;
+        push_verb();
+    }
     for (k = 0; k < NSSG; k++) { shpatch.input[k] = (uint8_t)cl(shpatch.input[k], 0, NSRC); shpatch.slew[k] &= 127u; }
     shpatch.qrate &= 127u;
     push_sh();
@@ -709,7 +746,7 @@ static const uint8_t DLIST[] = {
     D_FG(3, 0), D_FG(3, 1), D_FG(4, 0), D_FG(4, 1), D_FG(5, 0), D_FG(5, 1),
     D_GG(0, 0, 0), D_GG(0, 0, 1), D_GG(0, 1, 0), D_GG(0, 1, 1), D_GG(1, 0, 0), D_GG(1, 0, 1), D_GG(1, 1, 0), D_GG(1, 1, 1),
     D_GG(2, 0, 0), D_GG(2, 0, 1), D_GG(2, 1, 0), D_GG(2, 1, 1), D_GG(3, 0, 0), D_GG(3, 0, 1), D_GG(3, 1, 0), D_GG(3, 1, 1),
-    D_SSG(0), D_SSG(1), D_QRATE,
+    D_SSG(0), D_SSG(1), D_QRATE, D_VERB(0), D_VERB(1), D_VERB(2), D_VERB(3), D_VERB(4),
 };
 #define NDLIST (sizeof DLIST / sizeof DLIST[0])
 
@@ -746,7 +783,13 @@ static void randomize(void)
     for (o = 0; o < NO; o++) {
         oq[o].on = rnd(2) == 0u;
         oq[o].glide = rnd(3) ? 0u : (uint8_t)rnd_in(20, 80);
+        vpatch.send[o] = (uint8_t)(rnd(4) ? rnd_in(20, 100) : 0);
     }
+    vpatch.size = (uint8_t)rnd_in(40, 127); vpatch.decay = (uint8_t)rnd_in(50, 118); vpatch.damp = (uint8_t)rnd(110);
+    vpatch.pre = (uint8_t)rnd(80); vpatch.mod = (uint8_t)rnd(100); vpatch.ret = (uint8_t)rnd_in(40, 100);
+    vpatch.crush = rnd(4) ? 0u : (uint8_t)rnd_in(2, 7); vpatch.fb = rnd(3) ? 0u : (uint8_t)rnd_in(20, 110);
+    vpatch.rate = (uint8_t)rnd(2); vpatch.freeze = 0;
+    push_verb();
     for (k = 0; k < NFG; k++) {
         fgpatch_t *f = &fgpatch[k];
         f->rise = (uint8_t)rnd_in(30, 115);
@@ -838,6 +881,9 @@ static void dst_name(char *s, uint32_t d)
         s_cat(s, "FG");
         s_int(s, (int32_t)(d - NO * NP) / 2 + 1, 0);
         s_cat(s, (d - NO * NP) & 1u ? " FALL" : " RISE");
+    } else if (d >= D_VERB(0)) {
+        static const char *const VN[5] = {"RV SIZE", "RV DECAY", "RV DAMP", "RV RETURN", "RV FEEDBACK"};
+        s_cat(s, VN[(d - D_VERB(0)) % 5u]);
     } else if (d >= D_SSG(0)) {
         if (d == D_QRATE) s_cat(s, "QUAD RATE");
         else { s_cat(s, "S"); s_int(s, (int32_t)(d - D_SSG(0)) + 1, 0); s_cat(s, " SLEW"); }
@@ -850,11 +896,11 @@ static void dst_name(char *s, uint32_t d)
     }
 }
 
-enum { PG_INDEX, PG_OSC, PG_WAVE, PG_FG, PG_SH, PG_GATE, PG_MOD, PG_GMAT, PG_GLOBAL, PG_PATCH, NPG };
-static const char *const PG_NUM[NPG] = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "P"};
+enum { PG_INDEX, PG_OSC, PG_WAVE, PG_FG, PG_SH, PG_GATE, PG_MOD, PG_GMAT, PG_GLOBAL, PG_VERB, PG_PATCH, NPG };
+static const char *const PG_NUM[NPG] = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "R", "P"};
 static const char *const PG_NAME[NPG] = {"INDEX", "OSCILLATORS", "WAVEFORM", "FUNCTION GEN", "S&H / QUAD",
-                                         "GATE GEN", "MOD MATRIX", "GATE MATRIX", "GLOBAL", "PATCHES"};
-static const uint8_t PG_READY[NPG] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+                                         "GATE GEN", "MOD MATRIX", "GATE MATRIX", "GLOBAL", "REVERB", "PATCHES"};
+static const uint8_t PG_READY[NPG] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
 
 static void draw_header(uint32_t pg, uint32_t cpu_pct)
 {
@@ -879,10 +925,10 @@ static void draw_index(uint32_t cur)
     uint32_t i;
     cv_begin(240, BODY_H, PH_BG);
     for (i = 0; i < NPG; i++) {
-        int32_t y = 6 + (int32_t)i * 18;
+        int32_t y = 4 + (int32_t)i * 17;
         char s[32] = "";
         uint16_t c = PG_READY[i] ? PH_MID : PH_LO;
-        if (i == cur) { cv_rect(0, y - 1, 240, 18, PH_SEL); c = PH_HI; cv_text(4, y, &FONT_S, ">", PH_HI); }
+        if (i == cur) { cv_rect(0, y - 1, 240, 17, PH_SEL); c = PH_HI; cv_text(4, y, &FONT_S, ">", PH_HI); }
         s_cat(s, PG_NUM[i]);
         s_cat(s, "   ");
         s_cat(s, PG_NAME[i]);
@@ -1113,6 +1159,7 @@ static void gdst_name(char *s, uint32_t j, int full)
 {
     s[0] = 0;
     if (j < NFG) { s_cat(s, full ? "FG" : "F"); s_int(s, (int32_t)j + 1, 0); if (full) s_cat(s, " GATE"); }
+    else if (j == G_FREEZE) s_cat(s, full ? "REVERB FREEZE" : "RV");
     else if (j >= G_SSG(0)) { s_cat(s, "S"); s_int(s, (int32_t)(j - G_SSG(0)) + 1, 0); if (full) s_cat(s, " SAMPLE"); }
     else {
         uint32_t g = (j - NFG) / 2u, l = (j - NFG) & 1u;
@@ -1313,6 +1360,52 @@ static void draw_global(uint32_t qsel)
     cv_blit(0, BODY_Y);
 }
 
+/* ---- page R: the reverb */
+static uint16_t vhist[HIST];                    /* its level, one every 10 ms */
+static uint32_t vhead;
+static void draw_verb(uint32_t vsel, int shift)
+{
+    static const char *const L[8] = {"SIZE", "DECAY", "DAMP", "RETURN", "PRE", "MOD", "CRUSH", "FEEDBK"};
+    const uint8_t v[8] = {vpatch.size, vpatch.decay, vpatch.damp, vpatch.ret, vpatch.pre, vpatch.mod,
+                          vpatch.crush, vpatch.fb};
+    uint32_t o, k, i, frz = vpatch.freeze | v_gate_freeze;
+    char s[24];
+    cv_begin(240, BODY_H, PH_BG);
+    cv_text(4, 2, &FONT_S, "SEND", PH_LO);
+    for (o = 0; o < NO; o++) {
+        int32_t x = 48 + (int32_t)o * 48;
+        s[0] = 0;
+        s_cat(s, ONAME[o]);
+        s_cat(s, " ");
+        s_int(s, vpatch.send[o], 0);
+        if (o == vsel) cv_rect(x - 3, 1, 46, 17, PH_SEL);
+        cv_text(x, 2, &FONT_S, s, o == vsel ? PH_HI : PH_MID);
+    }
+    for (k = 0; k < 8u; k++) {                  /* K1..K4, then (SEL) K1..K4 */
+        int32_t x = k < 4u ? 4 : 124, y = 24 + (int32_t)(k & 3u) * 18;
+        int hot = (k >= 4u) == (shift != 0);
+        s[0] = 0;
+        s_cat(s, L[k]);
+        cv_text(x, y, &FONT_S, s, hot ? PH_MID : PH_LO);
+        s[0] = 0;
+        s_int(s, v[k], 0);
+        cv_text(x + 112 - 4 - text_w(&FONT_S, s), y, &FONT_S, s, hot ? PH_HI : PH_MID);
+    }
+    cv_text(4, 98, &FONT_S, vpatch.rate ? "RATE 11K" : "RATE 22K", PH_MID);
+    cv_text(236 - text_w(&FONT_S, "FREEZE"), 98, &FONT_S, "FREEZE", frz ? PH_HI : PH_LO);
+    cv_rect(0, 116, 240, 1, PH_LO);
+    for (i = 0; i < HIST; i++) {                /* the tail: its level, oldest on the left */
+        uint32_t lv = vhist[(vhead + i) % HIST], b = 0;
+        int32_t h;
+        while (lv > 1u) { lv >>= 1; b++; }      /* ~6 dB a step: the tail's shape, quiet or loud */
+        h = cl(((int32_t)b - 3) * 6 + (int32_t)(vhist[(vhead + i) % HIST] >> (b > 1u ? b - 1u : 0u) & 1u) * 3, 0, 72);
+        if (h) cv_rect(40 + (int32_t)i, 192 - h, 1, h, i + 1u == HIST ? PH_HI : PH_MID);
+    }
+    cv_text(4, 176, &FONT_S, "OUT", PH_LO);
+    cv_text(0, 200, &FONT_S, "SEL:MORE PRST:RATE PLAY:FREEZE", PH_LO);
+    cv_blit(0, BODY_Y);
+}
+
 static uint32_t idle_ok;
 static void midi_poll(void)                     /* the clock, START: the clocked LFOs follow them */
 {
@@ -1357,11 +1450,13 @@ static void app_main(void)
     uint32_t o, k, sel = 0, fsel = 0, prev = 0, page = PG_INDEX, icur = PG_OSC, mcs = 0, mcr = 0, mtop = 0, mleft = 0;
     uint32_t dirty = 1, hdr_dirty = 1, cpu_pct = 0, t_cpu = 0, t_live = 0, pcur = 1, pconf = PC_NONE, t_msg = 0;
     const char *pmsg = "";
-    uint32_t gsel = 0, gcc = 0, gcr = 0, gtop = 0, gleft = 0, t_hist = 0, qsel = 0;
+    uint32_t gsel = 0, gcc = 0, gcr = 0, gtop = 0, gleft = 0, t_hist = 0, qsel = 0, vsel = 0;
     int32_t oct = -1, e, shift_drawn = -1;
 
     for (k = 0; k < NGG; k++) ggpatch[k] = GG_DEFAULT[k];
     shpatch = SH_DEFAULT;
+    vpatch = V_DEFAULT;
+    verb_init();
 
     depth[0][0 * NP + P_WAVE] = 40;             /* a few pins to hear the FGs at once */
     depth[1][2 * NP + P_MOD] = 30;
@@ -1396,6 +1491,8 @@ static void app_main(void)
         if (fm1_ms - t_hist >= 10u) {           /* the logic analyser's next sample */
             t_hist = fm1_ms;
             for (k = 0; k < NGG; k++) ghist[k][ghead] = gg_bits[k];
+            vhist[vhead] = (uint16_t)cl(v_level, 0, 32767);
+            vhead = (vhead + 1u) % HIST;
             ghead = (ghead + 1u) % HIST;
             if (ghead & 1u) {                   /* the SSGs' trace: every 20 ms */
                 for (k = 0; k < NSSG; k++) shist[k][shead] = (int16_t)ssg_out[k];
@@ -1414,6 +1511,7 @@ static void app_main(void)
         if (b & (1u << BTN_ARP)) newpage = PG_MOD;
         if (b & (1u << BTN_SEQ)) newpage = PG_GMAT;
         if (b & (1u << BTN_GLO)) newpage = PG_GLOBAL;
+        if (b & (1u << BTN_FX)) newpage = PG_VERB;
         if (b & (1u << BTN_SAVE)) newpage = PG_PATCH;
         if (b & (1u << BTN_OCT_DOWN) && oct > -3) oct--;
         if (b & (1u << BTN_OCT_UP) && oct < 2) oct++;
@@ -1523,7 +1621,24 @@ static void app_main(void)
             if ((e = fm1_enc_take(ENC_KNOB3)) != 0) { depth[mcs][d] = (int8_t)cl(depth[mcs][d] + e, -64, 63); dirty = 1; }
             if (b & (1u << BTN_PLAY)) { depth[mcs][d] = depth[mcs][d] ? 0 : 32; dirty = 1; }
         }
-        else if (page == PG_GLOBAL) {
+        else if (page == PG_VERB) {
+            uint8_t *kn[8] = {&vpatch.size, &vpatch.decay, &vpatch.damp, &vpatch.ret,
+                              &vpatch.pre, &vpatch.mod, &vpatch.crush, &vpatch.fb};
+            static const uint8_t KE[4] = {ENC_KNOB1, ENC_KNOB2, ENC_KNOB3, ENC_KNOB4};
+            int ch = 0;
+            uint32_t j;
+            for (j = 0; j < 4u; j++)
+                if ((e = fm1_enc_take(KE[j])) != 0) {
+                    uint8_t *q = kn[j + (shift ? 4u : 0u)];
+                    *q = (uint8_t)cl(*q + e, 0, q == &vpatch.crush ? 10 : 127);
+                    ch = 1;
+                }
+            if ((e = fm1_enc_take(ENC_SELECT)) != 0) { vsel = (uint32_t)cl((int32_t)vsel + e, 0, NO - 1); dirty = 1; }
+            if ((e = fm1_enc_take(ENC_ALGORITHM)) != 0) { vpatch.send[vsel] = (uint8_t)cl(vpatch.send[vsel] + e, 0, 127); ch = 1; }
+            if ((e = fm1_enc_take(ENC_PRESETS)) != 0) { vpatch.rate = e > 0; ch = 1; }
+            if (b & (1u << BTN_PLAY)) { vpatch.freeze ^= 1u; ch = 1; }
+            if (ch) { push_verb(); dirty = 1; }
+        } else if (page == PG_GLOBAL) {
             int ch = 0;
             if ((e = fm1_enc_take(ENC_KNOB1)) != 0) {   /* a new tuning keeps the scale's place where it can */
                 uint32_t rel = (uint32_t)(tunpatch.scl - TUN_SCL0[tunpatch.tun]), nt;
@@ -1591,6 +1706,9 @@ static void app_main(void)
             if (page == PG_OSC) {
                 for (o = 0; o < NO; o++)
                     if (opatch[o].note == base + k) { if (o == sel) on = 1; else glow = 1; }
+            } else if (page == PG_VERB) {          /* the return's level, as a bar */
+                uint32_t lv = (uint32_t)cl(v_level, 0, 32767) * 27u >> 14;
+                on = k < lv;
             } else if (page == PG_GLOBAL) {        /* the oscillators' notes lit; a 12-step scale glows */
                 uint32_t note = base + k;
                 for (o = 0; o < NO; o++)
@@ -1624,6 +1742,7 @@ static void app_main(void)
             fm1_led_key(BTN_PLAY, ((page == PG_FG || page == PG_SH) && (play || blink))   /* a manual gate / sample */
                                   || (page == PG_WAVE && otab[sel] >= T_GEN && blink)   /* a new generative table */
                                   || (page == PG_GLOBAL && (oq[qsel].on || blink))   /* solid: this one quantises */
+                                  || (page == PG_VERB && (vpatch.freeze || v_gate_freeze || blink))   /* solid: frozen */
                                   || (page == PG_MOD && (depth[mcs][DLIST[mcr]] || blink))   /* solid: a pin here */
                                   || (page == PG_GMAT && (gpatch[gcr] >> gcc & 1u || blink)));
         }
@@ -1633,6 +1752,7 @@ static void app_main(void)
         fm1_led_key(BTN_LFO, page == PG_GATE);
         fm1_led_key(BTN_SEQ, page == PG_GMAT);
         fm1_led_key(BTN_GLO, page == PG_GLOBAL);
+        fm1_led_key(BTN_FX, page == PG_VERB);
 
         if (fm1_ms - t_cpu > 500u) {            /* the worst render of the last half second, in the header */
             uint32_t us = audio_us_max, pct;
@@ -1641,9 +1761,9 @@ static void app_main(void)
             pct = us * 100u / 5805u;            /* 256 frames at 44.1 kHz = 5805 us */
             if (us && pct != cpu_pct) { cpu_pct = pct; hdr_dirty = 1; }
         }
-        if (page == PG_OSC && shift != shift_drawn) { shift_drawn = shift; dirty = 1; }
+        if ((page == PG_OSC || page == PG_VERB) && shift != shift_drawn) { shift_drawn = shift; dirty = 1; }
         if ((page == PG_FG || page == PG_MOD || page == PG_WAVE || page == PG_GATE || page == PG_GMAT || page == PG_SH
-             || page == PG_GLOBAL)
+             || page == PG_GLOBAL || page == PG_VERB)
             && fm1_ms - t_live > 50u) { t_live = fm1_ms; dirty = 1; }
 
         idle_ok = 1;                            /* MIDI in while the screen draws */
@@ -1660,6 +1780,7 @@ static void app_main(void)
             case PG_GATE: draw_gg(gsel); break;
             case PG_SH: draw_sh(); break;
             case PG_GLOBAL: draw_global(qsel); break;
+            case PG_VERB: draw_verb(vsel, shift); break;
             case PG_GMAT: draw_gmat(gcc, gcr, gtop, gleft); break;
             default: draw_soon(page); break;
             }

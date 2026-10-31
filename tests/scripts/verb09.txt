@@ -1,0 +1,161 @@
+# reverb demo: DEFAULT, the plate, feedback up to the edge, crush + 11k, freeze, levels down
+200 btn 9
+300 enc 0 -2
+400 btn 3
+500 btn 3
+700 btn 2
+800 enc 5 20
+900 enc 1 20
+1000 enc 0 2
+1100 enc 1 50
+1200 enc 0 1
+1300 enc 1 50
+2500 shot
+6000 btndown 3
+6080 enc 5 1
+6160 enc 5 1
+6240 enc 5 1
+6320 enc 5 1
+6400 enc 5 1
+6480 enc 5 1
+6560 enc 5 1
+6640 enc 5 1
+6720 enc 5 1
+6800 enc 5 1
+6880 enc 5 1
+6960 enc 5 1
+7040 enc 5 1
+7120 enc 5 1
+7200 enc 5 1
+7280 enc 5 1
+7360 enc 5 1
+7440 enc 5 1
+7520 enc 5 1
+7600 enc 5 1
+7680 enc 5 1
+7760 enc 5 1
+7840 enc 5 1
+7920 enc 5 1
+8000 enc 5 1
+8080 enc 5 1
+8160 enc 5 1
+8240 enc 5 1
+8320 enc 5 1
+8400 enc 5 1
+8480 enc 5 1
+8560 enc 5 1
+8640 enc 5 1
+8720 enc 5 1
+8800 enc 5 1
+8880 enc 5 1
+8960 enc 5 1
+9040 enc 5 1
+9120 enc 5 1
+9200 enc 5 1
+9280 enc 5 1
+9360 enc 5 1
+9440 enc 5 1
+9520 enc 5 1
+9600 enc 5 1
+9680 enc 5 1
+9760 enc 5 1
+9840 enc 5 1
+9920 enc 5 1
+10000 enc 5 1
+10080 enc 5 1
+10160 enc 5 1
+10240 enc 5 1
+10320 enc 5 1
+10400 enc 5 1
+10480 enc 5 1
+10560 enc 5 1
+10640 enc 5 1
+10720 enc 5 1
+10800 enc 5 1
+10880 enc 5 1
+10960 enc 5 1
+11040 enc 5 1
+11120 enc 5 1
+11200 enc 5 1
+11280 enc 5 1
+11360 enc 5 1
+11440 enc 5 1
+11520 enc 5 1
+11600 enc 5 1
+11680 enc 5 1
+11760 enc 5 1
+11840 enc 5 1
+11920 enc 5 1
+12000 enc 5 1
+12080 enc 5 1
+12160 enc 5 1
+12240 enc 5 1
+12320 enc 5 1
+12400 enc 5 1
+12480 enc 5 1
+12560 enc 5 1
+12640 enc 5 1
+12720 enc 5 1
+12800 enc 5 1
+12880 enc 5 1
+12960 enc 5 1
+13040 enc 5 1
+13120 enc 5 1
+13200 enc 5 1
+13280 enc 5 1
+13360 enc 5 1
+13440 enc 5 1
+13520 enc 5 1
+13600 enc 5 1
+13680 enc 5 1
+13760 enc 5 1
+13840 enc 5 1
+13920 enc 5 1
+14000 enc 5 1
+14080 enc 5 1
+14160 enc 5 1
+14240 enc 5 1
+14320 enc 5 1
+14400 enc 5 1
+14480 enc 5 1
+14560 enc 5 1
+14640 enc 5 1
+14720 enc 5 1
+14800 enc 5 1
+14880 enc 5 1
+14960 enc 5 1
+15040 enc 5 1
+15120 enc 5 1
+15200 enc 5 1
+15280 enc 5 1
+15360 enc 5 1
+15440 enc 5 1
+15520 enc 5 1
+15600 enc 5 1
+15680 enc 5 1
+15760 enc 5 1
+15840 enc 5 1
+15920 enc 5 1
+16000 enc 5 1
+16080 enc 5 1
+16160 enc 5 1
+16500 btnup 3
+17000 shot
+22000 btndown 3
+22100 enc 4 6
+22200 btnup 3
+22300 enc 6 1
+28000 btn 12
+28300 btn 6
+28400 enc 0 -3
+28420 enc 5 -64
+28440 enc 0 1
+28460 enc 5 -64
+28480 enc 0 1
+28500 enc 5 -64
+28520 enc 0 1
+28540 enc 5 -64
+29000 btn 2
+31000 shot
+36000 btn 12
+42000 end
