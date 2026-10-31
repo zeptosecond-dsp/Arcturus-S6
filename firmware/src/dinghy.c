@@ -133,6 +133,12 @@ static int32_t sine(uint32_t ph)                /* a full cycle over 2^32 -> -32
     return y > 32767 ? 32767 : y < -32767 ? -32767 : y;
 }
 static volatile uint32_t audio_us, audio_us_max;
+/* page 3's scope: the main loop asks (scope_req), the interrupt waits for the oscillator's cycle to start, then
+ * keeps scope_len samples of its output (after PM / fold and the hi cut, before the level) */
+#define SCOPE_MAX 512u
+static int16_t scope_buf[SCOPE_MAX];
+static volatile uint32_t scope_osc, scope_req, scope_len, scope_n, scope_done, scope_dec;   /* dec: keep 1 in dec */
+static uint32_t scope_cnt;
 static volatile uint32_t mute;                  /* 1: fade the output out (a flash save stalls the sound) */
 static volatile int32_t out_gain = 32767;
 
@@ -390,6 +396,16 @@ static void render(int32_t *out)                /* SUB frames */
                 s->lp1 += ((x - s->lp1) * c) >> 15;
                 s->lp2 += ((s->lp1 - s->lp2) * c) >> 15;
                 x = s->lp2;
+            }
+            if (o == scope_osc && scope_req) {  /* the scope: from the start of a cycle */
+                if (scope_n == 0u && s->ph >= inc[o]) {}   /* (waiting for the phase to wrap) */
+                else if (scope_n < scope_len) {
+                    if (scope_n == 0u || ++scope_cnt >= scope_dec) {
+                        scope_cnt = 0;
+                        scope_buf[scope_n++] = (int16_t)(x >> 1);
+                        if (scope_n >= scope_len) { scope_req = 0; scope_done = 1; }
+                    }
+                }
             }
             s->amp += amp_d[o];
             v = (x * s->amp) >> 15;              /* <= 10000 */
@@ -1097,6 +1113,62 @@ static void draw_osc(uint32_t sel, int shift)
 static const int8_t *wave_tab;
 static int32_t wave_at(uint32_t w, uint32_t i) { return wave_tab[w * WT_SAMPLES + i]; }
 
+static uint32_t wmode;                          /* page 3: 0 the table, 1 the scope (OCT- / OCT+) */
+static int16_t scope_show[SCOPE_MAX];           /* the last whole capture, as drawn */
+static uint32_t scope_show_n, scope_show_osc = 99u;
+static void draw_scope(uint32_t sel)
+{
+    uint32_t inc = pitch_inc(q_pitch_v[sel] + opar[sel].fine_q8), n = scope_len, i;
+    uint32_t hz100 = (uint32_t)(((uint64_t)inc * 4410000u) >> 32);   /* 1/100 Hz */
+    int32_t py = 0;
+    char s[40] = "OSC ";
+    cv_begin(240, BODY_H, PH_BG);
+    for (i = 0; i <= 8u; i++) {                 /* the graticule: dotted */
+        uint32_t x;
+        for (x = 8; x <= 232u; x += 4u) cv_pset((int32_t)x, 8 + (int32_t)i * 18, i == 4u ? PH_MID : PH_LO);
+    }
+    for (i = 0; i <= 8u; i++) {
+        uint32_t y;
+        for (y = 8; y <= 152u; y += 4u) cv_pset(8 + (int32_t)i * 28, (int32_t)y, i == 4u ? PH_MID : PH_LO);
+    }
+    if (scope_done) {                           /* a new capture: keep it to draw */
+        for (i = 0; i < n; i++) scope_show[i] = scope_buf[i];
+        scope_show_n = n;
+        scope_show_osc = scope_osc;
+    }
+    n = scope_show_osc == sel ? scope_show_n : 0u;
+    if (n > 1u)
+        for (i = 0; i < 225u; i++) {            /* two cycles across the screen */
+            int32_t v = scope_show[i * (n - 1u) / 224u], y = 80 - (v * 70 >> 14);
+            y = cl(y, 9, 151);
+            if (i) { cv_line(8 + (int32_t)i - 1, py, 8 + (int32_t)i, y, PH_HI); cv_line(8 + (int32_t)i - 1, py + 1, 8 + (int32_t)i, y + 1, PH_HI); }
+            py = y;
+        }
+    s_cat(s, ONAME[sel]);
+    s_cat(s, "  SCOPE");
+    cv_text(4, 162, &FONT_S, s, PH_HI);
+    s[0] = 0;
+    s_int(s, (int32_t)(hz100 / 100u), 0);
+    s_cat(s, ".");
+    s_int(s, (int32_t)(hz100 / 10u % 10u), 0);
+    s_cat(s, "HZ   2 CYCLES");
+    cv_text(4, 180, &FONT_S, s, PH_MID);
+    cv_text(4, 198, &FONT_S, "SELECT OSC  OCT: TABLE/SCOPE", PH_LO);
+    cv_out(BODY_Y);
+    if (scope_done || !scope_req || scope_osc != sel) {   /* the next capture: two cycles (as much as fits) */
+        uint32_t per = inc ? 0xFFFFFFFFu / inc : SCOPE_MAX;
+        scope_req = 0;
+        scope_dec = per * 2u / SCOPE_MAX + 1u;   /* low notes: every dec-th sample, two cycles always */
+        scope_len = per * 2u / scope_dec;
+        if (scope_len < 16u) scope_len = 16u;
+        if (scope_len > SCOPE_MAX) scope_len = SCOPE_MAX;
+        scope_osc = sel;
+        scope_n = 0;
+        scope_done = 0;
+        scope_req = 1;                          /* (last: the interrupt starts on this) */
+    }
+}
+
 static void draw_wave(uint32_t sel, int32_t posq)
 {
     int32_t w, i, f = posq & 255, wc = posq >> 8;
@@ -1730,7 +1802,7 @@ static void app_main(void)
             int32_t st = (b >> BTN_OCT_UP & 1u) ? 1 : (b >> BTN_OCT_DOWN & 1u) ? -1 : 0;
             if (st) {
                 dirty = 1;
-                if (page == PG_WAVE) sel = (sel + NO + (uint32_t)st) % NO;
+                if (page == PG_WAVE) wmode ^= 1u;   /* page 3: the table <-> the scope */
                 else if (page == PG_FG) fsel = (fsel + NFG + (uint32_t)st) % NFG;
                 else if (page == PG_SH) ssel = (ssel + NSSG + (uint32_t)st) % NSSG;
                 else if (page == PG_GATE) gsel = (gsel + NGG + (uint32_t)st) % NGG;
@@ -2025,7 +2097,7 @@ static void app_main(void)
             switch (page) {
             case PG_INDEX: draw_index(icur); break;
             case PG_OSC: draw_osc(sel, shift); break;
-            case PG_WAVE: draw_wave(sel, ost[sel].posq); break;
+            case PG_WAVE: if (wmode) draw_scope(sel); else draw_wave(sel, ost[sel].posq); break;
             case PG_FG: draw_fg(fsel); break;
             case PG_MOD: draw_mod(mcs, mcr, mtop, mleft); break;
             case PG_PATCH: draw_patch(pcur, pconf, pmsg); break;
