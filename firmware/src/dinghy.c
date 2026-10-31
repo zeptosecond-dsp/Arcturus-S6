@@ -1154,6 +1154,15 @@ static int32_t batt_pct(void)                   /* 0..100, or -1 (not read yet) 
     return cl(((batt_avg / 16) - BATT_EMPTY) * 100 / (BATT_FULL - BATT_EMPTY), 0, 100);
 }
 
+static uint32_t batt_anim;                      /* on USB: the bars filling, one more every 600 ms */
+static uint32_t batt_bars(void)                 /* 0..3 */
+{
+    int32_t b = batt_pct();
+    if (batt_usb()) return batt_anim & 3u;
+    if (b < 0) return 3u;                       /* (not read yet) */
+    return b >= 67 ? 3u : b >= 34 ? 2u : b >= 10 ? 1u : 0u;
+}
+
 static void draw_header(uint32_t pg)
 {
     char s[40] = "PAGE ";
@@ -1164,12 +1173,13 @@ static void draw_header(uint32_t pg)
     if (pg == PG_GLOBAL) s_cat(s, gsub ? ": VDU" : ": TUNING");
     cv_begin(240, BODY_Y, PH_BG);
     cv_text(4, 2, &FONT_S, s, PH_HI);
-    {                                           /* the battery, top right */
-        char c[12] = "";
-        int32_t b = batt_pct();
-        if (batt_usb()) s_cat(c, "USB");
-        else if (b >= 0) { s_int(c, b, 0); s_cat(c, "%"); }
-        cv_text(236 - text_w(&FONT_S, c), 2, &FONT_S, c, b >= 0 && b < 15 && !batt_usb() ? PH_HI : PH_LO);
+    {                                           /* the battery, top right: three bars (on USB: filling, charging) */
+        uint32_t n = batt_bars(), k;
+        uint16_t c = !batt_usb() && n == 0u ? PH_HI : PH_MID;   /* (empty: the outline bright) */
+        cv_rect(208, 4, 22, 1, c); cv_rect(208, 14, 22, 1, c);
+        cv_rect(208, 4, 1, 11, c); cv_rect(229, 4, 1, 11, c);
+        cv_rect(230, 7, 2, 5, c);
+        for (k = 0; k < n; k++) cv_rect(211 + (int32_t)k * 6, 7, 5, 5, PH_HI);
     }
     cv_rect(0, 19, 240, 1, PH_MID);
     cv_out(0);
@@ -1804,8 +1814,8 @@ static void draw_flanger(uint32_t vsel, int shift)
 {
     static const char *const L[4] = {"RATE", "DEPTH", "MANUAL", "FEEDBK"};
     uint32_t o, k, c, div = fpatch.slow ? 4u : 2u;
-    uint32_t man = 2u + fpatch.manual * 3u;                 /* samples at the flanger's own rate */
-    uint32_t ms100 = man * div * 100000u / 44100u;          /* 1/100 ms */
+    uint32_t man = (uint32_t)fl_manual(fpatch.manual);      /* Q8 samples at the flanger's own rate */
+    uint32_t ms100 = (man * div * 1000u / 441u) >> 8;       /* 1/100 ms */
     int32_t ph = (int32_t)(fl_lfo >> 16), y0 = 150;
     char s[24];
     cv_begin(240, BODY_H, PH_BG);
@@ -1904,29 +1914,28 @@ static void big_text(int32_t x, int32_t y, const char *s, int32_t sx, int32_t sy
         }
     }
 }
+static void boot_line(int32_t y, const char *t, uint16_t c)   /* centred */
+{
+    cv_text((240 - text_w(&FONT_S, t)) / 2, y, &FONT_S, t, c);
+}
 static void draw_boot(uint32_t step)            /* step 0..8: the loading lines appear, then READY */
 {
     static const char *const LINE[3] = {"WAVETABLES ......  13", "TUNINGS .........  21", "PATCH MEMORY ....  16"};
     uint32_t i;
-    char bl[32] = "BATTERY ........ ";
     cv_begin(240, BODY_Y, PH_BG);
     cv_out(0);
     cv_begin(240, BODY_H, PH_BG);
-    big_text(32, 4, "ZEPTOSECOND", 2, 3, PH_HI);
-    big_text(72, 32, "DSP", 4, 4, PH_HI);
-    cv_text(20, 68, &FONT_S, "Pleasure is our business!", PH_MID);
-    cv_rect(16, 90, 208, 2, PH_MID);
-    cv_text(36, 96, &FONT_S, "FM-1 WAVETABLE SYSTEM", PH_MID);
-    cv_text(48, 114, &FONT_S, "SERIES I   REV " WT_VERSION, PH_LO);
-    for (i = 0; i < 3u && i < step; i++) cv_text(36, 138 + (int32_t)i * 16, &FONT_S, LINE[i], PH_MID);
-    if (step >= 4u) {                           /* the raw reading (for the scale), or USB */
-        if (batt_usb()) s_cat(bl, "USB");
-        else { uint32_t r = batt_raw(); if (r < 1000u) s_cat(bl, " "); s_int(bl, (int32_t)r, 0); }
-        cv_text(36, 186, &FONT_S, bl, PH_MID);
-    }
-    if (step >= 6u) cv_text(36, 202, &FONT_S, "READY", PH_HI);
-    else if (step & 1u) cv_text(36, 202, &FONT_S, "SYSTEM LOADING _", PH_LO);
-    else cv_text(36, 202, &FONT_S, "SYSTEM LOADING", PH_LO);
+    big_text(24, 2, "ARCTURUS", 3, 4, PH_HI);
+    big_text(88, 38, "S6", 4, 4, PH_HI);
+    cv_rect(16, 74, 208, 2, PH_MID);
+    boot_line(80, "Waveform Animation System " WT_VERSION, PH_MID);
+    boot_line(98, "by zeptosecond DSP", PH_MID);
+    boot_line(116, "Written by machine", PH_LO);
+    boot_line(132, "with human guidance", PH_LO);
+    for (i = 0; i < 3u && i < step; i++) cv_text(36, 152 + (int32_t)i * 16, &FONT_S, LINE[i], PH_MID);
+    if (step >= 6u) cv_text(36, 200, &FONT_S, "READY", PH_HI);
+    else if (step & 1u) cv_text(36, 200, &FONT_S, "SYSTEM LOADING _", PH_LO);
+    else cv_text(36, 200, &FONT_S, "SYSTEM LOADING", PH_LO);
     cv_out(BODY_Y);
 }
 static int boot_wait(uint32_t ms)               /* wait, polling; 1 = a button pressed (skip the rest) */
@@ -1981,7 +1990,7 @@ static void draw_patch(uint32_t cur, uint32_t confirm, const char *msg)
 static void app_main(void)
 {
     uint32_t o, k, sel = 0, fsel = 0, prev = 0, page = PG_INDEX, icur = PG_OSC, mcs = 0, mcr = 0, mtop = 0, mleft = 0;
-    uint32_t dirty = 1, hdr_dirty = 1, batt_shown = 0xFFFFu, t_batt = 0, t_live = 0, pcur = 1, pconf = PC_NONE, t_msg = 0;
+    uint32_t dirty = 1, hdr_dirty = 1, batt_shown = 0xFFFFu, t_batt = 0, t_banim = 0, t_live = 0, pcur = 1, pconf = PC_NONE, t_msg = 0;
     const char *pmsg = "";
     uint32_t gsel = 0, gcc = 0, gcr = 0, gtop = 0, gleft = 0, t_hist = 0, qsel = 0, vsel = 0, vdu_dirty = 0, t_vdu = 0;
     int32_t oct = -1, e, shift_drawn = -1;
@@ -2001,7 +2010,7 @@ static void app_main(void)
     fpatch = F_OFF;
     rpatch = R_DEFAULT;
     verb_init();
-    { uint32_t i; for (i = 0; i < FL_N; i++) fl_buf[i] = 0; for (i = 0; i < DL_N; i++) dl_buf[i] = 0; }
+    { uint32_t i; for (i = 0; i < FL_N; i++) fl_buf[0][i] = fl_buf[1][i] = 0; for (i = 0; i < DL_N; i++) dl_buf[i] = 0; }
 
     depth[0][0 * NP + P_WAVE] = 40;             /* a few pins to hear the FGs at once */
     depth[1][2 * NP + P_MOD] = 30;
@@ -2384,9 +2393,10 @@ static void app_main(void)
             uint32_t now;
             t_batt = fm1_ms;
             batt_poll();
-            now = batt_usb() ? 0x8000u : (uint32_t)(batt_pct() & 0x7F);
+            now = batt_usb() ? 0x8000u : batt_bars();
             if (now != batt_shown) { batt_shown = now; hdr_dirty = 1; }
         }
+        if (batt_usb() && fm1_ms - t_banim > 600u) { t_banim = fm1_ms; batt_anim++; hdr_dirty = 1; }
         if ((page == PG_OSC || page == PG_VERB) && shift != shift_drawn) { shift_drawn = shift; dirty = 1; }
         if ((page == PG_FG || page == PG_MOD || page == PG_WAVE || page == PG_GATE || page == PG_GMAT || page == PG_SH
              || page == PG_GLOBAL || page == PG_VERB)
