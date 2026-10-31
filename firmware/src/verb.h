@@ -34,6 +34,7 @@ typedef struct {                                /* set by the main loop (knob un
 static verb_par_t vp;
 static volatile int32_t v_level;                /* the return's level now, for the screen */
 static volatile uint32_t v_gate_freeze;         /* the gate matrix's FREEZE */
+static volatile uint32_t v_ready;               /* set by verb_init: the audio interrupt runs before app_main does */
 static int32_t v_damp_l, v_damp_r, v_bw, v_last_l, v_last_r, v_out_l, v_out_r, v_fb;
 static uint32_t v_lfo, v_phase;
 
@@ -54,6 +55,7 @@ static void verb_init(void)
     vline_init(&v_d1l, &m, V_D1L); vline_init(&v_apl, &m, V_APL); vline_init(&v_d2l, &m, V_D2L);
     vline_init(&v_d1r, &m, V_D1R); vline_init(&v_apr, &m, V_APR); vline_init(&v_d2r, &m, V_D2R);
     vline_init(&v_pre, &m, V_PRE);
+    v_ready = 1;                                /* (last: the lines are all in place) */
 }
 
 static inline __attribute__((always_inline)) int16_t sat16(int32_t v) { return (int16_t)(v > 32767 ? 32767 : v < -32767 ? -32767 : v); }
@@ -121,6 +123,7 @@ static void verb_run(const int32_t *in, int32_t *out, uint32_t n, const verb_mod
     uint32_t d1r = V_D1R * (uint32_t)sz >> 15, apr = V_APR * (uint32_t)sz >> 15, d2r = V_D2R * (uint32_t)sz >> 15;
 #define TAP(len) (((len) * (uint32_t)sz >> 15) + 1u)
     int32_t lvl = 0;
+    if (!v_ready) return;                       /* (not set up yet: on the FM-1 the sound starts first) */
 
     for (i = 0; i < n; i++) {
         if ((v_phase++ & (div - 1u)) == 0u) {          /* a reverb sample: the input averaged over div frames */
