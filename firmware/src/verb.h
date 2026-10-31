@@ -103,7 +103,7 @@ typedef struct { int32_t size, decay, damp, ret, fb; } verb_mod_t;
 #endif
 static int32_t v_fbenv;
 
-static void verb_run(const int32_t *in, int32_t *out, uint32_t n, const verb_mod_t *m)
+static void verb_run(const int32_t *in, int32_t *out, uint32_t n, const verb_mod_t *m, int32_t *wet)
 {
     uint32_t i, div = vp.rate ? 4u : 2u, k, frz = vp.freeze | v_gate_freeze;
     int32_t size_k = cl(vp.size + (m->size >> 8), 0, 127), dec_k = cl(vp.decay + (m->decay >> 8), 0, 127);
@@ -123,7 +123,7 @@ static void verb_run(const int32_t *in, int32_t *out, uint32_t n, const verb_mod
     uint32_t d1r = V_D1R * (uint32_t)sz >> 15, apr = V_APR * (uint32_t)sz >> 15, d2r = V_D2R * (uint32_t)sz >> 15;
 #define TAP(len) (((len) * (uint32_t)sz >> 15) + 1u)
     int32_t lvl = 0;
-    if (!v_ready) return;                       /* (not set up yet: on the FM-1 the sound starts first) */
+    if (!v_ready) { for (i = 0; i < n; i++) wet[i] = 0; return; }   /* (not set up yet: the sound starts first) */
 
     for (i = 0; i < n; i++) {
         if ((v_phase++ & (div - 1u)) == 0u) {          /* a reverb sample: the input averaged over div frames */
@@ -175,6 +175,7 @@ static void verb_run(const int32_t *in, int32_t *out, uint32_t n, const verb_mod
         }
         out[2u * i] += (v_out_l * ret) >> 15;   /* held between the reverb's samples: the grit */
         out[2u * i + 1u] += (v_out_r * ret) >> 15;
+        wet[i] = (v_out_l + v_out_r) >> 1;      /* (for the next in the chain) */
         {
             int32_t a = v_out_l < 0 ? -v_out_l : v_out_l;
             if (a > lvl) lvl = a;
@@ -212,4 +213,59 @@ static inline __attribute__((always_inline)) int32_t dl_frame(int32_t in, uint32
     dl_ph = ph;
     dl_lp += ((dl_hold - dl_lp) * lpc) >> 15;
     return dl_lp;
+}
+
+/* ---- the flanger: a short delay swept by its own triangle LFO, at 22 or 11 kHz (11: twice the time, grittier),
+ * held between its samples as the others. Two taps swept in opposite directions: stereo. Feedback -..+ through the
+ * saturator (- hollow and metallic, + the jet), at most ~0.9. Safe from the first interrupt: a static buffer. */
+#define FL_N 1024u
+static int16_t fl_buf[FL_N] __attribute__((section(".pool")));
+typedef struct { volatile uint8_t rate, depth, manual, fb, ret, slow; } fl_par_t;
+static fl_par_t flp;
+static uint32_t fl_w, fl_lfo, fl_phase;
+static int32_t fl_hold_l, fl_hold_r;
+static volatile int32_t fl_lfo_v;               /* the LFO's position, -32768..32767, for the screen */
+
+static inline __attribute__((always_inline)) int32_t fl_read(uint32_t d_q8)   /* d samples ago, Q8 */
+{
+    uint32_t d = d_q8 >> 8, f = d_q8 & 255u, i0 = fl_w + FL_N - d, i1 = i0 + FL_N - 1u;
+    int32_t a, b;
+    if (i0 >= FL_N) i0 -= FL_N;
+    if (i1 >= 2u * FL_N) i1 -= 2u * FL_N;
+    if (i1 >= FL_N) i1 -= FL_N;
+    a = fl_buf[i0];
+    b = fl_buf[i1];
+    return (a * (int32_t)(256u - f) + b * (int32_t)f) >> 8;
+}
+
+/* in: the block's input (sends + the chain); wet: its output, mono, for the next in the chain; out: + the return */
+static void fl_run(const int32_t *in, int32_t *wet, int32_t *out, uint32_t n, const uint32_t *lut_rate)
+{
+    uint32_t i, k, div = flp.slow ? 4u : 2u;
+    uint32_t inc = lut_rate[flp.rate & 127u] >> (flp.slow ? 3u : 4u);   /* the LUT is a step per 32 frames */
+    int32_t man = (2 + (int32_t)flp.manual * 3) << 8;                  /* the centre: 2 .. 383 samples, Q8 */
+    int32_t exc = man * (int32_t)flp.depth / 127;                       /* the sweep, a share of the centre (32-bit) */
+    int32_t fbg = ((int32_t)flp.fb - 64) * (29500 / 63), ret = (int32_t)flp.ret * flp.ret * 2;
+    for (i = 0; i < n; i++) {
+        if ((fl_phase++ & (div - 1u)) == 0u) {
+            int32_t x = 0, t, tri, dl, dr, yl, yr;
+            for (k = 0; k < div && i + k < n; k++) x += in[i + k];
+            x = (x / (int32_t)div) >> 1;
+            fl_lfo += inc;
+            t = (int32_t)(fl_lfo >> 16);
+            tri = (t < 32768 ? t : 65535 - t) * 2 - 32768;   /* a triangle, -32768 .. 32766 */
+            dl = cl(man + (int32_t)(((int64_t)exc * tri) >> 15), 256, (int32_t)(FL_N - 4u) << 8);
+            dr = cl(man - (int32_t)(((int64_t)exc * tri) >> 15), 256, (int32_t)(FL_N - 4u) << 8);
+            yl = fl_read((uint32_t)dl);
+            yr = fl_read((uint32_t)dr);
+            fl_buf[fl_w] = sat16(softclip(x + ((((yl + yr) >> 1) * fbg) >> 15)));
+            if (++fl_w >= FL_N) fl_w = 0;
+            fl_hold_l = (x + yl) >> 1;            /* the comb: the input and its swept echo */
+            fl_hold_r = (x + yr) >> 1;
+            fl_lfo_v = tri;
+        }
+        out[2u * i] += (fl_hold_l * ret) >> 15;
+        out[2u * i + 1u] += (fl_hold_r * ret) >> 15;
+        wet[i] = (fl_hold_l + fl_hold_r) >> 1;
+    }
 }

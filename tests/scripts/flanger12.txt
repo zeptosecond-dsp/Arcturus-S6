@@ -1,0 +1,29 @@
+# flanger + routing demo: DEFAULT, FX three times (the flanger), 1 + 2 into it, swept with feedback, a shot;
+# then 11K, then ROUTING: the order turned, LINK 1 up, a shot; OCT- back to the flanger, OCT+ round again
+200 btn 9
+300 enc 0 -2
+400 btn 3
+500 btn 3
+700 btn 2
+800 btn 2
+900 btn 2
+1000 enc 1 100
+1100 enc 0 1
+1200 enc 1 100
+1300 enc 2 10
+1400 enc 3 50
+1500 enc 4 -10
+1600 enc 5 30
+6000 shot
+9000 enc 6 1
+12000 shot
+13000 btn 2
+13100 enc 2 3
+13200 enc 3 70
+14000 shot
+15000 btn 0
+16000 btn 1
+16100 btn 1
+16200 btn 1
+17000 shot
+20000 end

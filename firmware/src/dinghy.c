@@ -63,7 +63,7 @@ enum { P_PITCH, P_WAVE, P_MOD, P_THR, P_HICUT, P_LEVEL, P_PAN, NP };
 typedef struct {                                /* the knobs, set by the main loop */
     volatile int32_t pitch_q8;                  /* note * 256, 1/256 semitone */
     volatile int32_t fine_q8;                   /* (after the quantiser) */
-    volatile uint8_t qon, qglide, send, dsend;  /* send: to the reverb, dsend: to the delay, 0..127 */
+    volatile uint8_t qon, qglide, send, dsend, fsend;   /* to the reverb, the delay, the flanger: 0..127 */
     volatile uint8_t pos, mod, thr, hicut, level, pan;
     volatile uint8_t table, scan;               /* scan: 0 smooth (crossfade), 1 stepped (PPG) */
 } osc_par_t;
@@ -141,6 +141,7 @@ static int16_t scope_buf[SCOPE_MAX];
 static volatile uint32_t scope_osc, scope_req, scope_len, scope_n, scope_done, scope_dec;   /* dec: keep 1 in dec */
 static uint32_t scope_cnt;
 static volatile uint32_t mute;                  /* 1: fade the output out (a flash save stalls the sound) */
+static volatile uint8_t fx_order, fx_link1, fx_link2;   /* the FX chain: one of 6 orders (F D R ...), two links */
 static volatile int32_t out_gain = 32767;
 
 static const uint32_t INC_C9[12] = {            /* MIDI 120..131 (C9..B9); lower octaves shift right */
@@ -236,7 +237,7 @@ static void render(int32_t *out)                /* SUB frames */
     uint32_t inc[NO];
     const int8_t *tab[NO];
     uint32_t step[NO];
-    int32_t vin[SUB], sendg[NO], dsendg[NO], dinb[SUB];
+    int32_t vin[SUB], sendg[NO], dsendg[NO], dinb[SUB], fsendg[NO], finb[SUB];
     verb_mod_t vm;
 
     for (k = 0; k < NFG; k++) src[k] = fg_out[k];   /* every source as it stood a step ago */
@@ -326,6 +327,7 @@ static void render(int32_t *out)                /* SUB frames */
         step[o] = p->scan;
         sendg[o] = p->send;
         dsendg[o] = p->dsend;
+        fsendg[o] = p->fsend;
         int32_t q, target, dpos;
         {
             int32_t pq = p->pitch_q8 + ((a[P_PITCH] * 3) >> 3);           /* full depth: ~4 octaves */
@@ -369,7 +371,7 @@ static void render(int32_t *out)                /* SUB frames */
 
     for (i = 0; i < SUB; i++) {
         int32_t l = 0, r = 0, prev0 = ost[0].last, prev1 = ost[1].last;    /* 1 and 2 hear each other a sample late */
-        int32_t snd = 0, dsnd = 0;
+        int32_t snd = 0, dsnd = 0, fsnd = 0;
         for (o = 0; o < NO; o++) {
             osc_st_t *s = &ost[o];
             uint32_t ph, idx, w, frac;
@@ -412,6 +414,7 @@ static void render(int32_t *out)                /* SUB frames */
             v = (x * s->amp) >> 15;              /* <= 10000 */
             snd += (v * sendg[o]) >> 7;          /* the sends, before the pan */
             dsnd += (v * dsendg[o]) >> 7;
+            fsnd += (v * fsendg[o]) >> 7;
             l += (v * pl[o]) >> 15;
             r += (v * pr[o]) >> 15;
         }
@@ -419,24 +422,39 @@ static void render(int32_t *out)                /* SUB frames */
         out[2u * i + 1u] += r;
         vin[i] = snd;
         dinb[i] = dsnd;
-    }
-    {   /* the delay, frame by frame: into the output, and (TO REVERB) into the reverb's input */
-        uint32_t dinc = LUT_DINC[cl(dlp.time + (acc[D_VERB(0)] >> 8), 0, 127)];   /* (on the matrix: DL TIME) */
-        int32_t fbg = cl(dlp.fb + (acc[D_VERB(2)] >> 8), 0, 127) * (DL_FB_MAX / 127), ret = (int32_t)dlp.ret * dlp.ret * 2;
-        int32_t tov = (int32_t)dlp.toverb * 258, mask = ~((1 << (dlp.crush > 10u ? 10u : dlp.crush)) - 1);
-        int32_t lpc = (int32_t)cl((int32_t)(dinc >> 16), 600, 32767);   /* the cutoff follows the clock */
-        for (i = 0; i < SUB; i++) {
-            int32_t y = dl_frame(dinb[i], dinc, fbg, mask, lpc), w = (y * ret) >> 15;
-            out[2u * i] += w;
-            out[2u * i + 1u] += w;
-            vin[i] += (y * tov) >> 15;
-        }
-        dl_w_v = dl_w;
+        finb[i] = fsnd;
     }
     for (o = 0; o < NO; o++) ost[o].amp = amp_t[o];
     vm.size = 0; vm.decay = acc[D_VERB(1)]; vm.damp = 0;   /* (size and damp are off the matrix now) */
     vm.ret = acc[D_VERB(3)]; vm.fb = acc[D_VERB(4)];
-    verb_run(vin, out, SUB, &vm);
+    {   /* the effects, in the chosen order: each takes its sends and (the link) the one before's output */
+        static const uint8_t ORD[6][3] = {{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}};   /* F D R */
+        int32_t wet[SUB], *ins[3];
+        uint32_t pos;
+        ins[0] = finb; ins[1] = dinb; ins[2] = vin;
+        for (pos = 0; pos < 3u; pos++) {
+            uint32_t fx = ORD[fx_order % 6u][pos];
+            int32_t *x = ins[fx];
+            if (pos) {
+                int32_t lk = (int32_t)(pos == 1u ? fx_link1 : fx_link2) * 258;
+                if (lk) for (i = 0; i < SUB; i++) x[i] += (wet[i] * lk) >> 15;
+            }
+            if (fx == 0u) fl_run(x, wet, out, SUB, LUT_GGINC);
+            else if (fx == 1u) {                /* the delay, frame by frame */
+                uint32_t dinc = LUT_DINC[cl(dlp.time + (acc[D_VERB(0)] >> 8), 0, 127)];   /* (on the matrix: DL TIME) */
+                int32_t fbg = cl(dlp.fb + (acc[D_VERB(2)] >> 8), 0, 127) * (DL_FB_MAX / 127), ret = (int32_t)dlp.ret * dlp.ret * 2;
+                int32_t mask = ~((1 << (dlp.crush > 10u ? 10u : dlp.crush)) - 1);
+                int32_t lpc = (int32_t)cl((int32_t)(dinc >> 16), 600, 32767);   /* the cutoff follows the clock */
+                for (i = 0; i < SUB; i++) {
+                    int32_t y = dl_frame(x[i], dinc, fbg, mask, lpc), w = (y * ret) >> 15;
+                    out[2u * i] += w;
+                    out[2u * i + 1u] += w;
+                    wet[i] = y;
+                }
+                dl_w_v = dl_w;
+            } else verb_run(x, out, SUB, &vm, wet);
+        }
+    }
 }
 
 static void app_audio(int32_t *out, uint32_t n)
@@ -487,6 +505,20 @@ static vpatch_t vpatch;
 typedef struct { uint8_t send[NO], time, fb, crush, ret, toverb, pad[3]; } dpatch_t;
 static const dpatch_t D_OFF = {{0, 0, 0, 0}, 80, 60, 0, 80, 30, {0, 0, 0}};   /* no sends: silent */
 static dpatch_t dpatch;
+typedef struct { uint8_t send[NO], rate, depth, manual, fb, ret, slow, pad[2]; } fpatch_t;   /* the flanger */
+static const fpatch_t F_OFF = {{0, 0, 0, 0}, 30, 70, 30, 90, 90, 0, {0, 0}};   /* no sends: silent */
+static fpatch_t fpatch;
+typedef struct { uint8_t order, link1, link2, pad; } rpatch_t;   /* the FX chain's order, and its two links */
+static const rpatch_t R_DEFAULT = {0, 0, 30, 0};   /* FLANGER > DELAY > REVERB, the delay into the reverb */
+static rpatch_t rpatch;
+static void push_fl(void)
+{
+    uint32_t o;
+    for (o = 0; o < NO; o++) opar[o].fsend = fpatch.send[o];
+    flp.rate = fpatch.rate; flp.depth = fpatch.depth; flp.manual = fpatch.manual; flp.fb = fpatch.fb;
+    flp.ret = fpatch.ret; flp.slow = fpatch.slow;
+}
+static void push_rt(void) { fx_order = rpatch.order; fx_link1 = rpatch.link1; fx_link2 = rpatch.link2; }
 static void push_dl(void)
 {
     uint32_t o;
@@ -643,6 +675,8 @@ typedef struct {
     tunpatch_t tun;
     vpatch_t verb;                              /* version 6 on */
     dpatch_t dly;                               /* version 7 on */
+    fpatch_t fl;                                /* version 8 on */
+    rpatch_t rt;
 } pdata_t;
 typedef union { pdata_t d; uint8_t raw[2040]; } pslot_t;
 typedef char pdata_fits_its_slot[sizeof(pdata_t) <= 2040u ? 1 : -1];   /* (the build fails if it ever grows past) */
@@ -684,7 +718,7 @@ static int patch_save(uint32_t slot)            /* 1..16 */
         for (k = 0; k < sizeof pbank[j].raw; k++) raw[k] = 0;
     }
     q->tag = PATCH_TAG;
-    q->ver = 7;
+    q->ver = 8;
     q->used = 1;
     for (o = 0; o < NO; o++) q->osc[o] = opatch[o];
     for (k = 0; k < NFG; k++) q->fg[k] = fgpatch[k];
@@ -699,6 +733,8 @@ static int patch_save(uint32_t slot)            /* 1..16 */
     q->tun = tunpatch;
     q->verb = vpatch;
     q->dly = dpatch;
+    q->fl = fpatch;
+    q->rt = rpatch;
     mute = 1;                                   /* fade out, save, fade in: the erase stops the sound ~50 ms */
     t0 = fm1_ms;
     while (out_gain > 0 && fm1_ms - t0 < 100u) platform_poll();
@@ -724,6 +760,8 @@ static int patch_load(uint32_t slot)            /* 0 = the default */
         tunpatch.tun = 0; tunpatch.scl = 1; tunpatch.root = 0;
         vpatch = V_DEFAULT;
         dpatch = D_OFF;
+        fpatch = F_OFF;
+        rpatch = R_DEFAULT;
     } else {
         if (bank_read((slot - 1u) / 2u)) return -1;
         q = &pbank[(slot - 1u) & 1u].d;
@@ -747,6 +785,8 @@ static int patch_load(uint32_t slot)            /* 0 = the default */
         if (q->ver >= 5u) tunpatch = q->tun; else { tunpatch.tun = 0; tunpatch.scl = 1; tunpatch.root = 0; }
         vpatch = q->ver >= 6u ? q->verb : V_OFF;   /* (older: no reverb) */
         dpatch = q->ver >= 7u ? q->dly : D_OFF;    /* (older: no delay) */
+        fpatch = q->ver >= 8u ? q->fl : F_OFF;     /* (older: no flanger; the delay's TO VERB becomes LINK 2) */
+        if (q->ver >= 8u) rpatch = q->rt; else { rpatch = R_DEFAULT; rpatch.link2 = dpatch.toverb; }
     }
     if (gen_seed != gen_built) gen_build(gen_seed);
     for (o = 0; o < NO; o++) {                  /* (a damaged value never reaches the engine) */
@@ -784,6 +824,14 @@ static int patch_load(uint32_t slot)            /* 0 = the default */
         for (k = 0; k < NO; k++) d->send[k] &= 127u;
         d->time &= 127u; d->fb &= 127u; d->crush = (uint8_t)cl(d->crush, 0, 10); d->ret &= 127u; d->toverb &= 127u;
         push_dl();
+    }
+    {
+        fpatch_t *f = &fpatch;
+        for (k = 0; k < NO; k++) f->send[k] &= 127u;
+        f->rate &= 127u; f->depth &= 127u; f->manual &= 127u; f->fb &= 127u; f->ret &= 127u; f->slow &= 1u;
+        push_fl();
+        rpatch.order = (uint8_t)(rpatch.order % 6u); rpatch.link1 &= 127u; rpatch.link2 &= 127u;
+        push_rt();
     }
     for (k = 0; k < NSSG; k++) { shpatch.input[k] = (uint8_t)cl(shpatch.input[k], 0, NSRC); shpatch.slew[k] &= 127u; }
     shpatch.qrate &= 127u;
@@ -848,8 +896,14 @@ static void randomize(void)
     push_verb();
     for (o = 0; o < NO; o++) dpatch.send[o] = (uint8_t)(rnd(3) ? 0 : rnd_in(20, 90));   /* the delay: now and then */
     dpatch.time = (uint8_t)rnd(128); dpatch.fb = (uint8_t)rnd(110); dpatch.crush = rnd(3) ? 0u : (uint8_t)rnd_in(2, 6);
-    dpatch.ret = (uint8_t)rnd_in(50, 100); dpatch.toverb = (uint8_t)rnd(80);
+    dpatch.ret = (uint8_t)rnd_in(50, 100); dpatch.toverb = 0;
     push_dl();
+    for (o = 0; o < NO; o++) fpatch.send[o] = (uint8_t)(rnd(3) ? 0 : rnd_in(30, 100));   /* the flanger: now and then */
+    fpatch.rate = (uint8_t)rnd(70); fpatch.depth = (uint8_t)rnd_in(20, 127); fpatch.manual = (uint8_t)rnd(100);
+    fpatch.fb = (uint8_t)rnd_in(10, 118); fpatch.ret = (uint8_t)rnd_in(60, 110); fpatch.slow = (uint8_t)rnd(2);
+    push_fl();
+    rpatch.order = (uint8_t)rnd(6); rpatch.link1 = (uint8_t)(rnd(2) ? 0 : rnd(90)); rpatch.link2 = (uint8_t)rnd(80);
+    push_rt();
     for (k = 0; k < NFG; k++) {
         fgpatch_t *f = &fgpatch[k];
         f->rise = (uint8_t)rnd_in(30, 115);
@@ -1058,7 +1112,9 @@ static void cv_out(uint32_t y0)                 /* the canvas (240 wide) through
 }
 
 static uint32_t gsub;                           /* page 9: 0 the tuning, 1 the VDU (OCT- / OCT+) */
-static uint32_t fxsub;                          /* the FX page: 0 the reverb, 1 the delay (FX again flips it) */
+static uint32_t fxsub;                          /* the FX page: 0 REVERB, 1 DELAY, 2 FLANGER, 3 ROUTING */
+#define NFXSUB 4u
+static const char *const FXSUB_NAME[NFXSUB] = {": REVERB", ": DELAY", ": FLANGER", ": ROUTING"};
 /* ---- the battery: SARADC channel 3 (the battery's divider), raw 0..1023, read every 2 s and smoothed. The scale is
  * built around the stock firmware's bar thresholds (531 / 561 / 591, as Felucca has them): BATT_EMPTY .. BATT_FULL
  * are first guesses, to be set from a full and a nearly flat reading (the boot screen shows the raw one). On USB
@@ -1102,7 +1158,7 @@ static void draw_header(uint32_t pg)
     s_cat(s, PG_NUM[pg]);
     s_cat(s, "  ");
     s_cat(s, PG_NAME[pg]);
-    if (pg == PG_VERB) s_cat(s, fxsub ? ": DELAY" : ": REVERB");
+    if (pg == PG_VERB) s_cat(s, FXSUB_NAME[fxsub % NFXSUB]);
     if (pg == PG_GLOBAL) s_cat(s, gsub ? ": VDU" : ": TUNING");
     cv_begin(240, BODY_Y, PH_BG);
     cv_text(4, 2, &FONT_S, s, PH_HI);
@@ -1689,7 +1745,7 @@ static void draw_verb(uint32_t vsel, int shift)
         if (h) cv_rect(40 + (int32_t)i, 192 - h, 1, h, i + 1u == HIST ? PH_HI : PH_MID);
     }
     cv_text(4, 176, &FONT_S, "OUT", PH_LO);
-    cv_text(0, 200, &FONT_S, "FX:FLIP SEL:MORE PLAY:FREEZE", PH_LO);
+    cv_text(0, 200, &FONT_S, "FX:NEXT SEL:MORE PLAY:FREEZE", PH_LO);
     cv_out(BODY_Y);
 }
 
@@ -1712,16 +1768,12 @@ static void draw_delay(uint32_t vsel, int shift)
     }
     for (k = 0; k < 4u; k++) {
         int32_t y = 24 + (int32_t)k * 18;
-        cv_text(4, y, &FONT_S, L[k], shift ? PH_LO : PH_MID);
+        cv_text(4, y, &FONT_S, L[k], PH_MID);
         s[0] = 0;
         if (k == 0u) { s_int(s, LUT_DMS[dpatch.time & 127u], 0); s_cat(s, "MS"); }
         else s_int(s, v[k], 0);
-        cv_text(112 - text_w(&FONT_S, s), y, &FONT_S, s, shift ? PH_MID : PH_HI);
+        cv_text(112 - text_w(&FONT_S, s), y, &FONT_S, s, PH_HI);
     }
-    cv_text(124, 24, &FONT_S, "TO VERB", shift ? PH_MID : PH_LO);
-    s[0] = 0;
-    s_int(s, dpatch.toverb, 0);
-    cv_text(236 - text_w(&FONT_S, s), 24, &FONT_S, s, shift ? PH_HI : PH_MID);
     cv_rect(0, 98, 240, 1, PH_LO);
     cv_text(4, 102, &FONT_S, "REGISTER", PH_LO);
     for (c = 0; c < 196u; c++) {                /* the register: each column ~10 cells, the write head bright */
@@ -1734,7 +1786,106 @@ static void draw_delay(uint32_t vsel, int shift)
         else cv_pset(40 + (int32_t)c, 156, PH_LO);
     }
     cv_rect(40 + (int32_t)(w * 196u / DL_N), 118, 1, 76, PH_HI);
-    cv_text(0, 200, &FONT_S, "FX:FLIP SEL:MORE PLAY:CLEAR", PH_LO);
+    cv_text(0, 200, &FONT_S, "FX:NEXT  PLAY:CLEAR", PH_LO);
+    cv_out(BODY_Y);
+}
+
+static void s_dec(char *s, uint32_t v100)       /* 1/100ths -> "1.23" */
+{
+    s_int(s, (int32_t)(v100 / 100u), 0);
+    s_cat(s, v100 % 100u < 10u ? ".0" : ".");
+    s_int(s, (int32_t)(v100 % 100u), 0);
+}
+
+/* ---- the flanger */
+static void draw_flanger(uint32_t vsel, int shift)
+{
+    static const char *const L[4] = {"RATE", "DEPTH", "MANUAL", "FEEDBK"};
+    uint32_t o, k, c, div = fpatch.slow ? 4u : 2u;
+    uint32_t man = 2u + fpatch.manual * 3u;                 /* samples at the flanger's own rate */
+    uint32_t ms100 = man * div * 100000u / 44100u;          /* 1/100 ms */
+    int32_t ph = (int32_t)(fl_lfo >> 16), y0 = 150;
+    char s[24];
+    cv_begin(240, BODY_H, PH_BG);
+    cv_text(4, 2, &FONT_S, "SEND", PH_LO);
+    for (o = 0; o < NO; o++) {
+        int32_t x = 48 + (int32_t)o * 48;
+        s[0] = 0;
+        s_cat(s, ONAME[o]);
+        s_cat(s, " ");
+        s_int(s, fpatch.send[o], 0);
+        if (o == vsel) cv_rect(x - 3, 1, 46, 17, PH_SEL);
+        cv_text(x, 2, &FONT_S, s, o == vsel ? PH_HI : PH_MID);
+    }
+    for (k = 0; k < 4u; k++) {
+        int32_t y = 24 + (int32_t)k * 18;
+        int dim = shift && k == 0u;
+        cv_text(4, y, &FONT_S, L[k], dim ? PH_LO : PH_MID);
+        s[0] = 0;
+        if (k == 0u) { s_dec(s, (uint32_t)(((uint64_t)LUT_GGINC[fpatch.rate & 127u] * 137813u) >> 32)); s_cat(s, "HZ"); }
+        else if (k == 1u) s_int(s, fpatch.depth, 0);
+        else if (k == 2u) { s_dec(s, ms100); s_cat(s, "MS"); }
+        else s_int(s, (int32_t)fpatch.fb - 64, 1);
+        cv_text(112 - text_w(&FONT_S, s), y, &FONT_S, s, dim ? PH_MID : PH_HI);
+    }
+    cv_text(124, 24, &FONT_S, "RETURN", shift ? PH_MID : PH_LO);
+    s[0] = 0;
+    s_int(s, fpatch.ret, 0);
+    cv_text(236 - text_w(&FONT_S, s), 24, &FONT_S, s, shift ? PH_HI : PH_MID);
+    cv_text(4, 98, &FONT_S, fpatch.slow ? "RATE 11K" : "RATE 22K", PH_MID);
+    cv_rect(0, 116, 240, 1, PH_LO);
+    cv_text(4, 120, &FONT_S, "LFO", PH_LO);
+    cv_rect(40, y0, 196, 1, PH_LO);
+    for (c = 0; c < 196u; c++) {                /* one cycle of the triangle, as tall as the depth */
+        int32_t t = (int32_t)(c * 65536u / 196u), tri = (t < 32768 ? t : 65535 - t) * 2 - 32768;
+        cv_pset(40 + (int32_t)c, y0 - tri * (int32_t)fpatch.depth / 127 * 28 / 32768, PH_MID);
+    }
+    {                                           /* and where it is now */
+        int32_t tri = (ph < 32768 ? ph : 65535 - ph) * 2 - 32768, x = 40 + ph * 196 / 65536;
+        cv_rect(x - 2, y0 - tri * (int32_t)fpatch.depth / 127 * 28 / 32768 - 2, 5, 5, PH_HI);
+    }
+    cv_text(0, 182, &FONT_S, "SEL+K1 RETURN PRESETS RATE", PH_LO);
+    cv_text(0, 200, &FONT_S, "FX:NEXT  PLAY:NO FEEDBK", PH_LO);
+    cv_out(BODY_Y);
+}
+
+/* ---- the routing: the three effects in order, each with its own sends, linked down the chain */
+static void draw_routing(void)
+{
+    static const uint8_t ORD[6][3] = {{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}};
+    static const char *const FXN[3] = {"FLANGER", "DELAY", "REVERB"};
+    uint32_t pos, o = rpatch.order % 6u;
+    char s[24];
+    cv_begin(240, BODY_H, PH_BG);
+    s[0] = 0;
+    s_cat(s, "ORDER ");
+    s_int(s, (int32_t)o + 1, 0);
+    s_cat(s, " OF 6");
+    cv_text(4, 2, &FONT_S, s, PH_HI);
+    for (pos = 0; pos < 3u; pos++) {
+        int32_t y = 26 + (int32_t)pos * 52, w = text_w(&FONT_S, FXN[ORD[o][pos]]);
+        cv_rect(64, y, 112, 1, PH_MID); cv_rect(64, y + 27, 112, 1, PH_MID);
+        cv_rect(64, y, 1, 28, PH_MID); cv_rect(175, y, 1, 28, PH_MID);
+        cv_text(120 - w / 2, y + 6, &FONT_S, FXN[ORD[o][pos]], PH_HI);
+        cv_text(4, y + 6, &FONT_S, "SENDS", PH_LO);
+        cv_rect(48, y + 13, 14, 1, PH_LO);
+        cv_rect(178, y + 13, 14, 1, PH_LO);
+        cv_text(196, y + 6, &FONT_S, "OUT", PH_LO);
+        if (pos < 2u) {                         /* the link down to the next */
+            uint32_t lk = pos ? rpatch.link2 : rpatch.link1;
+            int32_t yy = y + 28;
+            uint16_t c = lk ? PH_HI : PH_LO;
+            cv_rect(119, yy, 2, 24, c);
+            cv_rect(115, yy + 20, 10, 2, c);
+            cv_rect(117, yy + 22, 6, 2, c);
+            s[0] = 0;
+            s_cat(s, pos ? "LINK 2 " : "LINK 1 ");
+            s_int(s, (int32_t)lk, 0);
+            cv_text(130, yy + 4, &FONT_S, s, lk ? PH_MID : PH_LO);
+        }
+    }
+    cv_text(0, 182, &FONT_S, "K1 ORDER K2 LINK1 K3 LINK2", PH_LO);
+    cv_text(0, 200, &FONT_S, "FX:NEXT", PH_LO);
     cv_out(BODY_Y);
 }
 
@@ -1845,7 +1996,10 @@ static void app_main(void)
     shpatch = SH_DEFAULT;
     vpatch = V_DEFAULT;
     dpatch = D_OFF;
+    fpatch = F_OFF;
+    rpatch = R_DEFAULT;
     verb_init();
+    { uint32_t i; for (i = 0; i < FL_N; i++) fl_buf[i] = 0; for (i = 0; i < DL_N; i++) dl_buf[i] = 0; }
 
     depth[0][0 * NP + P_WAVE] = 40;             /* a few pins to hear the FGs at once */
     depth[1][2 * NP + P_MOD] = 30;
@@ -1904,7 +2058,7 @@ static void app_main(void)
         if (b & (1u << BTN_SEQ)) newpage = PG_GMAT;
         if (b & (1u << BTN_GLO)) newpage = PG_GLOBAL;
         if (b & (1u << BTN_FX)) {               /* FX again on the FX page: the other half */
-            if (page == PG_VERB) { fxsub ^= 1u; dirty = hdr_dirty = 1; }
+            if (page == PG_VERB) { fxsub = (fxsub + 1u) % NFXSUB; dirty = hdr_dirty = 1; }
             newpage = PG_VERB;
         }
         if (b & (1u << BTN_SAVE)) newpage = PG_PATCH;
@@ -1920,7 +2074,7 @@ static void app_main(void)
                 else if (page == PG_SH) ssel = (ssel + NSSG + (uint32_t)st) % NSSG;
                 else if (page == PG_GATE) gsel = (gsel + NGG + (uint32_t)st) % NGG;
                 else if (page == PG_GLOBAL) { gsub ^= 1u; hdr_dirty = 1; }   /* page 9: TUNING <-> VDU */
-                else if (page == PG_VERB) { fxsub = st > 0; hdr_dirty = 1; }   /* OCT-: REVERB, OCT+: DELAY */
+                else if (page == PG_VERB) { fxsub = (fxsub + NFXSUB + (uint32_t)st) % NFXSUB; hdr_dirty = 1; }
             }
         }
         base = (uint32_t)(53 + 12 * oct);       /* key 0 = F3, shifted */
@@ -2029,14 +2183,39 @@ static void app_main(void)
             if ((e = fm1_enc_take(ENC_KNOB3)) != 0) { depth[mcs][d] = (int8_t)cl(depth[mcs][d] + e, -64, 63); dirty = 1; }
             if (b & (1u << BTN_PLAY)) { depth[mcs][d] = depth[mcs][d] ? 0 : 32; dirty = 1; }
         }
-        else if (page == PG_VERB && fxsub) {     /* the delay */
+        else if (page == PG_VERB && fxsub == 2u) {   /* the flanger */
+            uint8_t *kn[5] = {&fpatch.rate, &fpatch.depth, &fpatch.manual, &fpatch.fb, &fpatch.ret};
+            static const uint8_t KE[4] = {ENC_KNOB1, ENC_KNOB2, ENC_KNOB3, ENC_KNOB4};
+            int ch = 0;
+            uint32_t j;
+            for (j = 0; j < 4u; j++)
+                if ((e = fm1_enc_take(KE[j])) != 0) {
+                    uint8_t *q = shift && j == 0u ? kn[4] : kn[j];
+                    *q = (uint8_t)cl(*q + e, 0, 127);
+                    ch = 1;
+                }
+            if ((e = fm1_enc_take(ENC_SELECT)) != 0) { vsel = (uint32_t)cl((int32_t)vsel + e, 0, NO - 1); dirty = 1; }
+            if ((e = fm1_enc_take(ENC_ALGORITHM)) != 0) { fpatch.send[vsel] = (uint8_t)cl(fpatch.send[vsel] + e, 0, 127); ch = 1; }
+            if ((e = fm1_enc_take(ENC_PRESETS)) != 0) { fpatch.slow = e > 0; ch = 1; }
+            if (b & (1u << BTN_PLAY)) { fpatch.fb = 64; ch = 1; }   /* the feedback back to none */
+            if (ch) { push_fl(); dirty = 1; }
+        } else if (page == PG_VERB && fxsub == 3u) {   /* the routing */
+            int ch = 0;
+            if ((e = fm1_enc_take(ENC_KNOB1)) != 0 || (e = fm1_enc_take(ENC_SELECT)) != 0) {
+                rpatch.order = (uint8_t)((rpatch.order + (e > 0 ? 1u : 5u)) % 6u);
+                ch = 1;
+            }
+            if ((e = fm1_enc_take(ENC_KNOB2)) != 0) { rpatch.link1 = (uint8_t)cl(rpatch.link1 + e, 0, 127); ch = 1; }
+            if ((e = fm1_enc_take(ENC_KNOB3)) != 0) { rpatch.link2 = (uint8_t)cl(rpatch.link2 + e, 0, 127); ch = 1; }
+            if (ch) { push_rt(); dirty = 1; }
+        } else if (page == PG_VERB && fxsub) {     /* the delay */
             uint8_t *kn[4] = {&dpatch.time, &dpatch.fb, &dpatch.crush, &dpatch.ret};
             static const uint8_t KE[4] = {ENC_KNOB1, ENC_KNOB2, ENC_KNOB3, ENC_KNOB4};
             int ch = 0;
             uint32_t j;
             for (j = 0; j < 4u; j++)
                 if ((e = fm1_enc_take(KE[j])) != 0) {
-                    uint8_t *q = shift && j == 0u ? &dpatch.toverb : kn[j];
+                    uint8_t *q = kn[j];
                     *q = (uint8_t)cl(*q + e, 0, q == &dpatch.crush ? 10 : 127);
                     ch = 1;
                 }
@@ -2137,6 +2316,9 @@ static void app_main(void)
             if (page == PG_OSC) {
                 for (o = 0; o < NO; o++)
                     if (opatch[o].note == base + k) { if (o == sel) on = 1; else glow = 1; }
+            } else if (page == PG_VERB && fxsub == 2u) {   /* the flanger's LFO, a dot along the white keys */
+                on = wi >= 0 && (uint32_t)wi == (uint32_t)(fl_lfo_v + 32768) * 15u >> 16;
+            } else if (page == PG_VERB && fxsub == 3u) {   /* (nothing moves on the routing) */
             } else if (page == PG_VERB && fxsub) { /* the register's write head, running along the keys */
                 on = wi >= 0 && (uint32_t)wi == dl_w_v * 16u / DL_N;
             } else if (page == PG_VERB) {          /* the return's level, as a bar */
@@ -2185,7 +2367,7 @@ static void app_main(void)
                                   || (page == PG_WAVE && otab[sel] >= T_GEN && blink)   /* a new generative table */
                                   || (page == PG_GLOBAL && !gsub && (oq[qsel].on || blink))   /* solid: it quantises */
                                   || (page == PG_VERB && !fxsub && (vpatch.freeze || v_gate_freeze || blink))   /* frozen */
-                                  || (page == PG_VERB && fxsub && blink)   /* the delay: PLAY clears it */
+                                  || (page == PG_VERB && (fxsub == 1u || fxsub == 2u) && blink)   /* clear / no feedback */
                                   || (page == PG_MOD && (depth[mcs][DLIST[mcr]] || blink))   /* solid: a pin here */
                                   || (page == PG_GMAT && (gpatch[gcr] >> gcc & 1u || blink)));
         }
@@ -2223,7 +2405,12 @@ static void app_main(void)
             case PG_GATE: draw_gg(gsel); break;
             case PG_SH: draw_sh(); break;
             case PG_GLOBAL: if (gsub) draw_vdu(); else draw_global(qsel); break;
-            case PG_VERB: if (fxsub) draw_delay(vsel, shift); else draw_verb(vsel, shift); break;
+            case PG_VERB:
+                if (fxsub == 1u) draw_delay(vsel, shift);
+                else if (fxsub == 2u) draw_flanger(vsel, shift);
+                else if (fxsub == 3u) draw_routing();
+                else draw_verb(vsel, shift);
+                break;
             case PG_GMAT: draw_gmat(gcc, gcr, gtop, gleft); break;
             default: draw_soon(page); break;
             }
