@@ -1804,8 +1804,8 @@ static void draw_flanger(uint32_t vsel, int shift)
 {
     static const char *const L[4] = {"RATE", "DEPTH", "MANUAL", "FEEDBK"};
     uint32_t o, k, c, div = fpatch.slow ? 4u : 2u;
-    uint32_t man = 2u + fpatch.manual * 3u;                 /* samples at the flanger's own rate */
-    uint32_t ms100 = man * div * 100000u / 44100u;          /* 1/100 ms */
+    uint32_t man = (uint32_t)fl_manual(fpatch.manual);      /* Q8 samples at the flanger's own rate */
+    uint32_t ms100 = (man * div * 100u / 441u) >> 8;        /* 1/100 ms */
     int32_t ph = (int32_t)(fl_lfo >> 16), y0 = 150;
     char s[24];
     cv_begin(240, BODY_H, PH_BG);
@@ -2001,7 +2001,7 @@ static void app_main(void)
     fpatch = F_OFF;
     rpatch = R_DEFAULT;
     verb_init();
-    { uint32_t i; for (i = 0; i < FL_N; i++) fl_buf[i] = 0; for (i = 0; i < DL_N; i++) dl_buf[i] = 0; }
+    { uint32_t i; for (i = 0; i < FL_N; i++) fl_buf[0][i] = fl_buf[1][i] = 0; for (i = 0; i < DL_N; i++) dl_buf[i] = 0; }
 
     depth[0][0 * NP + P_WAVE] = 40;             /* a few pins to hear the FGs at once */
     depth[1][2 * NP + P_MOD] = 30;
