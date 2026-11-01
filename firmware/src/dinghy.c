@@ -19,7 +19,7 @@
  * Rules of the road (the chip has no FPU and no libgcc): integers only, no float, no 64-bit division.
  * tests/host.c runs this file on a computer: the screen as a PNG, the sound as a WAV. */
 #define APP_NAME "FM1 WAVETABLE"
-#define WT_VERSION "1.3"                        /* (shown on the boot screen; APP_VER is the build's) */
+#define WT_VERSION "1.4"                        /* (shown on the boot screen; APP_VER is the build's) */
 static void app_idle(void);
 #define LCD_IDLE app_idle                       /* while the screen's DMA runs: read MIDI (the clock) */
 #define CV_MAX (240u * 218u)                    /* the page body's canvas */
