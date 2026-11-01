@@ -19,7 +19,7 @@
  * Rules of the road (the chip has no FPU and no libgcc): integers only, no float, no 64-bit division.
  * tests/host.c runs this file on a computer: the screen as a PNG, the sound as a WAV. */
 #define APP_NAME "FM1 WAVETABLE"
-#define WT_VERSION "1.6"                        /* (shown on the boot screen; APP_VER is the build's) */
+#define WT_VERSION "1.7"                        /* (shown on the boot screen; APP_VER is the build's) */
 static void app_idle(void);
 #define LCD_IDLE app_idle                       /* while the screen's DMA runs: read MIDI (the clock) */
 #define CV_MAX (240u * 218u)                    /* the page body's canvas */
@@ -660,6 +660,7 @@ static uint32_t rnd(uint32_t n)                 /* 0..n-1 (xorshift32) */
 }
 static int32_t rnd_in(int32_t lo, int32_t hi) { return lo + (int32_t)rnd((uint32_t)(hi - lo + 1)); }
 static void randomize(void);
+static uint32_t rnd_wild;                       /* 1: RANDOM asked for (the keys, the disk): busier, more patched */
 
 /* ---- patches in flash: 16 slots, two to a 4 KB blob, each a fixed 2040 bytes with room to grow
  * (later versions add their parts in the spare room; a patch saved now still loads) */
@@ -804,7 +805,7 @@ static int patch_load(uint32_t slot)            /* 0 = the default */
 {
     uint32_t o, k, d;
     const pdata_t *q;
-    if (slot == P_RANDOM) { randomize(); for (k = 0; k < 8u; k++) cur_name[k] = ' '; ploaded = P_RANDOM; return 0; }
+    if (slot == P_RANDOM) { rnd_wild = 1; randomize(); rnd_wild = 0; for (k = 0; k < 8u; k++) cur_name[k] = ' '; ploaded = P_RANDOM; return 0; }
     for (k = 0; k < 8u; k++) cur_name[k] = ' ';
     ploaded = slot;
     if (slot == 0u) {
@@ -1002,6 +1003,69 @@ static void randomize(void)
         uint32_t src = rnd(NSRC), dst = DLIST[rnd(NDLIST)];
         int32_t a = dst < NO * NP && dst % NP == P_PITCH ? rnd_in(2, 8) : rnd_in(10, 45);
         depth[src][dst] = (int8_t)(rnd(10) < 7u ? a : -a);
+    }
+    if (rnd_wild) {                             /* RANDOM by hand: the matrices put to work, within limits */
+        static const uint8_t VP[] = {P_WAVE, P_WAVE, P_WAVE, P_MOD, P_MOD, P_HICUT, P_HICUT, P_PAN, P_THR};
+        uint32_t nart = 2u + rnd(2), bed = rnd(2) ? rnd(NO) : 99u, used = 0, i, npin;
+        /* 1: the FGs snappier; the first three fire once on a gate (a pluck), the rest cycle or follow a gate */
+        for (k = 0; k < NFG; k++) {
+            fgpatch_t *f = &fgpatch[k];
+            if (k < 3u) { f->rise = (uint8_t)(rnd(3) ? rnd(30) : rnd_in(30, 80)); f->fall = (uint8_t)rnd_in(15, 95); f->mode = rnd(4) ? M_ONCE : M_GATE; }
+            else { f->rise = (uint8_t)rnd_in(5, 105); f->fall = (uint8_t)rnd_in(5, 105); f->mode = rnd(2) ? M_CYCLE : M_ONCE; }
+            f->curve = (uint8_t)rnd(3);
+        }
+        for (k = 0; k < NGG; k++) {             /* the gate generators: rhythms, short gates */
+            ggpatch_t *g = &ggpatch[k];
+            for (d = 0; d < 2u; d++) { g->rate[d] = (uint8_t)rnd_in(40, 112); g->duty[d] = (uint8_t)rnd_in(6, 70); }
+        }
+        for (k = 0; k < NGSRC; k++) gpatch[k] = 0;
+        for (k = 0; k < NSRC; k++)
+            for (d = 0; d < NDST; d++) depth[k][d] = 0;
+        /* 2: the articulated voices: an FG opens each one's level (and often its hi cut); one voice may stay a bed */
+        for (i = 0; i < nart; i++) {
+            uint32_t ov = rnd(NO), tries = 0;
+            while ((ov == bed || used >> ov & 1u) && tries++ < 8u) ov = rnd(NO);
+            if (ov == bed || used >> ov & 1u) break;
+            used |= 1u << ov;
+            depth[i][ov * NP + P_LEVEL] = (int8_t)rnd_in(40, 63);
+            opatch[ov].level = (uint8_t)rnd_in(0, 30);
+            if (rnd(3)) { depth[i][ov * NP + P_HICUT] = (int8_t)rnd_in(20, 55); opatch[ov].hicut = (uint8_t)rnd_in(30, 80); }
+            if (i && !rnd(3)) gpatch[NGG * GS_PER + (i - 1u)] |= 1u << i;   /* a cascade: the one before's EOC */
+            else gpatch[rnd(NGG) * GS_PER + rnd(GS_PER)] |= 1u << i;          /* or a gate generator's output */
+        }
+        if (bed < NO) { opatch[bed].level = (uint8_t)rnd_in(45, 72); opatch[bed].hicut = (uint8_t)rnd_in(40, 100); }   /* (under the rest) */
+        for (k = nart; k < NFG; k++)            /* the others: gated sometimes */
+            if (fgpatch[k].mode != M_CYCLE || rnd(3) == 0u)
+                gpatch[rnd(2) ? rnd(NGG) * GS_PER + rnd(GS_PER) : NGG * GS_PER + rnd(NFG)] |= 1u << k;
+        /* 3: Krell: an SSG clocked by a gate, stepping a voice's pitch through the quantiser */
+        for (k = 0; k < NSSG; k++) {
+            gpatch[rnd(3) ? NGG * GS_PER + rnd(NFG) : rnd(NGG) * GS_PER + rnd(GS_PER)] |= 1u << G_SSG(k);
+            shpatch.slew[k] = rnd(3) ? 0u : (uint8_t)rnd_in(20, 70);
+        }
+        if (rnd(4)) {
+            uint32_t ov = rnd(NO);
+            depth[S_SSG(0)][ov * NP + P_PITCH] = (int8_t)rnd_in(6, 24);
+            oq[ov].on = 1;
+            if (rnd(2)) { uint32_t ov2 = (ov + 1u + rnd(NO - 1u)) % NO; depth[S_SSG(1)][ov2 * NP + P_PITCH] = (int8_t)rnd_in(6, 18); oq[ov2].on = 1; }
+        }
+        if (!rnd(3)) gpatch[NGG * GS_PER + rnd(NFG)] |= 1u << (NFG + rnd(2u * NGG));   /* an EOC into the logic */
+        /* 4: the rest: 6..14 pins on timbre and on the modulators themselves (feedback), no new pitch or level */
+        for (npin = (uint32_t)rnd_in(6, 14); npin; npin--) {
+            uint32_t src = rnd(NSRC), dst;
+            int32_t a = rnd_in(15, 55);
+            switch (rnd(8)) {
+            case 0: dst = D_FG(rnd(NFG), rnd(2)); break;
+            case 1: dst = D_GG(rnd(NGG), rnd(2), rnd(2)); break;
+            case 2: dst = rnd(2) ? D_QRATE : D_SSG(rnd(NSSG)); break;
+            case 3: dst = D_VERB(rnd(5)); a = rnd_in(10, 35); break;
+            default: {
+                uint32_t pp = VP[rnd(sizeof VP)], ov = rnd(NO);
+                if (pp == P_THR && ov < 2u) pp = P_MOD;   /* (1 and 2 have no threshold) */
+                dst = ov * NP + pp;
+            }
+            }
+            if (!depth[src][dst]) depth[src][dst] = (int8_t)(rnd(10) < 7u ? a : -a);
+        }
     }
     for (o = 0; o < NO; o++) push_osc(o);
     for (k = 0; k < NFG; k++) push_fg(k);
@@ -2003,11 +2067,20 @@ static void draw_boot(uint32_t step)            /* step 0..8: the loading lines 
     cv_begin(240, BODY_H, PH_BG);
     big_text(24, 2, "ARCTURUS", 3, 4, PH_HI);
     big_text(88, 38, "S6", 4, 4, PH_HI);
+    cv_text(158, 54, &FONT_S, "V" WT_VERSION, PH_MID);
     cv_rect(16, 74, 208, 2, PH_MID);
-    boot_line(80, "Waveform Animation System " WT_VERSION, PH_MID);
-    boot_line(98, "by zeptosecond DSP", PH_MID);
-    boot_line(116, "Written by machine", PH_LO);
-    boot_line(132, "with human guidance", PH_LO);
+    boot_line(82, "Waveform Animation System", PH_MID);
+    {                                           /* (C) 1980: the font has no copyright sign, so it is drawn here */
+        static const uint8_t COPY[8] = {0x3C, 0x42, 0x99, 0x85, 0x85, 0x99, 0x42, 0x3C};   /* bit 0 = left */
+        const char *t = "  1980 Zeptosecond DSP";
+        int32_t x = (240 - text_w(&FONT_S, t)) / 2, y = 100;
+        uint32_t r, k;
+        cv_text(x, y, &FONT_S, t, PH_MID);
+        for (r = 0; r < 8u; r++)                /* double height, as the font is */
+            for (k = 0; k < 8u; k++)
+                if (COPY[r] >> k & 1u) cv_rect(x + (int32_t)k, y + (int32_t)r * 2, 1, 2, PH_MID);
+    }
+    boot_line(118, "Vibe coding the future!", PH_LO);
     for (i = 0; i < 3u && i < step; i++) cv_text(36, 152 + (int32_t)i * 16, &FONT_S, LINE[i], PH_MID);
     if (step >= 6u) cv_text(36, 200, &FONT_S, "READY", PH_HI);
     else if (step & 1u) cv_text(36, 200, &FONT_S, "SYSTEM LOADING _", PH_LO);
