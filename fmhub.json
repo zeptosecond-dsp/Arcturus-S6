@@ -1,0 +1,9 @@
+{
+  "what": "An experimental, self-playing wavetable instrument for generative, evolving soundscapes. Four PPG-style oscillators, Serge-style function generators, sample-and-holds and logic, patched through mod and gate matrices. 12 bit, 22kHz, green phosphor CRT, Fairlight-style pages.",
+  "author": "Zeptosecond DSP",
+  "kinds": [
+    "synth"
+  ],
+  "cheat": "https://github.com/zeptosecond-dsp/Arcturus-S6/blob/main/docs/QUICKSTART.md",
+  "image": "assets/card.png"
+}

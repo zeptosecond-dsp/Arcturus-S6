@@ -17,6 +17,6 @@ echo Using %PY%
 echo Connect the FM-1 by USB and switch it on.
 echo Close any other music software that might be using its MIDI port.
 echo.
-%PY% "%~dp0fm1_install.py" "%~dp0fm1-wavetable.fwsc"
+%PY% "%~dp0fm1_install.py" "%~dp0arcturus-s6.fwsc"
 echo.
 pause

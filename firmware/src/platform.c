@@ -84,7 +84,7 @@ static void fm1_led_key_glow(uint32_t id, int on)   /* as fm1_led_key, the dim l
 #if BOARD_SMK37
 #define FELUCCA_ID SMK_MODEL "_990"             /* SMK-37 Pro_99N (Elite, MKE-P37: SMK_MODEL), tools/build.py */
 #else
-#define FELUCCA_ID "FM-1_990"                   /* package identity: 99N = Dinghy build N (tools/build.py) */
+#define FELUCCA_ID "FM-1_67686970"              /* package identity: Arcturus S6 (tools/build.py: FM1_ID) */
 #endif
 #endif
 #ifndef APP_VER
