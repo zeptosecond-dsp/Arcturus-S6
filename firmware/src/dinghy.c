@@ -19,7 +19,7 @@
  * Rules of the road (the chip has no FPU and no libgcc): integers only, no float, no 64-bit division.
  * tests/host.c runs this file on a computer: the screen as a PNG, the sound as a WAV. */
 #define APP_NAME "FM1 WAVETABLE"
-#define WT_VERSION "1.5"                        /* (shown on the boot screen; APP_VER is the build's) */
+#define WT_VERSION "1.5.1"                        /* (shown on the boot screen; APP_VER is the build's) */
 static void app_idle(void);
 #define LCD_IDLE app_idle                       /* while the screen's DMA runs: read MIDI (the clock) */
 #define CV_MAX (240u * 218u)                    /* the page body's canvas */
@@ -1159,6 +1159,7 @@ static void cv_out(uint32_t y0)                 /* the canvas (240 wide) through
     o1 = y0 + h + CRT_M + 1u < 240u ? y0 + h + CRT_M + 1u : 240u;
     for (oy = o0; oy < o1;) {
         uint32_t n = o1 - oy > CV_MAX / 240u ? CV_MAX / 240u : o1 - oy, j;
+        lcd_sync();                             /* (the strip before may still be going out from this buffer) */
         for (j = 0; j < n; j++, oy++) {
             const uint16_t *lut = CRT_LUT[oy & 1u];
             uint16_t *px = &cv_px[j * 240u];
