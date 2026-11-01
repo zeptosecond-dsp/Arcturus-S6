@@ -118,7 +118,7 @@ static volatile int32_t ssg_out[NSSG], ssg_held[NSSG];   /* +-32767 */
 static uint8_t ssg_gate_prev[NSSG];
 static volatile uint8_t ssg_tap[NSSG];          /* PLAY (and SEL + PLAY) on page 5: a count of taps, by hand */
 static uint8_t ssg_tap_seen[NSSG];
-static volatile uint8_t eng_half;               /* 1: the voices at 22.05 kHz, each sample held twice */
+static volatile uint8_t eng_half = 1;           /* the voices at 22.05 kHz, each sample held twice (native: always) */
 static volatile uint8_t ssg_gate_v[NSSG], ssg_fire_n[NSSG];   /* for page 5: the gate, a count of samples */
 static volatile uint8_t ssg_fired[NSSG];        /* set at each sample, cleared by the screen */
 static uint32_t noise_s = 0x6D2B79F5u;
@@ -1044,9 +1044,12 @@ static const uint8_t PG_READY[NPG] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
  * toward the edges and corners (the vignette, radial), adds a soft halo around what is bright, darkens every other
  * line (the scanlines) and maps it all through a phosphor ramp, the brightest a little white. The background stays
  * black: a gradient there bands on the panel's 16-bit colour. */
-static uint8_t crt_a[240u * BODY_H] __attribute__((section(".pool")));   /* the intensity */
-static uint8_t crt_b[240u * BODY_H] __attribute__((section(".pool")));   /* its rows blurred */
+static uint8_t crt_scr[240u * 240u] __attribute__((section(".pool")));   /* the whole screen's intensity, as drawn */
+static uint8_t crt_cmb[240u * 240u] __attribute__((section(".pool")));   /* and with its halo: what the tube shows */
 static uint8_t CRT_D2[240];                     /* (distance from the middle)^2: 0 .. 128 along an axis */
+#define CRT_BULGE 30                            /* the tube's curve: ~6 px in at the corners, ~3 at the edges */
+#define CRT_M 8                                 /* (the most a row moves: the rows around a strip redrawn too) */
+static int32_t CRT_K2[240];                     /* BULGE x (distance from the middle)^2, per row / column */
 static uint16_t CRT_LUT[2][256];                /* intensity -> the panel's pixel, even and odd lines */
 
 /* the VDU settings (page 9, OCT): the phosphor and the brightness. Kept in the settings sector, not in a patch. */
@@ -1064,7 +1067,7 @@ static const uint8_t PHOS_K[NPHOS][7][4] = {    /* intensity, r, g, b: each phos
 };
 typedef struct { uint32_t boots; uint8_t phos, bright, eng, pad; } settings_t;   /* eng: bit 0 8-bit, bit 1 22 kHz */
 static settings_t gset = {0, 0, 7, 0, 0};
-static void push_eng(void) { eng_mask = gset.eng & 1u ? ~255 : ~15; eng_half = (uint8_t)(gset.eng >> 1 & 1u); }
+static void push_eng(void) { eng_mask = ~15; eng_half = 1; }   /* native: 12 bit, 22.05 kHz (eng: unused now) */
 static uint16_t CRT_TF[257];                    /* the light's gain over the radius: 256 in the middle .. 0 the corners */
 
 static void settings_store(void)                /* the VDU settings to flash, faded as a patch save */
@@ -1104,40 +1107,87 @@ static void crt_init(void)
     for (i = 0; i < 240u; i++) {
         int32_t d = 2 * (int32_t)i + 1 - 240;  /* -239 .. 239 */
         CRT_D2[i] = (uint8_t)((d * d * 128) / (239 * 239));
+        CRT_K2[i] = CRT_BULGE * ((int32_t)i - 120) * ((int32_t)i - 120);
     }
     crt_build();
 }
 
 static void cv_out(uint32_t y0)                 /* the canvas (240 wide) through the CRT, to the screen at y0 */
 {
-    uint32_t w = cv_w, h = cv_h, x, y, n = w * h;
-    for (x = 0; x < n; x++) crt_a[x] = (uint8_t)(((swap16(cv_px[x]) >> 5) & 63u) << 2);
-    for (y = 0; y < h; y++) {                   /* the halo: a 3 x 3 box, rows first */
-        const uint8_t *a = &crt_a[y * w];
-        uint8_t *b = &crt_b[y * w];
-        b[0] = (uint8_t)((a[0] * 2u + a[1]) * 85u >> 8);
-        for (x = 1; x + 1u < w; x++) b[x] = (uint8_t)(((uint32_t)a[x - 1] + a[x] + a[x + 1]) * 85u >> 8);
-        b[w - 1] = (uint8_t)((a[w - 2] + a[w - 1] * 2u) * 85u >> 8);
+    uint32_t w = cv_w, h = cv_h, x, y, r0, r1, oy, o0, o1;
+    uint8_t hb[3][240];                         /* the halo's rows (a 3 x 3 box, rows first), rolling */
+    if (w != 240u || y0 >= 240u) { cv_blit(0, y0); return; }
+    if (y0 + h > 240u) h = 240u - y0;
+    for (y = 0; y < h; y++) {                   /* 1: the strip into the screen's picture */
+        uint8_t *a = &crt_scr[(y0 + y) * 240u];
+        const uint16_t *px = &cv_px[y * w];
+        for (x = 0; x < 240u; x++) a[x] = (uint8_t)(((swap16(px[x]) >> 5) & 63u) << 2);
     }
-    for (y = 0; y < h; y++) {
-        uint32_t sy = y0 + y, dy = CRT_D2[sy < 240u ? sy : 239u];
-        const uint8_t *a = &crt_a[y * w], *bu = &crt_b[(y ? y - 1u : 0u) * w], *bm = &crt_b[y * w];
-        const uint8_t *bd = &crt_b[(y + 1u < h ? y + 1u : y) * w];
-        const uint16_t *lut = CRT_LUT[sy & 1u];
-        uint16_t *px = &cv_px[y * w];
-        for (x = 0; x < w; x++) {
-            uint32_t f = 256u - CRT_D2[x] - dy;                     /* radial: 256 in the middle, 0 in the corners */
-            uint32_t glow = ((uint32_t)bu[x] + bm[x] + bd[x]) * 30u >> 8;
-            uint32_t tf = CRT_TF[f];                                  /* the light: dimmer toward the corners */
-            uint32_t v = ((uint32_t)a[x] + glow) * tf >> 8;          /* (the background stays black: no banding) */
-            px[x] = lut[v > 255u ? 255u : v];
+    r0 = y0 ? y0 - 1u : 0u;                     /* 2: its halo, and one row each side (their halo changed) */
+    r1 = y0 + h < 240u ? y0 + h : 239u;
+    for (y = (r0 ? r0 - 1u : 0u); y <= r1 + 1u && y < 240u; y++) {
+        const uint8_t *a = &crt_scr[y * 240u];
+        uint8_t *b = hb[y % 3u];
+        b[0] = (uint8_t)((a[0] * 2u + a[1]) * 85u >> 8);
+        for (x = 1; x + 1u < 240u; x++) b[x] = (uint8_t)(((uint32_t)a[x - 1] + a[x] + a[x + 1]) * 85u >> 8);
+        b[239] = (uint8_t)((a[238] + a[239] * 2u) * 85u >> 8);
+        {                                       /* the row before this one now has its three halo rows */
+            uint32_t c = y - 1u;
+            if (y >= 1u && c >= r0 && c <= r1) {
+                const uint8_t *bu = hb[(c ? c - 1u : 0u) % 3u], *bm = hb[c % 3u], *bd = hb[y % 3u];
+                const uint8_t *s0 = &crt_scr[c * 240u];
+                uint8_t *m = &crt_cmb[c * 240u];
+                for (x = 0; x < 240u; x++) {
+                    uint32_t v = s0[x] + (((uint32_t)bu[x] + bm[x] + bd[x]) * 30u >> 8);
+                    m[x] = (uint8_t)(v > 255u ? 255u : v);
+                }
+            }
         }
     }
-    cv_blit(0, y0);
+    if (r1 == 239u) {                           /* (the last row: no row below it) */
+        const uint8_t *bu = hb[238u % 3u], *bm = hb[239u % 3u];
+        const uint8_t *s0 = &crt_scr[239u * 240u];
+        uint8_t *m = &crt_cmb[239u * 240u];
+        for (x = 0; x < 240u; x++) {
+            uint32_t v = s0[x] + (((uint32_t)bu[x] + 2u * bm[x]) * 30u >> 8);
+            m[x] = (uint8_t)(v > 255u ? 255u : v);
+        }
+    }
+    /* 3: through the tube: each pixel looks a little further out (the bulge: the picture curves in at the edges),
+     * read between pixels (no lost strokes), dimmed toward the corners, the scanlines straight across the glass */
+    o0 = y0 > CRT_M + 1u ? y0 - CRT_M - 1u : 0u;
+    o1 = y0 + h + CRT_M + 1u < 240u ? y0 + h + CRT_M + 1u : 240u;
+    for (oy = o0; oy < o1;) {
+        uint32_t n = o1 - oy > CV_MAX / 240u ? CV_MAX / 240u : o1 - oy, j;
+        for (j = 0; j < n; j++, oy++) {
+            const uint16_t *lut = CRT_LUT[oy & 1u];
+            uint16_t *px = &cv_px[j * 240u];
+            int32_t dy = (int32_t)oy - 120, ky = CRT_K2[oy];
+            uint32_t ddy = CRT_D2[oy];
+            for (x = 0; x < 240u; x++) {
+                int32_t k2 = CRT_K2[x] + ky, dx = (int32_t)x - 120;
+                int32_t sx = ((int32_t)x << 4) + ((dx * k2) >> 20), sy = ((int32_t)oy << 4) + ((dy * k2) >> 20);   /* Q4 */
+                int32_t ix = sx >> 4, iy = sy >> 4;
+                uint32_t v = 0;
+                if (ix >= 0 && iy >= 0 && ix < 239 && iy < 239) {
+                    const uint8_t *m = &crt_cmb[(uint32_t)iy * 240u + (uint32_t)ix];
+                    uint32_t fx, fy, t, b;
+                    if (!(m[0] | m[1] | m[240] | m[241])) { px[x] = lut[0]; continue; }   /* (dark glass: most of it) */
+                    fx = (uint32_t)sx & 15u; fy = (uint32_t)sy & 15u;
+                    t = m[0] * (16u - fx) + m[1] * fx; b = m[240] * (16u - fx) + m[241] * fx;
+                    v = (t * (16u - fy) + b * fy) >> 8;
+                    v = v * CRT_TF[256u - CRT_D2[x] - ddy] >> 8;   /* the light: dimmer toward the corners */
+                }
+                px[x] = lut[v > 255u ? 255u : v];
+            }
+        }
+        cv_w = 240u; cv_h = n;
+        cv_blit(0, oy - n);
+    }
 }
 
-static uint32_t gsub;                           /* page 9: 0 TUNING, 1 ENGINE, 2 VDU (OCT- / OCT+) */
-static const char *const GSUB_NAME[3] = {": TUNING", ": ENGINE", ": VDU"};
+static uint32_t gsub;                           /* page 9: 0 TUNING, 1 VDU (OCT- / OCT+) */
+static const char *const GSUB_NAME[2] = {": TUNING", ": VDU"};
 static uint32_t fxsub;                          /* the FX page: 0 REVERB, 1 DELAY, 2 FLANGER, 3 ROUTING */
 #define NFXSUB 4u
 static const char *const FXSUB_NAME[NFXSUB] = {": REVERB", ": DELAY", ": FLANGER", ": ROUTING"};
@@ -1195,7 +1245,7 @@ static void draw_header(uint32_t pg)
     s_cat(s, "  ");
     s_cat(s, PG_NAME[pg]);
     if (pg == PG_VERB) s_cat(s, FXSUB_NAME[fxsub % NFXSUB]);
-    if (pg == PG_GLOBAL) s_cat(s, GSUB_NAME[gsub % 3u]);
+    if (pg == PG_GLOBAL) s_cat(s, GSUB_NAME[gsub & 1u]);
     if (*hmsg) { s[0] = 0; s_cat(s, hmsg); }   /* (a message: in place of all of it) */
     cv_begin(240, BODY_Y, PH_BG);
     cv_text(4, 2, &FONT_S, s, PH_HI);
@@ -1224,6 +1274,8 @@ static void draw_index(uint32_t cur)
         s_cat(s, "   ");
         s_cat(s, PG_NAME[i]);
         cv_text(20, y, &FONT_S, s, c);
+        if (i == cur && (fm1_ms / 400u) & 1u)   /* a blinking block cursor after the line */
+            cv_rect(20 + text_w(&FONT_S, s) + 4, y + 1, 8, 14, PH_HI);
         if (!PG_READY[i]) cv_text(196, y, &FONT_S, "--", PH_LO);
     }
     cv_text(4, 196, &FONT_S, "SELECT: CHOOSE  SEL: OPEN", PH_LO);
@@ -1706,27 +1758,6 @@ static void draw_vdu(void)                      /* page 9's other half: the phos
     cv_out(BODY_Y);
 }
 
-static void draw_engine(void)                   /* page 9's middle: the engine's word length and rate */
-{
-    uint32_t b8 = gset.eng & 1u, h = gset.eng >> 1 & 1u, i;
-    int32_t px = h ? 12 : 6, lv = b8 ? 4 : 12, cy = 128, amp = 56, prev = 0;
-    cv_begin(240, BODY_H, PH_BG);
-    cv_text(4, 2, &FONT_S, "WORD", PH_LO);  cv_text(68, 2, &FONT_S, b8 ? "8 BIT" : "12 BIT", PH_HI);
-    cv_text(4, 20, &FONT_S, "RATE", PH_LO); cv_text(68, 20, &FONT_S, h ? "22.05 KHZ" : "44.1 KHZ", PH_HI);
-    cv_rect(0, 40, 240, 1, PH_LO);
-    for (i = 0; i < 224u; i++)                  /* a cycle and a bit, smooth, dim */
-        cv_pset(8 + (int32_t)i, cy - ((sine(i * 0x01600000u) * amp) >> 15), PH_LO);
-    for (i = 0; i < 224u; i += (uint32_t)px) {  /* and as the engine has it: held samples, stepped levels */
-        int32_t v = (sine(i * 0x01600000u) * lv) >> 15, y = cy - v * amp / lv, w = (int32_t)i + px > 224 ? 224 - (int32_t)i : px;
-        if (i) cv_rect(8 + (int32_t)i, prev < y ? prev : y, 1, (prev < y ? y - prev : prev - y) + 1, PH_HI);
-        cv_rect(8 + (int32_t)i, y, w, 1, PH_HI);
-        prev = y;
-    }
-    cv_text(4, 182, &FONT_S, "FOR EVERY PATCH  (SAVED)", PH_LO);
-    cv_text(4, 200, &FONT_S, "K1 WORD  K2 RATE", PH_LO);
-    cv_out(BODY_Y);
-}
-
 static void draw_global(uint32_t qsel)
 {
     uint32_t t = g_tun, n = TUN_N[t], j, o;
@@ -2051,7 +2082,7 @@ static void draw_patch(uint32_t cur, uint32_t confirm, const char *msg)
 static void app_main(void)
 {
     uint32_t o, k, sel = 0, fsel = 0, prev = 0, page = PG_INDEX, icur = PG_OSC, mcs = 0, mcr = 0, mtop = 0, mleft = 0;
-    uint32_t rk_prev = 0, rk_arm = 0, t_hmsg = 0;
+    uint32_t rk_prev = 0, rk_arm = 0, t_hmsg = 0, idx_blink = 0;
     uint32_t dirty = 1, hdr_dirty = 1, batt_shown = 0xFFFFu, t_batt = 0, t_banim = 0, t_live = 0, pcur = 1, pconf = PC_NONE, t_msg = 0;
     const char *pmsg = "";
     uint32_t gsel = 0, gcc = 0, gcr = 0, gtop = 0, gleft = 0, t_hist = 0, qsel = 0, vsel = 0, vdu_dirty = 0, t_vdu = 0;
@@ -2153,7 +2184,7 @@ static void app_main(void)
                 else if (page == PG_FG) fsel = (fsel + NFG + (uint32_t)st) % NFG;
                 else if (page == PG_SH) ssel = (ssel + NSSG + (uint32_t)st) % NSSG;
                 else if (page == PG_GATE) gsel = (gsel + NGG + (uint32_t)st) % NGG;
-                else if (page == PG_GLOBAL) { gsub = (gsub + 3u + (uint32_t)st) % 3u; hdr_dirty = 1; }
+                else if (page == PG_GLOBAL) { gsub ^= 1u; hdr_dirty = 1; }   /* page 9: TUNING <-> VDU */
                 else if (page == PG_VERB) { fxsub = (fxsub + NFXSUB + (uint32_t)st) % NFXSUB; hdr_dirty = 1; }
             }
         }
@@ -2340,11 +2371,6 @@ static void app_main(void)
             if ((e = fm1_enc_take(ENC_PRESETS)) != 0) { vpatch.rate = e > 0; ch = 1; }
             if (b & (1u << BTN_PLAY)) { vpatch.freeze ^= 1u; ch = 1; }
             if (ch) { push_verb(); dirty = 1; }
-        } else if (page == PG_GLOBAL && gsub == 1u) {   /* the engine: applied at once, saved like the VDU */
-            int ch = 0;
-            if ((e = fm1_enc_take(ENC_KNOB1)) != 0) { gset.eng = (uint8_t)((gset.eng & ~1u) | (e > 0 ? 1u : 0u)); ch = 1; }
-            if ((e = fm1_enc_take(ENC_KNOB2)) != 0) { gset.eng = (uint8_t)((gset.eng & ~2u) | (e > 0 ? 2u : 0u)); ch = 1; }
-            if (ch) { push_eng(); dirty = 1; vdu_dirty = 1; t_vdu = fm1_ms; }
         } else if (page == PG_GLOBAL && gsub) {  /* the VDU: applied at once, saved 2 s after the last turn */
             int ch = 0;
             if ((e = fm1_enc_take(ENC_KNOB1)) != 0) { gset.phos = (uint8_t)cl(gset.phos + (e > 0 ? 1 : -1), 0, NPHOS - 1); ch = 1; }
@@ -2500,6 +2526,7 @@ static void app_main(void)
         if ((page == PG_FG || page == PG_MOD || page == PG_WAVE || page == PG_GATE || page == PG_GMAT || page == PG_SH
              || page == PG_GLOBAL || page == PG_VERB)
             && fm1_ms - t_live > 50u) { t_live = fm1_ms; dirty = 1; }
+        if (page == PG_INDEX && ((fm1_ms / 400u) & 1u) != idx_blink) { idx_blink = (fm1_ms / 400u) & 1u; dirty = 1; }
 
         idle_ok = 1;                            /* MIDI in while the screen draws */
         if (vdu_dirty && fm1_ms - t_vdu > 2000u) { vdu_dirty = 0; settings_store(); }   /* (a short fade) */
@@ -2515,7 +2542,7 @@ static void app_main(void)
             case PG_PATCH: draw_patch(pcur, pconf, pmsg); break;
             case PG_GATE: draw_gg(gsel); break;
             case PG_SH: draw_sh(); break;
-            case PG_GLOBAL: if (gsub == 2u) draw_vdu(); else if (gsub) draw_engine(); else draw_global(qsel); break;
+            case PG_GLOBAL: if (gsub) draw_vdu(); else draw_global(qsel); break;
             case PG_VERB:
                 if (fxsub == 1u) draw_delay(vsel, shift);
                 else if (fxsub == 2u) draw_flanger(vsel, shift);
