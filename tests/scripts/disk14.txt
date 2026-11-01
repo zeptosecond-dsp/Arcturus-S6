@@ -1,0 +1,28 @@
+# the disk: SAVE into slot 01 (PATCH01), PLAY to name it DRONE (SELECT turns a letter, SEL the next), SAVE;
+# scroll B:\PATCHES down, load 01 back, and the INIT / RANDOM files on A:\SYSTEM
+3500 btn 9
+3700 shot
+3800 btn 9
+4000 shot
+4100 btn 12
+4200 enc 0 4
+4300 btn 3
+4400 enc 0 18
+4500 btn 3
+4600 enc 0 15
+4650 shot
+4700 btn 3
+4800 enc 0 14
+4900 btn 3
+5000 enc 0 5
+5100 btn 9
+5300 shot
+5400 enc 0 12
+5600 shot
+5700 enc 0 -12
+5800 btn 3
+5900 btn 3
+6200 shot
+6300 enc 0 -2
+6500 shot
+7000 end

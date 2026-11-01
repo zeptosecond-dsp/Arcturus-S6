@@ -682,6 +682,7 @@ typedef struct {
     dpatch_t dly;                               /* version 7 on */
     fpatch_t fl;                                /* version 8 on */
     rpatch_t rt;
+    char name[8];                               /* (any version: zeros in an older one, so no name) */
 } pdata_t;
 typedef union { pdata_t d; uint8_t raw[2040]; } pslot_t;
 typedef char pdata_fits_its_slot[sizeof(pdata_t) <= 2040u ? 1 : -1];   /* (the build fails if it ever grows past) */
@@ -692,6 +693,32 @@ static patch_t def_osc[NO];
 static fgpatch_t def_fg[NFG];
 static int8_t def_dep[NSRC][NDST];
 static uint32_t def_gm[NGSRC];
+
+/* ---- names: 8 characters from DOS's own set, space-padded. INIT and RANDOM are A:\SYSTEM's; the slots B:\PATCHES' */
+#define NCHARS 39u
+static const char NAME_CH[NCHARS + 1] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
+static char pname[NPATCH + 2][8];               /* each slot's name, as on the disk */
+static char cur_name[8];                        /* the patch in the engine: its name ("" = none yet) */
+static uint32_t ploaded = 0;                    /* the slot it came from (or went to) */
+static void name_clean(char *d, const char *src)   /* anything not in the set becomes a space */
+{
+    uint32_t i, k;
+    for (i = 0; i < 8u; i++) {
+        char c = src[i];
+        if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+        for (k = 0; k < NCHARS && NAME_CH[k] != c; k++) {}
+        d[i] = k < NCHARS ? c : ' ';
+    }
+}
+static void name_default(char *d, uint32_t slot)   /* PATCH01 .. PATCH16 */
+{
+    static const char P[8] = {'P', 'A', 'T', 'C', 'H', '0', '0', ' '};
+    uint32_t i;
+    for (i = 0; i < 8u; i++) d[i] = P[i];
+    d[5] = (char)('0' + slot / 10u);
+    d[6] = (char)('0' + slot % 10u);
+}
+static int name_blank(const char *n) { uint32_t i; for (i = 0; i < 8u; i++) if (n[i] != ' ' && n[i]) return 0; return 1; }
 
 static int bank_read(uint32_t blob)
 {
@@ -707,9 +734,35 @@ static void patches_scan(void)
     pused[0] = pused[P_RANDOM] = 1;
     for (b = 0; b < NPATCH / 2u; b++) {
         bank_read(b);
-        for (j = 0; j < 2u; j++)
-            pused[1u + 2u * b + j] = pbank[j].d.tag == PATCH_TAG && pbank[j].d.used;
+        for (j = 0; j < 2u; j++) {
+            uint32_t sl = 1u + 2u * b + j;
+            pused[sl] = pbank[j].d.tag == PATCH_TAG && pbank[j].d.used;
+            if (pused[sl] && !name_blank(pbank[j].d.name)) name_clean(pname[sl], pbank[j].d.name);
+            else name_default(pname[sl], sl);   /* (older patches: PATCHnn) */
+        }
     }
+}
+static int bank_write(uint32_t b)               /* fade out, write, fade in: the erase stops the sound ~50 ms */
+{
+    uint32_t t0;
+    int r;
+    mute = 1;
+    t0 = fm1_ms;
+    while (out_gain > 0 && fm1_ms - t0 < 100u) platform_poll();
+    r = blob_save(b, pbank, sizeof pbank);
+    mute = 0;
+    return r;
+}
+static int patch_rename(uint32_t slot, const char *n)   /* 1..16, saved: only its name changes */
+{
+    uint32_t b = (slot - 1u) / 2u, j = (slot - 1u) & 1u;
+    pdata_t *q = &pbank[j].d;
+    int r;
+    if (bank_read(b) || q->tag != PATCH_TAG || !q->used) return -1;
+    name_clean(q->name, n);
+    r = bank_write(b);
+    if (r == 0) { name_clean(pname[slot], n); if (ploaded == slot) name_clean(cur_name, n); }
+    return r;
 }
 static int patch_save(uint32_t slot)            /* 1..16 */
 {
@@ -740,19 +793,20 @@ static int patch_save(uint32_t slot)            /* 1..16 */
     q->dly = dpatch;
     q->fl = fpatch;
     q->rt = rpatch;
-    mute = 1;                                   /* fade out, save, fade in: the erase stops the sound ~50 ms */
-    t0 = fm1_ms;
-    while (out_gain > 0 && fm1_ms - t0 < 100u) platform_poll();
-    r = blob_save(b, pbank, sizeof pbank);
-    mute = 0;
-    if (r == 0) pused[slot] = 1;
+    if (name_blank(cur_name)) name_default(cur_name, slot);   /* no name yet: PATCHnn (else it keeps its own) */
+    name_clean(q->name, cur_name);
+    (void)t0;
+    r = bank_write(b);
+    if (r == 0) { pused[slot] = 1; name_clean(pname[slot], cur_name); ploaded = slot; }
     return r;
 }
 static int patch_load(uint32_t slot)            /* 0 = the default */
 {
     uint32_t o, k, d;
     const pdata_t *q;
-    if (slot == P_RANDOM) { randomize(); return 0; }
+    if (slot == P_RANDOM) { randomize(); for (k = 0; k < 8u; k++) cur_name[k] = ' '; ploaded = P_RANDOM; return 0; }
+    for (k = 0; k < 8u; k++) cur_name[k] = ' ';
+    ploaded = slot;
     if (slot == 0u) {
         for (o = 0; o < NO; o++) opatch[o] = def_osc[o];
         for (k = 0; k < NFG; k++) fgpatch[k] = def_fg[k];
@@ -772,6 +826,7 @@ static int patch_load(uint32_t slot)            /* 0 = the default */
         if (bank_read((slot - 1u) / 2u)) return -1;
         q = &pbank[(slot - 1u) & 1u].d;
         if (q->tag != PATCH_TAG || !q->used) return -1;
+        name_clean(cur_name, name_blank(q->name) ? pname[slot] : q->name);
         for (o = 0; o < NO; o++) opatch[o] = q->osc[o];
         for (k = 0; k < NFG; k++) fgpatch[k] = q->fg[k];
         for (k = 0; k < NSRC; k++)
@@ -1019,9 +1074,9 @@ static void dst_name(char *s, uint32_t d)
 }
 
 enum { PG_INDEX, PG_OSC, PG_WAVE, PG_FG, PG_SH, PG_GATE, PG_MOD, PG_GMAT, PG_GLOBAL, PG_VERB, PG_PATCH, NPG };
-static const char *const PG_NUM[NPG] = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "R", "P"};
+static const char *const PG_NUM[NPG] = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "R", "D"};
 static const char *const PG_NAME[NPG] = {"INDEX", "OSCILLATORS", "WAVETABLE", "FUNCTION GEN", "S&H / QUAD",
-                                         "GATE GEN", "MOD MATRIX", "GATE MATRIX", "GLOBAL", "FX", "PATCHES"};
+                                         "GATE GEN", "MOD MATRIX", "GATE MATRIX", "GLOBAL", "FX", "DISK"};
 static const uint8_t PG_READY[NPG] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
 
 /* ---- the CRT: every canvas is drawn as phosphor light (its green is the intensity), then cv_out() dims the light
@@ -1981,29 +2036,71 @@ static void midi_poll(void)                     /* the clock, START: the clocked
 static void app_idle(void) { if (idle_ok) midi_poll(); }
 
 enum { PC_NONE, PC_SAVE, PC_LOAD };
-static void draw_patch(uint32_t cur, uint32_t confirm, const char *msg)
+/* page P: the disk. A:\SYSTEM holds INIT and RANDOM, B:\PATCHES the 16 slots, drawn as a tree, a DIR listing */
+static uint32_t p_ren, p_rpos, p_top;           /* naming: on, the letter; the listing's first line shown */
+static char p_rname[8];
+#define P_LINES 20u                             /* A:\SYSTEM, 2 files, B:\PATCHES, 16 files */
+#define P_SHOW 9u
+static uint32_t p_line(uint32_t slot) { return slot == 0u ? 1u : slot == P_RANDOM ? 2u : 3u + slot; }
+static void s_name(char *s, const char *n)      /* 8 characters, as they stand (padded) */
 {
     uint32_t i;
+    while (*s) s++;
+    for (i = 0; i < 8u; i++) *s++ = n[i] ? n[i] : ' ';
+    *s = 0;
+}
+static void draw_patch(uint32_t cur, uint32_t confirm, const char *msg)
+{
+    uint32_t ln, cl_ = p_line(cur);
+    char s[32];
+    if (cl_ < p_top) p_top = cl_;
+    if (cl_ >= p_top + P_SHOW) p_top = cl_ - P_SHOW + 1u;
+    if (cl_ <= 1u) p_top = 0;                   /* (INIT: the whole of A: in view) */
     cv_begin(240, BODY_H, PH_BG);
-    for (i = 0; i <= P_RANDOM; i++) {
-        int32_t col = i == 0u ? 0 : i == P_RANDOM ? 1 : (int32_t)((i - 1u) / 8u);
-        int32_t row = i == 0u || i == P_RANDOM ? 0 : (int32_t)((i - 1u) % 8u) + 1;
-        int32_t x = 4 + col * 120, y = 4 + row * 18;
-        char s[24] = "";
-        if (i == 0u) s_cat(s, "INIT");
-        else if (i == P_RANDOM) s_cat(s, "RANDOM");
-        else {
-            if (i < 10u) s_cat(s, "0");
-            s_int(s, (int32_t)i, 0);
-            s_cat(s, pused[i] ? "  SAVED" : "  --");
+    cv_text(4, 2, &FONT_S, "DISK: A:\\SYSTEM -- B:\\PATCHES", PH_MID);
+    cv_rect(0, 19, 240, 1, PH_LO);
+    for (ln = p_top; ln < p_top + P_SHOW && ln < P_LINES; ln++) {
+        int32_t y = 22 + (int32_t)(ln - p_top) * 16;
+        uint32_t slot = ln == 1u ? 0u : ln == 2u ? P_RANDOM : ln >= 4u ? ln - 3u : 99u;
+        s[0] = 0;
+        if (ln == 0u || ln == 3u) {             /* a directory */
+            cv_text(4, y, &FONT_S, ln ? "B:\\PATCHES" : "A:\\SYSTEM", PH_MID);
+            continue;
         }
-        if (i == cur) cv_rect(x - 4, y - 1, 116, 18, PH_SEL);
-        cv_text(x, y, &FONT_S, s, i == cur ? PH_HI : pused[i] ? PH_MID : PH_LO);
+        {                                       /* the tree: a branch to each file, the last one a corner */
+            int last = ln == 2u || ln == P_LINES - 1u;
+            cv_rect(10, y - (ln == 1u || ln == 4u ? 2 : 0), 1, last ? 9 : 16, PH_LO);
+            cv_rect(10, y + 8, 8, 1, PH_LO);
+        }
+        if (slot == 0u) s_cat(s, "INIT     SYS");
+        else if (slot == P_RANDOM) s_cat(s, "RANDOM   SYS");
+        else {
+            if (slot < 10u) s_cat(s, "0");
+            s_int(s, (int32_t)slot, 0);
+            s_cat(s, " ");
+            if (!pused[slot]) s_cat(s, "--------    -");
+            else {
+                s_name(s, p_ren && slot == cur ? p_rname : pname[slot]);
+                s_cat(s, " PAT 2040");
+            }
+        }
+        if (slot == cur) cv_rect(20, y - 1, 220, 17, PH_SEL);
+        cv_text(22, y, &FONT_S, s, slot == cur ? PH_HI : slot == P_RANDOM || slot == 0u || pused[slot] ? PH_MID : PH_LO);
+        if (slot == ploaded) cv_text(228, y, &FONT_S, "*", PH_HI);   /* (the one playing) */
+        if (p_ren && slot == cur && (fm1_ms / 300u) & 1u)   /* naming: the letter, a cursor under it */
+            cv_rect(22 + (3 + (int32_t)p_rpos) * 8, y + 14, 8, 2, PH_HI);
     }
-    if (msg && *msg) cv_text(4, 172, &FONT_S, msg, PH_HI);
-    else if (confirm == PC_SAVE) cv_text(4, 172, &FONT_S, "SAVE AGAIN: OVERWRITE", PH_HI);
-    else if (confirm == PC_LOAD) cv_text(4, 172, &FONT_S, cur == P_RANDOM ? "SEL AGAIN: ROLL THE DICE" : "SEL AGAIN: LOAD IT", PH_HI);
-    cv_text(4, 198, &FONT_S, "SEL: LOAD  SAVE: SAVE", PH_LO);
+    if (p_ren) {
+        cv_text(4, 168, &FONT_S, "NAME: SELECT TURNS A LETTER", PH_HI);
+        cv_text(4, 184, &FONT_S, "SEL/OCT: NEXT/MOVE SAVE: OK", PH_LO);
+        cv_text(4, 200, &FONT_S, "PLAY: CANCEL", PH_LO);
+    } else {
+        if (msg && *msg) cv_text(4, 168, &FONT_S, msg, PH_HI);
+        else if (confirm == PC_SAVE) cv_text(4, 168, &FONT_S, "SAVE AGAIN: OVERWRITE", PH_HI);
+        else if (confirm == PC_LOAD) cv_text(4, 168, &FONT_S, cur == P_RANDOM ? "SEL AGAIN: ROLL THE DICE" : "SEL AGAIN: LOAD IT", PH_HI);
+        cv_text(4, 184, &FONT_S, "SEL: LOAD   SAVE: SAVE", PH_LO);
+        cv_text(4, 200, &FONT_S, "PLAY: NAME", PH_LO);
+    }
     cv_out(BODY_Y);
 }
 
@@ -2055,6 +2152,7 @@ static void app_main(void)
     }
     if (!skip) { draw_boot(3); skip = boot_wait(250); }
     randomize();                                /* (the sound starts here) */
+    ploaded = P_RANDOM;
     if (!skip) { draw_boot(4); skip = boot_wait(250); }
     if (!skip) { draw_boot(5); skip = boot_wait(200); }
     if (!skip) { draw_boot(6); boot_wait(700); }
@@ -2123,7 +2221,30 @@ static void app_main(void)
             if ((e = fm1_enc_take(ENC_SELECT)) != 0) { icur = (uint32_t)cl((int32_t)icur + e, 0, NPG - 1); dirty = 1; }
             if (b & (1u << BTN_SEL)) newpage = icur;
         }
-        if (page == PG_PATCH) {
+        if (page == PG_PATCH && p_ren) {         /* naming: SELECT the letter, SEL the next, OCT move, SAVE keep it */
+            uint32_t k2;
+            if ((e = fm1_enc_take(ENC_SELECT)) != 0 || (e = fm1_enc_take(ENC_ALGORITHM)) != 0) {
+                for (k2 = 0; k2 < NCHARS && NAME_CH[k2] != p_rname[p_rpos]; k2++) {}
+                k2 = (k2 + NCHARS * 8u + (uint32_t)e) % NCHARS;
+                p_rname[p_rpos] = NAME_CH[k2];
+                dirty = 1;
+            }
+            if (b & (1u << BTN_SEL) || b & (1u << BTN_OCT_UP)) { p_rpos = (p_rpos + 1u) & 7u; dirty = 1; }
+            if (b & (1u << BTN_OCT_DOWN)) { p_rpos = (p_rpos + 7u) & 7u; dirty = 1; }
+            if (b & (1u << BTN_SAVE)) {
+                newpage = PG_PATCH;
+                if (name_blank(p_rname)) name_default(p_rname, pcur);
+                pmsg = patch_rename(pcur, p_rname) == 0 ? "NAMED" : "NAMING FAILED";
+                t_msg = fm1_ms; p_ren = 0; dirty = 1;
+            }
+            if (b & (1u << BTN_PLAY)) { p_ren = 0; dirty = 1; }
+        } else if (page == PG_PATCH) {
+            if (b & (1u << BTN_PLAY)) {         /* PLAY: name the slot (a saved one) */
+                if (pcur == 0u || pcur == P_RANDOM) { pmsg = "SYSTEM FILE"; t_msg = fm1_ms; }
+                else if (!pused[pcur]) { pmsg = "EMPTY SLOT: SAVE FIRST"; t_msg = fm1_ms; }
+                else { uint32_t k2; for (k2 = 0; k2 < 8u; k2++) p_rname[k2] = pname[pcur][k2]; p_ren = 1; p_rpos = 0; pconf = PC_NONE; pmsg = ""; }
+                dirty = 1;
+            }
             if ((e = fm1_enc_take(ENC_SELECT)) != 0) {
                 static const uint8_t ORDER[NPATCH + 2] = {0, P_RANDOM, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
                 uint32_t at = 0;
@@ -2170,7 +2291,7 @@ static void app_main(void)
             }
         } else { rk_prev = fm1_in.notes; if (rk_arm) { rk_arm = 0; hmsg = ""; hdr_dirty = 1; } }
         if (!rk_arm && *hmsg && fm1_ms - t_hmsg > 1500u) { hmsg = ""; hdr_dirty = 1; }
-        if (newpage != page) { page = newpage; pconf = PC_NONE; pmsg = ""; dirty = hdr_dirty = 1; }
+        if (newpage != page) { page = newpage; pconf = PC_NONE; pmsg = ""; p_ren = 0; dirty = hdr_dirty = 1; }
 
         for (k = 0; k < NFG; k++)               /* PLAY held on the FG page: the selected FG's gate */
             fg_manual[k] = (uint8_t)(page == PG_FG && k == fsel && play);
@@ -2415,7 +2536,7 @@ static void app_main(void)
         {
             uint32_t blink = (fm1_ms / 250u) & 1u;   /* a flashing button: "press me here" (its job here is this page's) */
             int pn = page == PG_WAVE || page == PG_FG || page == PG_SH || page == PG_GATE || page == PG_GLOBAL
-                  || page == PG_VERB;           /* OCT- / OCT+ as previous / next: flashing in turn */
+                  || page == PG_VERB || (page == PG_PATCH && p_ren);           /* OCT- / OCT+ as previous / next: flashing in turn */
             if (page == PG_OSC) {               /* page 2: the octave; solid on the side it is shifted to */
                 fm1_led_key(BTN_OCT_DOWN, oct < 0 || blink);
                 fm1_led_key(BTN_OCT_UP, oct > 0 || blink);
@@ -2429,6 +2550,7 @@ static void app_main(void)
             fm1_led_key(BTN_SAVE, page == PG_PATCH && (pconf == PC_SAVE || blink));
             fm1_led_key(BTN_FX, page == PG_VERB && blink);   /* FX again: the other half */
             fm1_led_key(BTN_PLAY, ((page == PG_FG || page == PG_SH) && (play || blink))   /* a manual gate / sample */
+                                  || (page == PG_PATCH && blink)   /* PLAY: name it / cancel */
                                   || (page == PG_WAVE && otab[sel] >= T_GEN && blink)   /* a new generative table */
                                   || (page == PG_GLOBAL && !gsub && (oq[qsel].on || blink))   /* solid: it quantises */
                                   || (page == PG_VERB && !fxsub && (vpatch.freeze || v_gate_freeze || blink))   /* frozen */
@@ -2455,6 +2577,7 @@ static void app_main(void)
         if ((page == PG_FG || page == PG_MOD || page == PG_WAVE || page == PG_GATE || page == PG_GMAT || page == PG_SH
              || page == PG_GLOBAL || page == PG_VERB)
             && fm1_ms - t_live > 50u) { t_live = fm1_ms; dirty = 1; }
+        if (page == PG_PATCH && p_ren && ((fm1_ms / 300u) & 1u) != idx_blink) { idx_blink = (fm1_ms / 300u) & 1u; dirty = 1; }
         if (page == PG_INDEX && ((fm1_ms / 400u) & 1u) != idx_blink) { idx_blink = (fm1_ms / 400u) & 1u; dirty = 1; }
 
         idle_ok = 1;                            /* MIDI in while the screen draws */
