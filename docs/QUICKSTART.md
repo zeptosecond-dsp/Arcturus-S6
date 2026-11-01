@@ -1,6 +1,6 @@
 # Arcturus S6 Quick Start Guide
 
-Arcturus S6 turns the M-VAVE FM-1 into a four-oscillator wavetable instrument that plays itself: patch modulators into each other, set it going, and let it evolve.
+Arcturus S6 turns the M-VAVE FM-1 into a four-oscillator wavetable instrument that plays itself: patch modulators into each other, set it going, and let it evolve. Try rolling some random patches at first to get a sense for how the system sounds, and what its capabilities are.
 
 ## What it is
 
