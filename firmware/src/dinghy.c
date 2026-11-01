@@ -1074,9 +1074,9 @@ static void dst_name(char *s, uint32_t d)
 }
 
 enum { PG_INDEX, PG_OSC, PG_WAVE, PG_FG, PG_SH, PG_GATE, PG_MOD, PG_GMAT, PG_GLOBAL, PG_VERB, PG_PATCH, NPG };
-static const char *const PG_NUM[NPG] = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "R", "P"};
+static const char *const PG_NUM[NPG] = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "R", "D"};
 static const char *const PG_NAME[NPG] = {"INDEX", "OSCILLATORS", "WAVETABLE", "FUNCTION GEN", "S&H / QUAD",
-                                         "GATE GEN", "MOD MATRIX", "GATE MATRIX", "GLOBAL", "FX", "PATCHES"};
+                                         "GATE GEN", "MOD MATRIX", "GATE MATRIX", "GLOBAL", "FX", "DISK"};
 static const uint8_t PG_READY[NPG] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
 
 /* ---- the CRT: every canvas is drawn as phosphor light (its green is the intensity), then cv_out() dims the light
