@@ -1,5 +1,5 @@
 # Build the FM-1 firmware on GitHub: on every push to main, or by hand (Actions -> fm1 -> Run workflow).
-# The .fwsc to install is attached to the run as the artifact "fm1-wavetable-firmware".
+# The .fwsc to install is attached to the run as the artifact "arcturus-s6-firmware".
 # The build's last lines are also posted as annotations (errors on a failure, notices on success),
 # so they can be read without opening the log.
 name: fm1
@@ -60,6 +60,6 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: fm1-wavetable-firmware
+          name: arcturus-s6-firmware
           path: dist/
           if-no-files-found: error
