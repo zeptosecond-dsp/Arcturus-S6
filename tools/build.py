@@ -61,7 +61,8 @@ MODELS = {"pro": "SMK-37 Pro", "elite": "SMK-37 Elite", "mke": "MKE-P37"}   # sm
 DATA_FAMILY = "ARCTRS"              # the SMK store's owner tag (store.h): 1..7 of A-Z 0-9. Your fork: your own
 SCREEN_NAME = "ARCTURUS"              # the update loader's screen (FM-1, ldr_screen.c): the name and its colour (RGB565)
 SCREEN_COLOUR = 0x464B              # phosphor green, #46C85F
-PRODUCT = "FM-1_950"                # Arcturus S6: 95N (Dinghy is 99N; the installers resume loaders FM-1_9NN)
+PRODUCT = "FM-1_67686970"           # Arcturus S6: one identity for every version (FM1_ID below)
+FM1_ID = "FM-1_67686970"            # (the Firmware Hub: unique, checked; Dinghy is FM-1_99N)
 VERSION = None                      # APP_VER for release builds
 
 
@@ -327,6 +328,8 @@ def main():
         PRODUCT = BOARD_PREFIX[BOARD] + m[2]
         VERSION = m[1] + "." + m[2] + (m[3] or "")
         name = f"arcturus-s6-{a.release}{suffix}.fwsc"
+    if BOARD == "fm1":
+        PRODUCT = FM1_ID                # (the same identity for dev and release builds: the version is in the name)
     fm1pkg_make.SDK = a.sdk
     for rel, sha in SDK_SHA256.items():          # fail early without the SDK
         if hashlib.sha256(fm1pkg_make.sdk_file(rel)).hexdigest() != sha:
