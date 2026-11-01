@@ -1,5 +1,13 @@
 # Licensing
 
+Arcturus S6 is free software under the GNU General Public License, version 3 only (`GPL-3.0-only`, full text in
+`LICENSE`), as Dinghy, which it is built on. The app (`firmware/src/dinghy.c`, `verb.h`, `tunings.h`, `luts.h`,
+`wt_tables.h`, `font_chunky.h`), `tools/gen_tables.py`, `tools/gen_font8.py`, `tools/preview_tables.py`,
+`tools/fm1_winmidi.py`, the host scripts in `tests/scripts/` and `docs/QUICKSTART.md` are by Zeptosecond DSP, written
+by machine (Claude, by Anthropic) with human guidance. Everything else is Dinghy's, as below.
+
+---
+
 Dinghy is free software under the GNU General Public License, version 3 only (`GPL-3.0-only`, full text in
 `LICENSE`). You may use, study, change and share it. If you give someone a firmware built from it, give them its
 complete source under the same licence too.
@@ -19,15 +27,16 @@ complete source under the same licence too.
 
 | What | Licence | Where |
 | --- | --- | --- |
+| font8x8_basic by Daniel Hepper (after the IBM VGA fonts), rendered into `firmware/src/font_chunky.h` | Public domain | `tools/third_party/font8x8_basic.h` |
 | Terminus font 8x16 (ter-u16n), rendered into `firmware/gen/felucca_font.h` | SIL OFL 1.1 | `assets/fonts/Terminus-LICENSE.txt` |
 | JieLi AC79 SDK: `uboot.boot`, `cfg_tool.bin`, `eq_cfg_hw.bin` are read from your SDK checkout at build time and placed in the package; no SDK files are in this tree | Apache-2.0 | <https://gitee.com/Jieli-Tech/fw-AC79_AIoT_SDK> |
 
 ## The logo
 
-`assets/logo.svg` / `logo.png` carry the designburg signet: Copyright (C) designburg, all rights reserved, not under
-the GPL. It marks Dinghy itself; a fork uses its own logo.
+Dinghy's logo (the designburg signet, all rights reserved, not under the GPL) marks Dinghy itself and is not part of
+this fork. `assets/card.png` is Arcturus S6's own (its boot screen).
 
 ## Trademarks
 
 "Felucca" and "Hügelton Instruments" are names of Hügelton Instruments; "M-VAVE", "FM-1", "SMK-37" and "MKE-P37"
-belong to their owners. Dinghy is not made or endorsed by them.
+belong to their owners. Dinghy and Arcturus S6 are not made or endorsed by them.

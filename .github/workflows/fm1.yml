@@ -55,7 +55,7 @@ jobs:
       - name: Package for Windows (the firmware, the installer and a double-click install.bat)
         run: |
           mkdir -p dist
-          cp build/dinghy.fwsc dist/fm1-wavetable.fwsc
+          cp build/arcturus-s6.fwsc dist/arcturus-s6.fwsc
           cp tools/fm1_install.py tools/fm1_winmidi.py tools/windows/install.bat dist/
 
       - uses: actions/upload-artifact@v4
