@@ -1,12 +1,12 @@
 # Build the FM-1 firmware on GitHub: on every push to main, or by hand (Actions -> fm1 -> Run workflow).
-# The .fwsc to install is attached to the run as the artifact "fm1-wavetable-firmware".
+# The .fwsc to install is attached to the run as the artifact "cellular-test-firmware".
 # The build's last lines are also posted as annotations (errors on a failure, notices on success),
 # so they can be read without opening the log.
 name: fm1
 
 on:
   push:
-    branches: [main]
+    branches: [main, cellular]
   workflow_dispatch:
 
 jobs:
@@ -55,11 +55,11 @@ jobs:
       - name: Package for Windows (the firmware, the installer and a double-click install.bat)
         run: |
           mkdir -p dist
-          cp build/dinghy.fwsc dist/fm1-wavetable.fwsc
+          cp build/dinghy.fwsc dist/cellular-test.fwsc
           cp tools/fm1_install.py tools/fm1_winmidi.py tools/windows/install.bat dist/
 
       - uses: actions/upload-artifact@v4
         with:
-          name: fm1-wavetable-firmware
+          name: cellular-test-firmware
           path: dist/
           if-no-files-found: error

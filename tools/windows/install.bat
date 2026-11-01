@@ -1,5 +1,5 @@
 @echo off
-rem Installs the FM-1 wavetable firmware over USB, with Windows' own MIDI: nothing else to install but Python.
+rem Installs the Cellular test firmware over USB, with Windows' own MIDI: nothing else to install but Python.
 rem Each version is asked for by name first: a stale py/python default (an uninstalled Python) is skipped.
 set PY=
 for %%V in (3.14 3.13 3.12 3.11 3.10 3.9 3.8) do (
@@ -17,6 +17,6 @@ echo Using %PY%
 echo Connect the FM-1 by USB and switch it on.
 echo Close any other music software that might be using its MIDI port.
 echo.
-%PY% "%~dp0fm1_install.py" "%~dp0fm1-wavetable.fwsc"
+%PY% "%~dp0fm1_install.py" "%~dp0cellular-test.fwsc"
 echo.
 pause
