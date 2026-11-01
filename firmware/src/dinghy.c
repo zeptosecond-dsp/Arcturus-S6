@@ -1044,9 +1044,12 @@ static const uint8_t PG_READY[NPG] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
  * toward the edges and corners (the vignette, radial), adds a soft halo around what is bright, darkens every other
  * line (the scanlines) and maps it all through a phosphor ramp, the brightest a little white. The background stays
  * black: a gradient there bands on the panel's 16-bit colour. */
-static uint8_t crt_a[240u * BODY_H] __attribute__((section(".pool")));   /* the intensity */
-static uint8_t crt_b[240u * BODY_H] __attribute__((section(".pool")));   /* its rows blurred */
+static uint8_t crt_scr[240u * 240u] __attribute__((section(".pool")));   /* the whole screen's intensity, as drawn */
+static uint8_t crt_cmb[240u * 240u] __attribute__((section(".pool")));   /* and with its halo: what the tube shows */
 static uint8_t CRT_D2[240];                     /* (distance from the middle)^2: 0 .. 128 along an axis */
+#define CRT_BULGE 30                            /* the tube's curve: ~6 px in at the corners, ~3 at the edges */
+#define CRT_M 8                                 /* (the most a row moves: the rows around a strip redrawn too) */
+static int32_t CRT_K2[240];                     /* BULGE x (distance from the middle)^2, per row / column */
 static uint16_t CRT_LUT[2][256];                /* intensity -> the panel's pixel, even and odd lines */
 
 /* the VDU settings (page 9, OCT): the phosphor and the brightness. Kept in the settings sector, not in a patch. */
@@ -1104,36 +1107,83 @@ static void crt_init(void)
     for (i = 0; i < 240u; i++) {
         int32_t d = 2 * (int32_t)i + 1 - 240;  /* -239 .. 239 */
         CRT_D2[i] = (uint8_t)((d * d * 128) / (239 * 239));
+        CRT_K2[i] = CRT_BULGE * ((int32_t)i - 120) * ((int32_t)i - 120);
     }
     crt_build();
 }
 
 static void cv_out(uint32_t y0)                 /* the canvas (240 wide) through the CRT, to the screen at y0 */
 {
-    uint32_t w = cv_w, h = cv_h, x, y, n = w * h;
-    for (x = 0; x < n; x++) crt_a[x] = (uint8_t)(((swap16(cv_px[x]) >> 5) & 63u) << 2);
-    for (y = 0; y < h; y++) {                   /* the halo: a 3 x 3 box, rows first */
-        const uint8_t *a = &crt_a[y * w];
-        uint8_t *b = &crt_b[y * w];
-        b[0] = (uint8_t)((a[0] * 2u + a[1]) * 85u >> 8);
-        for (x = 1; x + 1u < w; x++) b[x] = (uint8_t)(((uint32_t)a[x - 1] + a[x] + a[x + 1]) * 85u >> 8);
-        b[w - 1] = (uint8_t)((a[w - 2] + a[w - 1] * 2u) * 85u >> 8);
+    uint32_t w = cv_w, h = cv_h, x, y, r0, r1, oy, o0, o1;
+    uint8_t hb[3][240];                         /* the halo's rows (a 3 x 3 box, rows first), rolling */
+    if (w != 240u || y0 >= 240u) { cv_blit(0, y0); return; }
+    if (y0 + h > 240u) h = 240u - y0;
+    for (y = 0; y < h; y++) {                   /* 1: the strip into the screen's picture */
+        uint8_t *a = &crt_scr[(y0 + y) * 240u];
+        const uint16_t *px = &cv_px[y * w];
+        for (x = 0; x < 240u; x++) a[x] = (uint8_t)(((swap16(px[x]) >> 5) & 63u) << 2);
     }
-    for (y = 0; y < h; y++) {
-        uint32_t sy = y0 + y, dy = CRT_D2[sy < 240u ? sy : 239u];
-        const uint8_t *a = &crt_a[y * w], *bu = &crt_b[(y ? y - 1u : 0u) * w], *bm = &crt_b[y * w];
-        const uint8_t *bd = &crt_b[(y + 1u < h ? y + 1u : y) * w];
-        const uint16_t *lut = CRT_LUT[sy & 1u];
-        uint16_t *px = &cv_px[y * w];
-        for (x = 0; x < w; x++) {
-            uint32_t f = 256u - CRT_D2[x] - dy;                     /* radial: 256 in the middle, 0 in the corners */
-            uint32_t glow = ((uint32_t)bu[x] + bm[x] + bd[x]) * 30u >> 8;
-            uint32_t tf = CRT_TF[f];                                  /* the light: dimmer toward the corners */
-            uint32_t v = ((uint32_t)a[x] + glow) * tf >> 8;          /* (the background stays black: no banding) */
-            px[x] = lut[v > 255u ? 255u : v];
+    r0 = y0 ? y0 - 1u : 0u;                     /* 2: its halo, and one row each side (their halo changed) */
+    r1 = y0 + h < 240u ? y0 + h : 239u;
+    for (y = (r0 ? r0 - 1u : 0u); y <= r1 + 1u && y < 240u; y++) {
+        const uint8_t *a = &crt_scr[y * 240u];
+        uint8_t *b = hb[y % 3u];
+        b[0] = (uint8_t)((a[0] * 2u + a[1]) * 85u >> 8);
+        for (x = 1; x + 1u < 240u; x++) b[x] = (uint8_t)(((uint32_t)a[x - 1] + a[x] + a[x + 1]) * 85u >> 8);
+        b[239] = (uint8_t)((a[238] + a[239] * 2u) * 85u >> 8);
+        {                                       /* the row before this one now has its three halo rows */
+            uint32_t c = y - 1u;
+            if (y >= 1u && c >= r0 && c <= r1) {
+                const uint8_t *bu = hb[(c ? c - 1u : 0u) % 3u], *bm = hb[c % 3u], *bd = hb[y % 3u];
+                const uint8_t *s0 = &crt_scr[c * 240u];
+                uint8_t *m = &crt_cmb[c * 240u];
+                for (x = 0; x < 240u; x++) {
+                    uint32_t v = s0[x] + (((uint32_t)bu[x] + bm[x] + bd[x]) * 30u >> 8);
+                    m[x] = (uint8_t)(v > 255u ? 255u : v);
+                }
+            }
         }
     }
-    cv_blit(0, y0);
+    if (r1 == 239u) {                           /* (the last row: no row below it) */
+        const uint8_t *bu = hb[238u % 3u], *bm = hb[239u % 3u];
+        const uint8_t *s0 = &crt_scr[239u * 240u];
+        uint8_t *m = &crt_cmb[239u * 240u];
+        for (x = 0; x < 240u; x++) {
+            uint32_t v = s0[x] + (((uint32_t)bu[x] + 2u * bm[x]) * 30u >> 8);
+            m[x] = (uint8_t)(v > 255u ? 255u : v);
+        }
+    }
+    /* 3: through the tube: each pixel looks a little further out (the bulge: the picture curves in at the edges),
+     * read between pixels (no lost strokes), dimmed toward the corners, the scanlines straight across the glass */
+    o0 = y0 > CRT_M + 1u ? y0 - CRT_M - 1u : 0u;
+    o1 = y0 + h + CRT_M + 1u < 240u ? y0 + h + CRT_M + 1u : 240u;
+    for (oy = o0; oy < o1;) {
+        uint32_t n = o1 - oy > CV_MAX / 240u ? CV_MAX / 240u : o1 - oy, j;
+        for (j = 0; j < n; j++, oy++) {
+            const uint16_t *lut = CRT_LUT[oy & 1u];
+            uint16_t *px = &cv_px[j * 240u];
+            int32_t dy = (int32_t)oy - 120, ky = CRT_K2[oy];
+            uint32_t ddy = CRT_D2[oy];
+            for (x = 0; x < 240u; x++) {
+                int32_t k2 = CRT_K2[x] + ky, dx = (int32_t)x - 120;
+                int32_t sx = ((int32_t)x << 4) + ((dx * k2) >> 20), sy = ((int32_t)oy << 4) + ((dy * k2) >> 20);   /* Q4 */
+                int32_t ix = sx >> 4, iy = sy >> 4;
+                uint32_t v = 0;
+                if (ix >= 0 && iy >= 0 && ix < 239 && iy < 239) {
+                    const uint8_t *m = &crt_cmb[(uint32_t)iy * 240u + (uint32_t)ix];
+                    uint32_t fx, fy, t, b;
+                    if (!(m[0] | m[1] | m[240] | m[241])) { px[x] = lut[0]; continue; }   /* (dark glass: most of it) */
+                    fx = (uint32_t)sx & 15u; fy = (uint32_t)sy & 15u;
+                    t = m[0] * (16u - fx) + m[1] * fx; b = m[240] * (16u - fx) + m[241] * fx;
+                    v = (t * (16u - fy) + b * fy) >> 8;
+                    v = v * CRT_TF[256u - CRT_D2[x] - ddy] >> 8;   /* the light: dimmer toward the corners */
+                }
+                px[x] = lut[v > 255u ? 255u : v];
+            }
+        }
+        cv_w = 240u; cv_h = n;
+        cv_blit(0, oy - n);
+    }
 }
 
 static uint32_t gsub;                           /* page 9: 0 TUNING, 1 VDU (OCT- / OCT+) */
