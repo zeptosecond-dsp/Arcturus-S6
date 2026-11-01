@@ -1,0 +1,26 @@
+# RANDOM rolled (G5 twice) six times, 6 s apart: the busier hand-rolled patches
+3500 keys 0x4000000
+3600 keys 0
+3700 keys 0x4000000
+3800 keys 0
+9500 keys 0x4000000
+9600 keys 0
+9700 keys 0x4000000
+9800 keys 0
+15500 keys 0x4000000
+15600 keys 0
+15700 keys 0x4000000
+15800 keys 0
+21500 keys 0x4000000
+21600 keys 0
+21700 keys 0x4000000
+21800 keys 0
+27500 keys 0x4000000
+27600 keys 0
+27700 keys 0x4000000
+27800 keys 0
+33500 keys 0x4000000
+33600 keys 0
+33700 keys 0x4000000
+33800 keys 0
+39500 end
