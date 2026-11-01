@@ -19,7 +19,7 @@
  * Rules of the road (the chip has no FPU and no libgcc): integers only, no float, no 64-bit division.
  * tests/host.c runs this file on a computer: the screen as a PNG, the sound as a WAV. */
 #define APP_NAME "FM1 WAVETABLE"
-#define WT_VERSION "1.6"                        /* (shown on the boot screen; APP_VER is the build's) */
+#define WT_VERSION "1.7"                        /* (shown on the boot screen; APP_VER is the build's) */
 static void app_idle(void);
 #define LCD_IDLE app_idle                       /* while the screen's DMA runs: read MIDI (the clock) */
 #define CV_MAX (240u * 218u)                    /* the page body's canvas */
@@ -2067,11 +2067,20 @@ static void draw_boot(uint32_t step)            /* step 0..8: the loading lines 
     cv_begin(240, BODY_H, PH_BG);
     big_text(24, 2, "ARCTURUS", 3, 4, PH_HI);
     big_text(88, 38, "S6", 4, 4, PH_HI);
+    cv_text(158, 54, &FONT_S, "V" WT_VERSION, PH_MID);
     cv_rect(16, 74, 208, 2, PH_MID);
-    boot_line(80, "Waveform Animation System " WT_VERSION, PH_MID);
-    boot_line(98, "by zeptosecond DSP", PH_MID);
-    boot_line(116, "Written by machine", PH_LO);
-    boot_line(132, "with human guidance", PH_LO);
+    boot_line(82, "Waveform Animation System", PH_MID);
+    {                                           /* (C) 1980: the font has no copyright sign, so it is drawn here */
+        static const uint8_t COPY[8] = {0x3C, 0x42, 0x99, 0x85, 0x85, 0x99, 0x42, 0x3C};   /* bit 0 = left */
+        const char *t = "  1980 Zeptosecond DSP";
+        int32_t x = (240 - text_w(&FONT_S, t)) / 2, y = 100;
+        uint32_t r, k;
+        cv_text(x, y, &FONT_S, t, PH_MID);
+        for (r = 0; r < 8u; r++)                /* double height, as the font is */
+            for (k = 0; k < 8u; k++)
+                if (COPY[r] >> k & 1u) cv_rect(x + (int32_t)k, y + (int32_t)r * 2, 1, 2, PH_MID);
+    }
+    boot_line(118, "Vibe coding the future!", PH_LO);
     for (i = 0; i < 3u && i < step; i++) cv_text(36, 152 + (int32_t)i * 16, &FONT_S, LINE[i], PH_MID);
     if (step >= 6u) cv_text(36, 200, &FONT_S, "READY", PH_HI);
     else if (step & 1u) cv_text(36, 200, &FONT_S, "SYSTEM LOADING _", PH_LO);
