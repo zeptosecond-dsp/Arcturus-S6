@@ -118,6 +118,8 @@ static volatile int32_t ssg_out[NSSG], ssg_held[NSSG];   /* +-32767 */
 static uint8_t ssg_gate_prev[NSSG];
 static volatile uint8_t ssg_tap[NSSG];          /* PLAY (and SEL + PLAY) on page 5: a count of taps, by hand */
 static uint8_t ssg_tap_seen[NSSG];
+static volatile uint8_t eng_half;               /* 1: the voices at 22.05 kHz, each sample held twice */
+static volatile uint8_t ssg_gate_v[NSSG], ssg_fire_n[NSSG];   /* for page 5: the gate, a count of samples */
 static volatile uint8_t ssg_fired[NSSG];        /* set at each sample, cleared by the screen */
 static uint32_t noise_s = 0x6D2B79F5u;
 static volatile uint8_t q_rate;
@@ -237,7 +239,11 @@ static void render(int32_t *out)                /* SUB frames */
     uint32_t inc[NO];
     const int8_t *tab[NO];
     uint32_t step[NO];
-    int32_t vin[SUB], sendg[NO], dsendg[NO], dinb[SUB], fsendg[NO], finb[SUB];
+    int32_t vin[SUB], sendg[NO], dsendg[NO], dinb[SUB], fsendg[NO], finb[SUB], hcc[NO];
+    const int32_t qm = eng_mask, qv = eng_mask >> 2;   /* the word length: on the bus, and on a voice (~1/4 scale) */
+    const int32_t qh = (int32_t)(((uint32_t)~qm + 1u) >> 1), qvh = (int32_t)(((uint32_t)~qv + 1u) >> 1);   /* (rounding) */
+    const uint32_t half = eng_half;
+    int32_t hold_l = 0, hold_r = 0;
     verb_mod_t vm;
 
     for (k = 0; k < NFG; k++) src[k] = fg_out[k];   /* every source as it stood a step ago */
@@ -302,8 +308,10 @@ static void render(int32_t *out)                /* SUB frames */
                 } else
                     ssg_held[k] = src[in - 1u];
                 ssg_fired[k] = 1;
+                ssg_fire_n[k]++;
             }
             ssg_gate_prev[k] = (uint8_t)gt;
+            ssg_gate_v[k] = (uint8_t)gt;
             t = ssg_held[k];
             sk = (uint32_t)cl(ssgp[k].slew + (acc[D_SSG(k)] >> 8), 0, 127);
             if (sk == 0u) o = t;                /* no slew: a hard step */
@@ -351,7 +359,7 @@ static void render(int32_t *out)                /* SUB frames */
             }
             if (qg_cnt[o]) qg_cnt[o]--;
             q_pitch_v[o] = pq;
-            inc[o] = pitch_inc(pq + p->fine_q8);
+            inc[o] = pitch_inc(pq + p->fine_q8) << half;   /* (at 22 kHz: twice the step, every other frame) */
         }
         target = (cl(p->pos * 256 + a[P_WAVE], 0, 127 * 256) * 127) >> 8;   /* -> Q8 waves, 0..63 */
         dpos = target - ost[o].posq;
@@ -362,6 +370,10 @@ static void render(int32_t *out)                /* SUB frames */
         fg_t[o] = 4096 + ((cl(p->thr * 256 + a[P_THR], 0, 127 * 256) * 224) >> 8);   /* threshold, Q15 */
         fg_mk[o] = (int32_t)((32767u << 12) / (uint32_t)fg_t[o]);         /* make-up gain, Q12 */
         hc[o] = cl(p->hicut + (a[P_HICUT] >> 8), 0, 127);
+        {                                   /* at 22 kHz the one-poles run half as often: the same cutoff */
+            int32_t c = LUT_HICUT[hc[o]];
+            hcc[o] = half ? cl(2 * c - ((c * c) >> 15), 0, 32767) : c;
+        }
         amp_t[o] = LUT_LEVEL[cl(p->level + (a[P_LEVEL] >> 8), 0, 127)];
         amp_d[o] = (amp_t[o] - ost[o].amp) >> 5;                            /* a ramp over the SUB frames */
         k = (uint32_t)cl(p->pan + (a[P_PAN] >> 8), 0, 127);
@@ -372,6 +384,12 @@ static void render(int32_t *out)                /* SUB frames */
     for (i = 0; i < SUB; i++) {
         int32_t l = 0, r = 0, prev0 = ost[0].last, prev1 = ost[1].last;    /* 1 and 2 hear each other a sample late */
         int32_t snd = 0, dsnd = 0, fsnd = 0;
+        if (half && (i & 1u)) {                 /* 22 kHz: the frame before, again (no smoothing: the images stay) */
+            out[2u * i] += hold_l;
+            out[2u * i + 1u] += hold_r;
+            vin[i] = vin[i - 1u]; dinb[i] = dinb[i - 1u]; finb[i] = finb[i - 1u];
+            continue;
+        }
         for (o = 0; o < NO; o++) {
             osc_st_t *s = &ost[o];
             uint32_t ph, idx, w, frac;
@@ -386,18 +404,18 @@ static void render(int32_t *out)                /* SUB frames */
             else { w = (uint32_t)s->posq >> 8; frac = (uint32_t)s->posq & 255u; }
             w0 = tab[o] + w * WT_SAMPLES;
             w1 = w + 1u < WT_WAVES ? w0 + WT_SAMPLES : w0;
-            x = (int32_t)w0[idx] * (int32_t)(256u - frac) + (int32_t)w1[idx] * (int32_t)frac;   /* +-32512 */
+            x = ((int32_t)w0[idx] * (int32_t)(256u - frac) + (int32_t)w1[idx] * (int32_t)frac + qh) & qm;   /* +-32512 */
             if (o >= 2u) {                       /* the wavefolder */
                 int32_t y = (x * fg_g[o]) >> 8, t = fg_t[o], n;
                 for (n = 0; n < 24 && (y > t || y < -t); n++)
                     y = y > t ? 2 * t - y : -2 * t - y;
-                x = (y * fg_mk[o]) >> 12;
+                x = (((y * fg_mk[o]) >> 12) + qh) & qm;
             }
             s->last = x;
             if (hc[o] < 127) {                   /* the hi cut: two one-poles, 12 dB */
-                int32_t c = LUT_HICUT[hc[o]];
-                s->lp1 += ((x - s->lp1) * c) >> 15;
-                s->lp2 += ((s->lp1 - s->lp2) * c) >> 15;
+                int32_t c = hcc[o];
+                s->lp1 = (s->lp1 + (((x - s->lp1) * c) >> 15) + qh) & qm;   /* (short words: the state too) */
+                s->lp2 = (s->lp2 + (((s->lp1 - s->lp2) * c) >> 15) + qh) & qm;
                 x = s->lp2;
             }
             if (o == scope_osc && scope_req) {  /* the scope: from the start of a cycle */
@@ -410,19 +428,21 @@ static void render(int32_t *out)                /* SUB frames */
                     }
                 }
             }
-            s->amp += amp_d[o];
-            v = (x * s->amp) >> 15;              /* <= 10000 */
+            s->amp += amp_d[o] << half;
+            v = (((x * s->amp) >> 15) + qvh) & qv;       /* <= 10000 */
             snd += (v * sendg[o]) >> 7;          /* the sends, before the pan */
             dsnd += (v * dsendg[o]) >> 7;
             fsnd += (v * fsendg[o]) >> 7;
             l += (v * pl[o]) >> 15;
             r += (v * pr[o]) >> 15;
         }
-        out[2u * i] += l;
-        out[2u * i + 1u] += r;
-        vin[i] = snd;
-        dinb[i] = dsnd;
-        finb[i] = fsnd;
+        hold_l = (l + qh) & qm;
+        hold_r = (r + qh) & qm;
+        out[2u * i] += hold_l;
+        out[2u * i + 1u] += hold_r;
+        vin[i] = (snd + qh) & qm;
+        dinb[i] = (dsnd + qh) & qm;
+        finb[i] = (fsnd + qh) & qm;
     }
     for (o = 0; o < NO; o++) ost[o].amp = amp_t[o];
     vm.size = 0; vm.decay = acc[D_VERB(1)]; vm.damp = 0;   /* (size and damp are off the matrix now) */
@@ -443,7 +463,7 @@ static void render(int32_t *out)                /* SUB frames */
             else if (fx == 1u) {                /* the delay, frame by frame */
                 uint32_t dinc = LUT_DINC[cl(dlp.time + (acc[D_VERB(0)] >> 8), 0, 127)];   /* (on the matrix: DL TIME) */
                 int32_t fbg = cl(dlp.fb + (acc[D_VERB(2)] >> 8), 0, 127) * (DL_FB_MAX / 127), ret = (int32_t)dlp.ret * dlp.ret * 2;
-                int32_t mask = ~((1 << (dlp.crush > 10u ? 10u : dlp.crush)) - 1);
+                int32_t mask = ~((1 << (dlp.crush > 10u ? 10u : dlp.crush)) - 1) & qm;
                 int32_t lpc = (int32_t)cl((int32_t)(dinc >> 16), 600, 32767);   /* the cutoff follows the clock */
                 for (i = 0; i < SUB; i++) {
                     int32_t y = dl_frame(x[i], dinc, fbg, mask, lpc), w = (y * ret) >> 15;
@@ -455,6 +475,7 @@ static void render(int32_t *out)                /* SUB frames */
             } else verb_run(x, out, SUB, &vm, wet);
         }
     }
+    for (i = 0; i < 2u * SUB; i++) out[i] = (out[i] + qh) & qm;   /* and out, in short words */
 }
 
 static void app_audio(int32_t *out, uint32_t n)
@@ -481,11 +502,11 @@ static void app_audio(int32_t *out, uint32_t n)
 
 /* ================================================================== the patch (main loop) */
 typedef struct { uint8_t note; int8_t fine; uint8_t pos, mod, thr, hicut, level, pan; } patch_t;
-static patch_t opatch[NO] = {                   /* a drone to start from: C2, G2, C3, G3 */
-    {36,  0, 20, 20,   0,  90, 100,  40},
-    {43,  4, 50, 10,   0,  80,  85,  88},
-    {48, -3, 10, 30,  90,  70,  80,  20},
-    {55,  2, 64, 15, 110,  60,  70, 107},
+static patch_t opatch[NO] = {                   /* INIT: four sines in fifths (C2 G2 D3 A3), open, nothing patched */
+    {36, 0, 0, 0, 0, 127, 90, 40},
+    {43, 0, 0, 0, 0, 127, 90, 88},
+    {50, 0, 0, 0, 0, 127, 90, 24},
+    {57, 0, 0, 0, 0, 127, 90, 104},
 };
 typedef struct { uint8_t rise, fall, curve, mode; } fgpatch_t;
 static fgpatch_t fgpatch[NFG] = {               /* four cycling, two waiting for a gate */
@@ -759,6 +780,7 @@ static int patch_load(uint32_t slot)            /* 0 = the default */
         for (o = 0; o < NO; o++) { otab[o] = oscan[o] = 0; oq[o].on = oq[o].glide = 0; }
         tunpatch.tun = 0; tunpatch.scl = 1; tunpatch.root = 0;
         vpatch = V_DEFAULT;
+        for (o = 0; o < NO; o++) vpatch.send[o] = 0;   /* (INIT: dry; the reverb ready for a send) */
         dpatch = D_OFF;
         fpatch = F_OFF;
         rpatch = R_DEFAULT;
@@ -1040,8 +1062,9 @@ static const uint8_t PHOS_K[NPHOS][7][4] = {    /* intensity, r, g, b: each phos
     {{0, 0, 0, 0}, {20, 15, 16, 19}, {60, 54, 57, 64}, {110, 106, 110, 120}, {170, 176, 180, 192}, {230, 234, 238, 246},
      {255, 255, 255, 255}},
 };
-typedef struct { uint32_t boots; uint8_t phos, bright, pad[2]; } settings_t;
-static settings_t gset = {0, 0, 7, {0, 0}};
+typedef struct { uint32_t boots; uint8_t phos, bright, eng, pad; } settings_t;   /* eng: bit 0 8-bit, bit 1 22 kHz */
+static settings_t gset = {0, 0, 7, 0, 0};
+static void push_eng(void) { eng_mask = gset.eng & 1u ? ~255 : ~15; eng_half = (uint8_t)(gset.eng >> 1 & 1u); }
 static uint16_t CRT_TF[257];                    /* the light's gain over the radius: 256 in the middle .. 0 the corners */
 
 static void settings_store(void)                /* the VDU settings to flash, faded as a patch save */
@@ -1113,7 +1136,8 @@ static void cv_out(uint32_t y0)                 /* the canvas (240 wide) through
     cv_blit(0, y0);
 }
 
-static uint32_t gsub;                           /* page 9: 0 the tuning, 1 the VDU (OCT- / OCT+) */
+static uint32_t gsub;                           /* page 9: 0 TUNING, 1 ENGINE, 2 VDU (OCT- / OCT+) */
+static const char *const GSUB_NAME[3] = {": TUNING", ": ENGINE", ": VDU"};
 static uint32_t fxsub;                          /* the FX page: 0 REVERB, 1 DELAY, 2 FLANGER, 3 ROUTING */
 #define NFXSUB 4u
 static const char *const FXSUB_NAME[NFXSUB] = {": REVERB", ": DELAY", ": FLANGER", ": ROUTING"};
@@ -1163,6 +1187,7 @@ static uint32_t batt_bars(void)                 /* 0..3 */
     return b >= 67 ? 3u : b >= 34 ? 2u : b >= 10 ? 1u : 0u;
 }
 
+static const char *hmsg = "";                   /* a word in the header in place of the page's name, a moment */
 static void draw_header(uint32_t pg)
 {
     char s[40] = "PAGE ";
@@ -1170,7 +1195,8 @@ static void draw_header(uint32_t pg)
     s_cat(s, "  ");
     s_cat(s, PG_NAME[pg]);
     if (pg == PG_VERB) s_cat(s, FXSUB_NAME[fxsub % NFXSUB]);
-    if (pg == PG_GLOBAL) s_cat(s, gsub ? ": VDU" : ": TUNING");
+    if (pg == PG_GLOBAL) s_cat(s, GSUB_NAME[gsub % 3u]);
+    if (*hmsg) { s[0] = 0; s_cat(s, hmsg); }   /* (a message: in place of all of it) */
     cv_begin(240, BODY_Y, PH_BG);
     cv_text(4, 2, &FONT_S, s, PH_HI);
     {                                           /* the battery, top right: three bars (on USB: filling, charging) */
@@ -1299,6 +1325,7 @@ static void draw_scope(uint32_t sel)
     cv_out(BODY_Y);
     if (scope_done || !scope_req || scope_osc != sel) {   /* the next capture: two cycles (as much as fits) */
         uint32_t per = inc ? 0xFFFFFFFFu / inc : SCOPE_MAX;
+        if (eng_half) per = per / 2u + 1u;      /* (22 kHz: half the samples a cycle) */
         scope_req = 0;
         scope_dec = per * 2u / SCOPE_MAX + 1u;   /* low notes: every dec-th sample, two cycles always */
         scope_len = per * 2u / scope_dec;
@@ -1576,6 +1603,8 @@ static void draw_gmat(uint32_t cc, uint32_t cr, uint32_t top, uint32_t left)
 }
 
 /* ---- page 5: the SSGs and the quad LFO */
+static uint32_t ssg_t_fire[NSSG];               /* when each last sampled (the main loop's clock) */
+static uint8_t shist_f[NSSG][HIST], ssg_fire_seen[NSSG], ssg_fire_acc[NSSG];   /* the samples, along the trace */
 static int16_t shist[NSSG][HIST];               /* the SSGs' outputs, one every 20 ms */
 static uint32_t shead;
 static void s_secs(char *s, uint32_t cs)        /* 1/100 s -> "12.5S" or "120S" */
@@ -1605,7 +1634,18 @@ static void draw_sh(void)
         s_cat(s, "SLEW ");
         if (shpatch.slew[k]) s_int(s, shpatch.slew[k], 0); else s_cat(s, "OFF");
         cv_text(236 - text_w(&FONT_S, s), y0 + 2, &FONT_S, s, PH_MID);
+        {                                       /* the lamps: the gate (live), and SAMPLE (lit a moment each time) */
+            uint32_t gt = ssg_gate_v[k], sm = fm1_ms - ssg_t_fire[k] < 150u;
+            cv_rect(4, y0 + 24, 9, 9, gt ? PH_HI : PH_LO);
+            if (!gt) cv_rect(5, y0 + 25, 7, 7, PH_BG);
+            cv_text(16, y0 + 20, &FONT_S, "GT", gt ? PH_MID : PH_LO);
+            cv_rect(4, y0 + 42, 9, 9, sm ? PH_HI : PH_LO);
+            if (!sm) cv_rect(5, y0 + 43, 7, 7, PH_BG);
+            cv_text(16, y0 + 38, &FONT_S, "SH", sm ? PH_MID : PH_LO);
+        }
         cv_rect(40, mid, 196, 1, PH_LO);
+        for (i = 0; i < HIST; i++)              /* each sample, a tick along the trace */
+            if (shist_f[k][(shead + i) % HIST]) cv_rect(40 + (int32_t)i, y0 + 20, 1, 4, PH_MID);
         for (i = 0; i < HIST; i++) {            /* the output, oldest on the left */
             int32_t y = mid - ((int32_t)shist[k][(shead + i) % HIST] * 19 >> 15);
             if (i) cv_line(40 + (int32_t)i - 1, py, 40 + (int32_t)i, y, i + 1u == HIST ? PH_HI : PH_MID);
@@ -1663,6 +1703,27 @@ static void draw_vdu(void)                      /* page 9's other half: the phos
     for (i = 0; i < 192u; i++)                  /* a sine sweep, bright */
         cv_pset(24 + (int32_t)i, 160 - ((sine(i * 0x05555555u) * 14) >> 15), PH_HI);
     cv_text(2, 200, &FONT_S, "K1 PHOSPHOR  K2 BRIGHTNESS", PH_LO);
+    cv_out(BODY_Y);
+}
+
+static void draw_engine(void)                   /* page 9's middle: the engine's word length and rate */
+{
+    uint32_t b8 = gset.eng & 1u, h = gset.eng >> 1 & 1u, i;
+    int32_t px = h ? 12 : 6, lv = b8 ? 4 : 12, cy = 128, amp = 56, prev = 0;
+    cv_begin(240, BODY_H, PH_BG);
+    cv_text(4, 2, &FONT_S, "WORD", PH_LO);  cv_text(68, 2, &FONT_S, b8 ? "8 BIT" : "12 BIT", PH_HI);
+    cv_text(4, 20, &FONT_S, "RATE", PH_LO); cv_text(68, 20, &FONT_S, h ? "22.05 KHZ" : "44.1 KHZ", PH_HI);
+    cv_rect(0, 40, 240, 1, PH_LO);
+    for (i = 0; i < 224u; i++)                  /* a cycle and a bit, smooth, dim */
+        cv_pset(8 + (int32_t)i, cy - ((sine(i * 0x01600000u) * amp) >> 15), PH_LO);
+    for (i = 0; i < 224u; i += (uint32_t)px) {  /* and as the engine has it: held samples, stepped levels */
+        int32_t v = (sine(i * 0x01600000u) * lv) >> 15, y = cy - v * amp / lv, w = (int32_t)i + px > 224 ? 224 - (int32_t)i : px;
+        if (i) cv_rect(8 + (int32_t)i, prev < y ? prev : y, 1, (prev < y ? y - prev : prev - y) + 1, PH_HI);
+        cv_rect(8 + (int32_t)i, y, w, 1, PH_HI);
+        prev = y;
+    }
+    cv_text(4, 182, &FONT_S, "FOR EVERY PATCH  (SAVED)", PH_LO);
+    cv_text(4, 200, &FONT_S, "K1 WORD  K2 RATE", PH_LO);
     cv_out(BODY_Y);
 }
 
@@ -1969,7 +2030,7 @@ static void draw_patch(uint32_t cur, uint32_t confirm, const char *msg)
         int32_t row = i == 0u || i == P_RANDOM ? 0 : (int32_t)((i - 1u) % 8u) + 1;
         int32_t x = 4 + col * 120, y = 4 + row * 18;
         char s[24] = "";
-        if (i == 0u) s_cat(s, "DEFAULT");
+        if (i == 0u) s_cat(s, "INIT");
         else if (i == P_RANDOM) s_cat(s, "RANDOM");
         else {
             if (i < 10u) s_cat(s, "0");
@@ -1990,6 +2051,7 @@ static void draw_patch(uint32_t cur, uint32_t confirm, const char *msg)
 static void app_main(void)
 {
     uint32_t o, k, sel = 0, fsel = 0, prev = 0, page = PG_INDEX, icur = PG_OSC, mcs = 0, mcr = 0, mtop = 0, mleft = 0;
+    uint32_t rk_prev = 0, rk_arm = 0, t_hmsg = 0;
     uint32_t dirty = 1, hdr_dirty = 1, batt_shown = 0xFFFFu, t_batt = 0, t_banim = 0, t_live = 0, pcur = 1, pconf = PC_NONE, t_msg = 0;
     const char *pmsg = "";
     uint32_t gsel = 0, gcc = 0, gcr = 0, gtop = 0, gleft = 0, t_hist = 0, qsel = 0, vsel = 0, vdu_dirty = 0, t_vdu = 0;
@@ -1999,6 +2061,8 @@ static void app_main(void)
     if (settings_load(&gset, sizeof gset)) { gset.boots = 0; gset.phos = 0; gset.bright = 7; }   /* (none yet) */
     if (gset.phos >= NPHOS) gset.phos = 0;
     if (gset.bright > 10u) gset.bright = 7;
+    gset.eng &= 3u;
+    push_eng();
     crt_init();
     batt_poll();                                /* (a first reading, so the header has one from the start) */
     draw_boot(0);
@@ -2012,11 +2076,6 @@ static void app_main(void)
     verb_init();
     { uint32_t i; for (i = 0; i < FL_N; i++) fl_buf[0][i] = fl_buf[1][i] = 0; for (i = 0; i < DL_N; i++) dl_buf[i] = 0; }
 
-    depth[0][0 * NP + P_WAVE] = 40;             /* a few pins to hear the FGs at once */
-    depth[1][2 * NP + P_MOD] = 30;
-    depth[2][3 * NP + P_PAN] = 45;
-    depth[2][1 * NP + P_MOD] = 20;
-    depth[3][D_FG(0, 0)] = 20;                  /* FG4 bends FG1's rise: feedback */
     for (o = 0; o < NO; o++) def_osc[o] = opatch[o];   /* the built-in default, for slot 0 */
     for (k = 0; k < NFG; k++) def_fg[k] = fgpatch[k];
     for (k = 0; k < NSRC; k++)
@@ -2045,6 +2104,12 @@ static void app_main(void)
         int shift, play;
         platform_poll();
         midi_poll();
+        for (k = 0; k < NSSG; k++)              /* the SSGs: a sample since we looked? */
+            if (ssg_fire_n[k] != ssg_fire_seen[k]) {
+                ssg_fire_seen[k] = ssg_fire_n[k];
+                ssg_t_fire[k] = fm1_ms;
+                ssg_fire_acc[k] = 1;
+            }
         if (fm1_ms - t_hist >= 10u) {           /* the logic analyser's next sample */
             t_hist = fm1_ms;
             for (k = 0; k < NGG; k++) ghist[k][ghead] = gg_bits[k];
@@ -2052,7 +2117,11 @@ static void app_main(void)
             vhead = (vhead + 1u) % HIST;
             ghead = (ghead + 1u) % HIST;
             if (ghead & 1u) {                   /* the SSGs' trace: every 20 ms */
-                for (k = 0; k < NSSG; k++) shist[k][shead] = (int16_t)ssg_out[k];
+                for (k = 0; k < NSSG; k++) {
+                    shist[k][shead] = (int16_t)ssg_out[k];
+                    shist_f[k][shead] = ssg_fire_acc[k];
+                    ssg_fire_acc[k] = 0;
+                }
                 shead = (shead + 1u) % HIST;
             }
         }
@@ -2084,7 +2153,7 @@ static void app_main(void)
                 else if (page == PG_FG) fsel = (fsel + NFG + (uint32_t)st) % NFG;
                 else if (page == PG_SH) ssel = (ssel + NSSG + (uint32_t)st) % NSSG;
                 else if (page == PG_GATE) gsel = (gsel + NGG + (uint32_t)st) % NGG;
-                else if (page == PG_GLOBAL) { gsub ^= 1u; hdr_dirty = 1; }   /* page 9: TUNING <-> VDU */
+                else if (page == PG_GLOBAL) { gsub = (gsub + 3u + (uint32_t)st) % 3u; hdr_dirty = 1; }
                 else if (page == PG_VERB) { fxsub = (fxsub + NFXSUB + (uint32_t)st) % NFXSUB; hdr_dirty = 1; }
             }
         }
@@ -2121,6 +2190,26 @@ static void app_main(void)
             }
             if (*pmsg && fm1_ms - t_msg > 2000u) { pmsg = ""; dirty = 1; }
         }
+        if (page != PG_OSC) {                   /* the top two keys: INIT (F#5) and RANDOM (G5), press twice */
+            uint32_t keys = fm1_in.notes, kd = keys & ~rk_prev, want = 0;
+            rk_prev = keys;
+            if (kd >> 26 & 1u) want = 2u;
+            else if (kd >> 25 & 1u) want = 1u;
+            if (want && rk_arm == want) {
+                patch_load(want == 2u ? P_RANDOM : 0u);
+                rk_arm = 0;
+                hmsg = want == 2u ? "RANDOM PATCH ROLLED" : "INIT PATCH LOADED";
+                t_hmsg = fm1_ms;
+                dirty = hdr_dirty = 1;
+            } else if (want) {
+                rk_arm = want; t_hmsg = fm1_ms;
+                hmsg = want == 2u ? "AGAIN: RANDOM PATCH" : "AGAIN: INIT PATCH";
+                hdr_dirty = 1;
+            } else if (rk_arm && (b || (kd & ~(3u << 25)) || fm1_ms - t_hmsg > 3000u)) {   /* anything else: no */
+                rk_arm = 0; hmsg = ""; hdr_dirty = 1;
+            }
+        } else { rk_prev = fm1_in.notes; if (rk_arm) { rk_arm = 0; hmsg = ""; hdr_dirty = 1; } }
+        if (!rk_arm && *hmsg && fm1_ms - t_hmsg > 1500u) { hmsg = ""; hdr_dirty = 1; }
         if (newpage != page) { page = newpage; pconf = PC_NONE; pmsg = ""; dirty = hdr_dirty = 1; }
 
         for (k = 0; k < NFG; k++)               /* PLAY held on the FG page: the selected FG's gate */
@@ -2251,6 +2340,11 @@ static void app_main(void)
             if ((e = fm1_enc_take(ENC_PRESETS)) != 0) { vpatch.rate = e > 0; ch = 1; }
             if (b & (1u << BTN_PLAY)) { vpatch.freeze ^= 1u; ch = 1; }
             if (ch) { push_verb(); dirty = 1; }
+        } else if (page == PG_GLOBAL && gsub == 1u) {   /* the engine: applied at once, saved like the VDU */
+            int ch = 0;
+            if ((e = fm1_enc_take(ENC_KNOB1)) != 0) { gset.eng = (uint8_t)((gset.eng & ~1u) | (e > 0 ? 1u : 0u)); ch = 1; }
+            if ((e = fm1_enc_take(ENC_KNOB2)) != 0) { gset.eng = (uint8_t)((gset.eng & ~2u) | (e > 0 ? 2u : 0u)); ch = 1; }
+            if (ch) { push_eng(); dirty = 1; vdu_dirty = 1; t_vdu = fm1_ms; }
         } else if (page == PG_GLOBAL && gsub) {  /* the VDU: applied at once, saved 2 s after the last turn */
             int ch = 0;
             if ((e = fm1_enc_take(ENC_KNOB1)) != 0) { gset.phos = (uint8_t)cl(gset.phos + (e > 0 ? 1 : -1), 0, NPHOS - 1); ch = 1; }
@@ -2355,6 +2449,11 @@ static void app_main(void)
                 on = wi >= 0 && (uint32_t)wi == pos;
                 glow = wi >= 0 && (uint32_t)wi < pos;
             }
+            if (page != PG_OSC && k >= 25u) {    /* INIT, RANDOM: flashing; quick when it waits for the second press */
+                uint32_t arm = rk_arm == (k == 26u ? 2u : 1u);
+                on = arm ? (fm1_ms / 80u) & 1u : (fm1_ms / 500u) & 1u;
+                glow = 0;
+            }
             fm1_led_key(KEY_LED(k), on);
             if (!on) fm1_led_key_glow(KEY_LED(k), glow);
         }
@@ -2416,7 +2515,7 @@ static void app_main(void)
             case PG_PATCH: draw_patch(pcur, pconf, pmsg); break;
             case PG_GATE: draw_gg(gsel); break;
             case PG_SH: draw_sh(); break;
-            case PG_GLOBAL: if (gsub) draw_vdu(); else draw_global(qsel); break;
+            case PG_GLOBAL: if (gsub == 2u) draw_vdu(); else if (gsub) draw_engine(); else draw_global(qsel); break;
             case PG_VERB:
                 if (fxsub == 1u) draw_delay(vsel, shift);
                 else if (fxsub == 2u) draw_flanger(vsel, shift);

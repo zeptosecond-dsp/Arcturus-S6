@@ -34,6 +34,7 @@ typedef struct {                                /* set by the main loop (knob un
 static verb_par_t vp;
 static volatile int32_t v_level;                /* the return's level now, for the screen */
 static volatile uint32_t v_gate_freeze;         /* the gate matrix's FREEZE */
+static volatile int32_t eng_mask = ~15;         /* the engine's word length: ~15 = 12 bits, ~255 = 8 (on 16) */
 static volatile uint32_t v_ready;               /* set by verb_init: the audio interrupt runs before app_main does */
 static int32_t v_damp_l, v_damp_r, v_bw, v_last_l, v_last_r, v_out_l, v_out_r, v_fb;
 static uint32_t v_lfo, v_phase;
@@ -65,9 +66,14 @@ static inline __attribute__((always_inline)) int32_t vread(const vline_t *l, uin
     if (i >= l->len) i -= l->len;
     return l->b[i];
 }
+static inline __attribute__((always_inline)) int16_t qr16(int32_t v, int32_t mask)   /* to 16 bits, then to the mask's */
+{
+    int32_t h = (int32_t)(((uint32_t)~mask + 1u) >> 1);   /* half a step: rounded, not chopped (no DC creeping in) */
+    return (int16_t)(sat16(v + h) & mask);
+}
 static inline __attribute__((always_inline)) void vwrite(vline_t *l, int32_t v, int32_t mask)
 {
-    l->b[l->w] = (int16_t)(sat16(v) & mask);    /* (the crush: the low bits gone) */
+    l->b[l->w] = qr16(v, mask);                 /* (the crush: to fewer bits, rounded) */
     if (++l->w >= l->len) l->w = 0;
 }
 static inline __attribute__((always_inline)) int32_t vallpass(vline_t *l, uint32_t d, int32_t g, int32_t x, int32_t mask)   /* g Q15 */
@@ -115,7 +121,7 @@ static void verb_run(const int32_t *in, int32_t *out, uint32_t n, const verb_mod
     int32_t ret = ret_k * ret_k * 2;            /* the return, squared: 0 .. ~1.0 */
     int32_t fbg = frz ? 0 : fb_k * (FB_MAX / 127);   /* linear: the tail thickens, then (near the top) rings */
     int32_t ingain = frz ? 0 : 32767;
-    int32_t mask = ~((1 << (vp.crush > 10u ? 10u : vp.crush)) - 1);   /* crush 0 .. 10 bits off */
+    int32_t mask = ~((1 << (vp.crush > 10u ? 10u : vp.crush)) - 1) & eng_mask;   /* crush 0 .. 10 bits off */
     uint32_t exc = (uint32_t)vp.mod * V_EXC * 2u;   /* the excursion, Q8 samples (0 .. 16) */
     uint32_t pre = 1u + (uint32_t)vp.pre * (V_PRE - 2u) / 127u;
     uint32_t dmapl = (V_MAPL * (uint32_t)sz >> 15), dmapr = (V_MAPR * (uint32_t)sz >> 15);
@@ -206,7 +212,7 @@ static inline __attribute__((always_inline)) int32_t dl_frame(int32_t in, uint32
     dl_in = in;
     if (ph < dl_ph || inc == 0xFFFFFFFFu) {     /* a clock tick: the oldest cell out, the input (and feedback) in */
         int32_t old = dl_buf[dl_w];
-        dl_buf[dl_w] = (int16_t)(sat16(softclip((dl_in >> 1) + ((old * fbg) >> 15))) & mask);
+        dl_buf[dl_w] = qr16(softclip((dl_in >> 1) + ((old * fbg) >> 15)), mask);
         if (++dl_w >= DL_N) dl_w = 0;
         dl_hold = old;
     }
@@ -267,8 +273,8 @@ static void fl_run(const int32_t *in, int32_t *wet, int32_t *out, uint32_t n, co
             e = (tri * span) >> 15;
             yl = fl_read(fl_buf[0], (uint32_t)cl(fl_oct(man, e), lo, hi));   /* the two taps swept apart */
             yr = fl_read(fl_buf[1], (uint32_t)cl(fl_oct(man, -e), lo, hi));
-            fl_buf[0][fl_w] = sat16(softclip((x >> 2) + ((yl * fbg) >> 15)));   /* each fed back on its own: it rings */
-            fl_buf[1][fl_w] = sat16(softclip((x >> 2) + ((yr * fbg) >> 15)));   /* (in at a quarter: room to ring) */
+            fl_buf[0][fl_w] = qr16(softclip((x >> 2) + ((yl * fbg) >> 15)), eng_mask);   /* each fed back on its own: it rings */
+            fl_buf[1][fl_w] = qr16(softclip((x >> 2) + ((yr * fbg) >> 15)), eng_mask);   /* (in at a quarter: room to ring) */
             if (++fl_w >= FL_N) fl_w = 0;
             fl_hold_l = softclip(4 * yl);         /* the swept echo alone: it combs against the dry voices */
             fl_hold_r = softclip(4 * yr);         /* in the main mix, so the notches go all the way down */
