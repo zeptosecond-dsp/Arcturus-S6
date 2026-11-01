@@ -1,22 +1,16 @@
-# INIT twice (F#5), the sines in fifths at 12 bit / 44.1; page 9's ENGINE half: 8 bit, 22 kHz;
-# then RANDOM twice (G5), and the S&H page: its lamps and ticks, PLAY tapped
+# INIT twice (F#5): the sines in fifths, native 12 bit / 22 kHz; the index's cursor; RANDOM twice (G5);
+# the S&H page: its lamps and ticks, PLAY tapped
 3500 keys 0x2000000
 3600 keys 0
 3700 shot
 3800 keys 0x2000000
 3900 keys 0
 4000 shot
-7000 btn 7
-7100 btn 1
-7300 shot
-8000 enc 2 1
-8100 enc 3 1
-8500 shot
+4400 shot
 12000 keys 0x4000000
 12100 keys 0
 12200 keys 0x4000000
 12300 keys 0
-12400 shot
 12500 btndown 3
 12600 btn 4
 12700 btnup 3
@@ -24,6 +18,4 @@
 13600 btn 12
 14200 btn 12
 14300 shot
-14800 btn 12
-15500 shot
 16000 end
