@@ -1,0 +1,20 @@
+# Quorum 0.3: the sequencers (page 7, SEQ), the gate matrix's new columns, a phosphor change (the header follows)
+3000 btn 11
+4000 shot
+4100 btn 1
+5500 shot
+5600 btn 1
+6500 shot
+6600 btn 3
+7000 shot
+7500 btndown 3
+7600 btn 10
+7700 btnup 3
+7800 enc 3 12
+7900 enc 2 21
+8300 shot
+9000 btn 7
+9100 btn 1
+9200 enc 2 2
+9600 shot
+10000 end

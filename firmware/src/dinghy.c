@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-only */
-/* QUORUM Cellular Synthesis System: build 0.2 (the engine, its logic and its modulation). The sister of Arcturus S6 (the
+/* QUORUM Cellular Synthesis System: build 0.4 (the engine, its logic, its modulation, its sequencers). The sister of Arcturus S6 (the
  * main branch), on Dinghy (zvenson), on the platform of Felucca (Hügelton Instruments) as SLOOP (isod89) carries it.
  *
  * 64 sine partials at 22.05 kHz (each sample held twice) and 12 bit, as S6. Two 32-cell automata switch them; two
@@ -13,16 +13,19 @@
  *   ENV    4 STRIKE     OCT: strike 1 / 2; SEL: SOUND, ENVELOPE, TRILL; ALGORITHM sum / filter; PRESETS routing; PLAY fires
  *   SEL+EDIT 5 SPLIT    OCT: SPLIT / PATH A / PATH B; K1-K4, SEL: two banks on the paths; ALGORITHM N
  *   SEL+LFO 6 LOGIC     OCT: generator 1-4: an input AND/OR/... a square LFO (free or clocked); ALGORITHM free / clock
- *   SEL+ENV 8 FUNC GEN  OCT: FG 1-4, S&H 1-2 (their gates come from the gate matrix)
+ *   SEL+ENV 8 FUNC GEN  OCT: FG 1-4, S&H 1-2 (their gates come from the gate matrix), the quadrature LFO
  *   ARP    9 MOD MATRIX K1 / SELECT the source, K2 / PRESETS the destination, K3 the depth, PLAY a pin in / out
- *   SEL+ARP X GATE MATRIX  21 gate sources x 10 destinations (the strikes, FG triggers, S&H clocks, grid steps), OR'd
+ *   SEQ    7 SEQUENCERS OCT: 1-3; bank 1 STEP (cursor) VALUE GATE LENGTH, bank 2 DIR SLEW ADDRESS (CLOCK, or a matrix
+ *                       source sweeping the steps, Serge style) CHAIN; PLAY: the step's gate
+ *   SEL+ARP X GATE MATRIX  24 gate sources x 16 destinations (the strikes, FG triggers, S&H clocks, grid steps,
+ *                       the sequencers' advance and reset), OR'd
  *   GLO    G GLOBAL     OCT: TUNING (SELECT a path, PLAY quantise, K4 glide), VDU, ENGINE (version, clock, CPU)
  *   the keys: the root (F1 .. F3); their LEDs show the cells. The top two keys (lit): strike 1 and 2 by hand, anywhere
  *
  * Rules of the road (the chip has no FPU and no libgcc): integers only, no float, no 64-bit division.
  * tests/host.c runs this file on a computer: the screen as a PNG, the sound as a WAV. */
 #define APP_NAME "QUORUM"
-#define Q_VERSION "0.3"
+#define Q_VERSION "0.4"
 static void app_idle(void);
 #define LCD_IDLE app_idle                       /* while the screen's DMA runs: the clock and MIDI keep going */
 #define CV_MAX (240u * 218u)                    /* the page body's canvas */
@@ -138,14 +141,21 @@ enum { FM_CYCLE, FM_ONCE, FM_GATE };
 #define S_SSG(k) (NFG + (k))
 #define S_POP(i) (NFG + NSSG + (i))
 #define S_GEN(g) (NFG + NSSG + 2u + (g))
-#define NSRC (NFG + NSSG + 2u + NGEN)
+#define S_QUAD(k) (NFG + NSSG + 2u + NGEN + (k))   /* the quadrature LFO: SIN+ SIN- COS+ COS- (+-) */
+#define NSEQ 3u                                 /* slew sequencers */
+#define S_SEQ(n) (NFG + NSSG + 2u + NGEN + 4u + (n))
+#define NSRC (NFG + NSSG + 2u + NGEN + 4u + NSEQ)
 enum { D_TILT, D_STR, D_LVL, D_SPLIT, D_FILTA, D_FILTB, D_PANA, D_PANB, D_PITA, D_PITB,
        D_K1PART, D_K1VEL, D_K1SHP, D_K1LVL, D_K2PART, D_K2VEL, D_K2SHP, D_K2LVL,
-       D_MUTA, D_MUTB, D_SPDA, D_SPDB, D_FG1, D_FG2, D_FG3, D_FG4, NDST };
+       D_MUTA, D_MUTB, D_SPDA, D_SPDB, D_FG1, D_FG2, D_FG3, D_FG4, D_QRATE, NDST };
 /* the gate matrix: rows (sources) and columns (destinations); pins OR'd into each column */
-enum { GS_GEN = 0, GS_LFO = 4, GS_EOC = 8, GS_QNT = 12, GS_CLK = 14, GS_POP = 19, NGS = 21 };
-enum { GD_K1, GD_K2, GD_FG1, GD_FG2, GD_FG3, GD_FG4, GD_SH1, GD_SH2, GD_GA, GD_GB, NGD };
-typedef struct { uint8_t rule, div, mut, rescue, dens, shift; } gpar_t;
+enum { GS_GEN = 0, GS_LFO = 4, GS_EOC = 8, GS_QNT = 12, GS_CLK = 14, GS_POP = 19, GS_SEQ = 21, NGS = 24 };
+enum { GD_K1, GD_K2, GD_FG1, GD_FG2, GD_FG3, GD_FG4, GD_SH1, GD_SH2, GD_GA, GD_GB,
+       GD_SQA1, GD_SQA2, GD_SQA3, GD_SQR1, GD_SQR2, GD_SQR3, NGD };   /* (16: one uint16 a row) */
+enum { SD_FWD, SD_PEND, SD_RND };
+typedef struct { uint8_t val[8], gate[8], len, dir, slew, addr, chain; } seq_t;   /* addr 0: clocked; 1..: swept by a
+                                                                                      matrix source (addr - 1) */
+typedef struct { uint8_t rule, rate, mut, rescue, dens, shift; } gpar_t;   /* rate: the grid's own clock (0..127) */
 typedef struct { uint8_t mode, part, vel, level, shape, decay, fall, series, trig, filt; } kpar_t;
 typedef struct { uint8_t mode, freq, res, bw, level, pan; int8_t coarse, fine; } ppar_t;
 typedef struct { uint8_t in, op, mode, rate, duty; } gen_t;   /* op: AND OR XOR NAND NOR XNOR, IN, LFO; mode 0 free 1 clock */
@@ -168,6 +178,9 @@ typedef struct {
     trill_t tr[2];
     int8_t dep[NSRC][NDST];                     /* the mod matrix: 0 = no pin, +-63 */
     uint16_t gmat[NGS];                         /* the gate matrix: bit d = a pin to destination d */
+    uint8_t qrate;                              /* the quadrature LFO's rate (as S6: FG speeds) */
+    uint8_t lock;                               /* 1: grid B runs on grid A's clock (lockstep) */
+    seq_t seq[NSEQ];
 } patch_t;
 /* logic sources: 0 off; 1..11 the clock and its divisions; 12..43 grid A's cells; 44..75 grid B's; 76, 77 pop > half;
  * 78..81 the generators; 82..85 the FGs' end of cycle */
@@ -176,7 +189,7 @@ typedef struct {
 #define NLS 86u
 static patch_t P = {
     33, 32, 100, 100, 1, 64, 0, GM_LOWHIGH, 2, 0,
-    {{90, 4, 3, 1, 30, 0}, {30, 2, 4, 1, 30, 0}},
+    {{90, 69, 3, 1, 30, 0}, {30, 85, 4, 1, 30, 0}},   /* grid A 1 step a second, grid B 2 */
     {{KM_STRIKE, 3, 89, 100, 64, 70, 76, SE_ALL, LS_GEN(0), 0},
      {KM_MALLET, 2, 76, 100, 44, 82, 51, SE_ALL, LS_GEN(1), 0}},
     0,
@@ -192,7 +205,12 @@ static patch_t P = {
     {{1, 8, TP_HUMP, 120}, {1, 6, TP_FALL, 110}},
     {{0}},
     {(1u << GD_K1) | (1u << GD_SH1), (1u << GD_K2) | (1u << GD_FG2), 1u << GD_FG4, 0,   /* G1: strike 1, S&H 1; G2: strike 2, FG2; G3: FG4 */
-     0, 0, 0, 0,  0, 0, 0, 0,  0, 0,  0, 0, 0, 0, 1u << GD_SH2,  0, 0},                  /* clock /16: S&H 2 */
+     0, 0, 0, 0,  0, 0, 0, 0,  0, 0,  0, 0, 1u << GD_SQA2, 0, 1u << GD_SH2,  0, 0,  0, 0, 0},
+    /* (G3, a free LFO, also advances SEQ 1 - below; clock /4 advances SEQ 2; clock /16 clocks S&H 2) */
+    50, 0,
+    {{{20, 90, 45, 110, 30, 75, 60, 127}, {1, 0, 1, 0, 1, 1, 0, 1}, 8, SD_FWD, 40, 0, 0},
+     {{0, 40, 80, 127, 90, 50, 0, 0}, {1, 0, 0, 1, 0, 0, 0, 0}, 5, SD_PEND, 90, 0, 0},
+     {{10, 60, 30, 100, 120, 70, 0, 0}, {1, 1, 1, 1, 1, 1, 0, 0}, 6, SD_FWD, 20, 1, 0}},   /* SEQ 3 swept by FG 1 */
 };
 static patch_t E;                               /* the patch as played: P with the matrix's modulation on it */
 static const char *const GM_NAME[NGM] = {"LO/HI", "ODD/EVN", "A AND B", "A OR B", "A XOR B"};
@@ -207,6 +225,9 @@ static const char *const CV_NAME[3] = {"LOG", "LIN", "EXP"};
 static const char *const FM_NAME[3] = {"CYCLE", "ONCE", "GATE"};
 static void default_pins(void)                  /* a few pins to hear the matrix at once */
 {
+    P.gmat[GS_GEN + 2] |= 1u << GD_SQA1;        /* G3 advances SEQ 1 */
+    P.dep[S_SEQ(0)][D_FILTA] = 28;              /* SEQ 1 walks path A's vowel */
+    P.dep[S_SEQ(1)][D_STR] = 10;                /* SEQ 2, slewed: a slow stretch */
     P.dep[S_FG(0)][D_SPLIT] = 24;               /* FG1's slow cycle moves the split */
     P.dep[S_FG(1)][D_TILT] = -20;               /* FG2 (on G2) darkens, then brightens */
     P.dep[S_SSG(0)][D_PITB] = 30;               /* SSG1 (noise, on G1): a melody on path B, quantised */
@@ -388,6 +409,8 @@ static void path_push(void)
 static void strike_prepare(uint32_t s);
 static volatile int32_t src_v[NSRC];            /* every matrix source now (Q15): the interrupt keeps them */
 static volatile int8_t fgmod_v[NFG];            /* the matrix on each FG's rate, knob steps */
+static volatile int8_t qmod_v;                  /* the matrix on the quad LFO's rate, knob steps */
+static volatile int32_t sq_k_v[3];              /* the sequencers' slew steps a block, Q16 */
 static int32_t macc[NDST];                      /* each destination's modulation, knob steps x 256 */
 static uint32_t any_pin;
 static uint8_t m8(uint8_t v, int32_t d, int32_t lo, int32_t hi) { return (uint8_t)cl((int32_t)v + d, lo, hi); }
@@ -422,9 +445,11 @@ static void mod_apply(void)                     /* E = P, moved by the matrix (a
         E.k[k].shape = m8(P.k[k].shape, MK(b + 2u), 0, 127);
         E.k[k].level = m8(P.k[k].level, MK(b + 3u), 0, 127);
         E.g[k].mut = m8(P.g[k].mut, MK(k ? D_MUTB : D_MUTA) / 4, 0, 50);
-        E.g[k].div = P.g[k].div ? m8(P.g[k].div, -MK(k ? D_SPDB : D_SPDA) / 8, 1, 16) : 0;   /* (0: the gate matrix steps it) */
+        E.g[k].rate = m8(P.g[k].rate, MK(k ? D_SPDB : D_SPDA), 0, 127);   /* (up: faster) */
     }
     for (k = 0; k < NFG; k++) fgmod_v[k] = (int8_t)cl(-MK(D_FG1 + k), -127, 127);   /* (up: faster) */
+    qmod_v = (int8_t)cl(MK(D_QRATE), -127, 127);
+    for (k = 0; k < NSEQ; k++) { int32_t sl = P.seq[k].slew; sq_k_v[k] = 65536 / (1 + sl * sl / 2); }   /* slew 127: ~6 s */
 #undef MK
 }
 static void push_partials(void)
@@ -562,27 +587,39 @@ static void strike_prepare(uint32_t s)
 /* ================================================================== the clock (main loop) */
 static const uint8_t DIVS[11] = {1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 32};
 static volatile uint32_t half_n;                /* half pulses since start (the interrupt's logic reads it) */
-static uint32_t gcount[2], t_half, midi_clk, gstep_seen[2];
+static uint32_t t_half, t_halfb, half_b, midi_clk, gstep_seen[2];
 static volatile uint32_t gstep_req_v[2];        /* a grid step asked for by the gate matrix */
 static volatile uint32_t dirty_partials = 1;
-static void half_tick(void)
+static const uint16_t MIDI_DIV[8] = {3, 6, 12, 24, 48, 96, 192, 384};   /* MIDI clocks a step: 1/32 .. 4 bars */
+static const char *const MIDI_DIVN[8] = {"1/32", "1/16", "1/8", "1/4", "1/2", "1 BAR", "2 BAR", "4 BAR"};
+static uint32_t gated(uint32_t i) { uint32_t r; for (r = 0; r < NGS; r++) if (P.gmat[r] >> (GD_GA + i) & 1u) return 1u; return 0u; }
+static void half_tick(void)                     /* the master clock (grid A's), half a step: the CLK rows' squares */
 {
-    uint32_t i;
     half_n++;
-    if (!(half_n & 1u))
-        for (i = 0; i < 2u; i++)
-            if (E.g[i].div && ++gcount[i] >= E.g[i].div) { gcount[i] = 0; grid_step(i); dirty_partials = 1; }
+    if (!(half_n & 1u)) {
+        if (!gated(0)) { grid_step(0); dirty_partials = 1; }
+        if (P.lock && !gated(1)) { grid_step(1); dirty_partials = 1; }
+    }
 }
-static void clock_poll(void)                    /* the clock: internal, or 3 MIDI clocks a half pulse (16ths) */
+static void clock_poll(void)                    /* grid A's clock: internal, or MIDI; grid B's: its own, or A's */
 {
     uint8_t st, d1, d2;
     uint32_t s;
     while (midi_get(&st, &d1, &d2)) {
         if (!P.clk_midi) continue;
-        if (st == 0xF8u) { if (++midi_clk >= 3u) { midi_clk = 0; half_tick(); } }
-        else if (st == 0xFAu) { midi_clk = 0; half_n = 0xFFFFFFFFu; gcount[0] = gcount[1] = 0; }
+        if (st == 0xF8u) { if (++midi_clk >= MIDI_DIV[E.g[0].rate >> 4] / 2u) { midi_clk = 0; half_tick(); } }
+        else if (st == 0xFAu) { midi_clk = 0; half_n = 0xFFFFFFFFu; }
     }
-    if (!P.clk_midi && fm1_ms - t_half >= Q_TEMPO_HMS[P.tempo]) { t_half += Q_TEMPO_HMS[P.tempo]; if (fm1_ms - t_half > 1000u) t_half = fm1_ms; half_tick(); }
+    if (!P.clk_midi && fm1_ms - t_half >= Q_GRID_HMS[E.g[0].rate]) {
+        t_half += Q_GRID_HMS[E.g[0].rate];
+        if (fm1_ms - t_half > 2000u) t_half = fm1_ms;
+        half_tick();
+    }
+    if (!P.lock && fm1_ms - t_halfb >= Q_GRID_HMS[E.g[1].rate]) {   /* grid B on its own clock */
+        t_halfb += Q_GRID_HMS[E.g[1].rate];
+        if (fm1_ms - t_halfb > 2000u) t_halfb = fm1_ms;
+        if (!(++half_b & 1u) && !gated(1)) { grid_step(1); dirty_partials = 1; }
+    }
     for (s = 0; s < 2u; s++)                    /* a gate from the matrix steps a grid */
         if (gstep_req_v[s] != gstep_seen[s]) { gstep_seen[s] = gstep_req_v[s]; grid_step(s); dirty_partials = 1; }
     for (s = 0; s < 2u; s++)                    /* a hand-held Bow / Breath lets go when its time is up */
@@ -600,9 +637,12 @@ enum { FG_IDLE, FG_RISE, FG_HOLD, FG_FALL };
 typedef struct { int32_t x; uint8_t stage, gate_prev, eoc; } fg_st_t;
 static fg_st_t fgs[NFG];
 static int32_t ssg_held[NSSG], ssg_out[NSSG];
+static uint32_t q_ph;                           /* the quadrature LFO's phase */
+
 static uint8_t ssg_prev[NSSG];
 static volatile uint32_t ssg_fired_v[NSSG];
 static uint32_t isr_rnd = 0x1234567u;
+static volatile uint32_t sq_gate_v;
 static uint32_t lsrc(uint32_t id)               /* a logic source now (also read by the main loop, for the lamps) */
 {
     if (id == 0u) return 0u;
@@ -675,6 +715,54 @@ static int32_t trill_vel(uint32_t s, uint32_t i, uint32_t n)   /* hit i of n: be
     }
     return lo + (hi - lo) * f / 256;
 }
+/* the slew sequencers: CLOCKED (an advance gate from the matrix, or the one before wrapping when chained; a reset gate
+ * back to step 1) or SWEPT (a matrix source picks the step: low = step 1, high = the last, as a Serge sequencer under
+ * an FG). Entering a step whose gate is on fires a short gate (to the gate matrix). The output glides at SLEW. */
+static uint32_t sq_step[NSEQ], sq_dir[NSEQ], sq_adv_prev, sq_rst_prev, sq_wrap, sq_pulse[NSEQ];
+static int32_t sq_out[NSEQ];
+static volatile uint32_t sq_step_v[NSEQ];       /* for the screens */
+
+static void seq_enter(uint32_t n, uint32_t st)
+{
+    if (P.seq[n].gate[st & 7u]) sq_pulse[n] = 7;   /* (~5 ms) */
+    sq_step[n] = st & 7u;
+}
+static void seq_block(void)
+{
+    uint32_t n, wraps = 0, adv = gdst_v >> GD_SQA1 & 7u, rst = gdst_v >> GD_SQR1 & 7u, gates = 0;
+    for (n = 0; n < NSEQ; n++) {
+        const seq_t *q = &P.seq[n];
+        uint32_t len = q->len < 1u ? 1u : q->len > 8u ? 8u : q->len, cur = sq_step[n] >= len ? 0u : sq_step[n];
+        if (q->addr) {                          /* swept: the source's level picks the step */
+            uint32_t k = q->addr - 1u, st;
+            int32_t v = k < NSRC ? src_v[k] : 0;
+            if (k >= NFG && k < NFG + NSSG) v = (v + 32768) >> 1;   /* (the bipolar ones lifted: S&H, quad) */
+            if (k >= S_QUAD(0) && k < S_QUAD(0) + 4u) v = (v + 32768) >> 1;
+            st = (uint32_t)cl(v, 0, 32767) * len >> 15;
+            if (st >= len) st = len - 1u;
+            if (st != cur) seq_enter(n, st);
+            else sq_step[n] = cur;
+        } else {
+            uint32_t go = ((adv >> n & 1u) && !(sq_adv_prev >> n & 1u)) || (q->chain && n && (sq_wrap >> (n - 1u) & 1u));
+            if ((rst >> n & 1u) && !(sq_rst_prev >> n & 1u)) seq_enter(n, 0);
+            else if (go) {
+                uint32_t nx;
+                if (q->dir == SD_RND) { isr_rnd ^= isr_rnd << 13; isr_rnd ^= isr_rnd >> 17; isr_rnd ^= isr_rnd << 5; nx = (isr_rnd >> 16) % len; }
+                else if (q->dir == SD_PEND) {
+                    if (len < 2u) nx = 0;
+                    else { if (sq_dir[n]) { nx = cur ? cur - 1u : 1u; if (!nx) sq_dir[n] = 0; } else { nx = cur + 1u >= len ? len - 2u : cur + 1u; if (nx == len - 1u) sq_dir[n] = 1; } }
+                    if (nx == 0u) wraps |= 1u << n;
+                } else { nx = cur + 1u >= len ? 0u : cur + 1u; if (!nx) wraps |= 1u << n; }
+                seq_enter(n, nx);
+            }
+        }
+        sq_out[n] += (int32_t)(((int64_t)((int32_t)P.seq[n].val[sq_step[n]] * 258 - sq_out[n]) * sq_k_v[n]) >> 16);
+        src_v[S_SEQ(n)] = sq_out[n];
+        if (sq_pulse[n]) { sq_pulse[n]--; gates |= 1u << n; }
+        sq_step_v[n] = sq_step[n];
+    }
+    sq_adv_prev = adv; sq_rst_prev = rst; sq_wrap = wraps; sq_gate_v = gates;
+}
 static void logic_block(void)                   /* once a block (1378 Hz): generators, FGs, SSGs, strikes */
 {
     uint32_t g, k, s, outs = 0, ins = 0, lfos = 0;
@@ -696,11 +784,13 @@ static void logic_block(void)                   /* once a block (1378 Hz): gener
         for (k = 0; k < 2u; k++) { if (qpulse_v[k]) { qpulse_v[k]--; gs |= 1u << (GS_QNT + k); } }
         for (k = 0; k < 5u; k++) gs |= (uint32_t)((half_n / CD[k]) % 2u == 0u) << (GS_CLK + k);
         for (k = 0; k < 2u; k++) gs |= (uint32_t)(popc(G[k].row) > NC / 2u) << (GS_POP + k);
+        gs |= sq_gate_v << GS_SEQ;              /* (the sequencers' step gates, as they were a block ago) */
         for (r = 0; r < NGS; r++) if (gs >> r & 1u) gd |= P.gmat[r];
         for (k = 0; k < 2u; k++) if ((gd >> (GD_GA + k) & 1u) && !(gdst_v >> (GD_GA + k) & 1u)) gstep_req_v[k]++;
         gsrc_v = gs; gdst_v = gd;
     }
     for (k = 0; k < NFG; k++) fg_step(k, gdst_v >> (GD_FG1 + k) & 1u);
+    seq_block();
     for (k = 0; k < NSSG; k++) {                /* sample on the clock's rise; glide to it at SLEW */
         uint32_t c = gdst_v >> (GD_SH1 + k) & 1u;
         if (c && !ssg_prev[k]) {
@@ -713,6 +803,12 @@ static void logic_block(void)                   /* once a block (1378 Hz): gener
         if (!P.ssg[k].slew) ssg_out[k] = ssg_held[k];
         else ssg_out[k] += (ssg_held[k] - ssg_out[k]) * 64 / (64 + (int32_t)P.ssg[k].slew * P.ssg[k].slew / 4);
         src_v[S_SSG(k)] = ssg_out[k];
+    }
+    {                                           /* the quadrature LFO (as S6) */
+        int32_t sn, cs;
+        q_ph += LUT_QINC[cl((int32_t)P.qrate + qmod_v, 0, 127)];
+        sn = sine(q_ph); cs = sine(q_ph + 0x40000000u);
+        src_v[S_QUAD(0)] = sn; src_v[S_QUAD(1)] = -sn; src_v[S_QUAD(2)] = cs; src_v[S_QUAD(3)] = -cs;
     }
     src_v[S_POP(0)] = (int32_t)popc(G[0].row) * 1024;
     src_v[S_POP(1)] = (int32_t)popc(G[1].row) * 1024;
@@ -922,13 +1018,16 @@ static void src_name(char *s, uint32_t k)       /* a matrix source */
     if (k < NFG) { s_cat(s, "FG"); s_int(s, (int32_t)k + 1); }
     else if (k < NFG + NSSG) { s_cat(s, "SSG"); s_int(s, (int32_t)(k - NFG) + 1); }
     else if (k < NFG + NSSG + 2u) s_cat(s, k == S_POP(0) ? "POP A" : "POP B");
-    else { s_cat(s, "GEN"); s_int(s, (int32_t)(k - S_GEN(0)) + 1); }
+    else if (k < S_QUAD(0)) { s_cat(s, "GEN"); s_int(s, (int32_t)(k - S_GEN(0)) + 1); }
+    else if (k < S_SEQ(0)) { static const char *const QN[4] = {"SIN+", "SIN-", "COS+", "COS-"}; s_cat(s, QN[(k - S_QUAD(0)) & 3u]); }
+    else { s_cat(s, "SEQ"); s_int(s, (int32_t)(k - S_SEQ(0)) + 1); }
 }
 static const char *const GS_NAME[NGS] = {"GEN1", "GEN2", "GEN3", "GEN4", "LFO1", "LFO2", "LFO3", "LFO4", "EOC1", "EOC2",
-    "EOC3", "EOC4", "QNT A", "QNT B", "CLK", "CLK/2", "CLK/4", "CLK/8", "CLK16", "POP A", "POP B"};
-static const char *const GD_SHORT[NGD] = {"K1", "K2", "F1", "F2", "F3", "F4", "S1", "S2", "GA", "GB"};
+    "EOC3", "EOC4", "QNT A", "QNT B", "CLK", "CLK/2", "CLK/4", "CLK/8", "CLK16", "POP A", "POP B", "SEQ1", "SEQ2", "SEQ3"};
+static const char *const GD_SHORT[NGD] = {"K1", "K2", "F1", "F2", "F3", "F4", "S1", "S2", "GA", "GB", "Q1", "Q2", "Q3", "R1", "R2", "R3"};
 static const char *const GD_NAME[NGD] = {"STRIKE 1", "STRIKE 2", "FG1 TRIGGER", "FG2 TRIGGER", "FG3 TRIGGER", "FG4 TRIGGER",
-    "S&H 1 CLOCK", "S&H 2 CLOCK", "GRID A STEP", "GRID B STEP"};
+    "S&H 1 CLOCK", "S&H 2 CLOCK", "GRID A STEP", "GRID B STEP", "SEQ 1 ADVANCE", "SEQ 2 ADVANCE", "SEQ 3 ADVANCE",
+    "SEQ 1 RESET", "SEQ 2 RESET", "SEQ 3 RESET"};
 static void gins(char *s, uint32_t d)           /* what is pinned into destination d */
 {
     uint32_t r, n = 0;
@@ -936,11 +1035,11 @@ static void gins(char *s, uint32_t d)           /* what is pinned into destinati
     if (!n) s_cat(s, "-");
 }
 static const char *const DST_SHORT[NDST] = {"TLT", "STR", "LVL", "SPL", "FLA", "FLB", "PNA", "PNB", "PTA", "PTB",
-    "1PT", "1VL", "1SH", "1LV", "2PT", "2VL", "2SH", "2LV", "MTA", "MTB", "SPA", "SPB", "F1R", "F2R", "F3R", "F4R"};
+    "1PT", "1VL", "1SH", "1LV", "2PT", "2VL", "2SH", "2LV", "MTA", "MTB", "SPA", "SPB", "F1R", "F2R", "F3R", "F4R", "QRT"};
 static const char *const DST_NAME[NDST] = {"TILT", "STRETCH", "OUT LEVEL", "SPLIT POINT", "FILTER A", "FILTER B",
     "PAN A", "PAN B", "PITCH A", "PITCH B", "STRIKE 1 PARTIAL", "STRIKE 1 VELOCITY", "STRIKE 1 SHAPE", "STRIKE 1 LEVEL",
     "STRIKE 2 PARTIAL", "STRIKE 2 VELOCITY", "STRIKE 2 SHAPE", "STRIKE 2 LEVEL", "GRID A MUTATION", "GRID B MUTATION",
-    "GRID A SPEED", "GRID B SPEED", "FG1 RATE", "FG2 RATE", "FG3 RATE", "FG4 RATE"};
+    "GRID A SPEED", "GRID B SPEED", "FG1 RATE", "FG2 RATE", "FG3 RATE", "FG4 RATE", "QUAD RATE"};
 static uint32_t isqrt32(uint32_t v) { uint32_t r = 0, b = 1u << 30; while (b > v) b >>= 2; while (b) { if (v >= r + b) { v -= r + b; r = (r >> 1) + b; } else r >>= 1; b >>= 2; } return r; }
 
 /* ================================================================== the screen: green phosphor */
@@ -1132,7 +1231,7 @@ enum { PG_INDEX, PG_VOICE, PG_GRID, PG_STRIKE, PG_SPLIT, PG_LOGIC, PG_SEQ, PG_FG
 static const char *const PG_NUM[NPG] = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "X", "F", "G", "D"};
 static const char *const PG_NAME[NPG] = {"INDEX", "VOICE", "GRIDS", "STRIKE", "SPLIT + FILTERS", "LOGIC", "SEQUENCERS",
                                          "FUNCTION GEN", "MOD MATRIX", "GATE MATRIX", "FX", "GLOBAL", "DISK"};
-static const uint8_t PG_READY[NPG] = {1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 0};
+static const uint8_t PG_READY[NPG] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0};
 static uint32_t page = PG_INDEX, sub, bank;     /* sub: OCT's choice (grid, strike, split part); bank: SEL's */
 static uint32_t cpu_avg, cpu_peak, cpu_max;     /* 1/10 per cent of the 5.8 ms */
 #define BUDGET_US 5805u
@@ -1142,25 +1241,28 @@ static uint32_t page_subs(uint32_t pg)
     if (pg == PG_GRID) return 2u;
     if (pg == PG_STRIKE) return 2u;
     if (pg == PG_LOGIC) return 4u;
+    if (pg == PG_SEQ) return NSEQ;
     if (pg == PG_SPLIT || pg == PG_GLOBAL) return 3u;
-    if (pg == PG_FG) return NFG + NSSG;         /* FG 1-4, SSG 1-2 */
+    if (pg == PG_FG) return NFG + NSSG + 1u;    /* FG 1-4, S&H 1-2, the quad LFO */
     return 1u;
 }
-static uint32_t mrow, mcol, mtop, mleft;        /* the matrix's cursor (source, destination) and its window */
+static uint32_t mrow, mcol, mtop, mleft;
+static uint8_t scur[NSEQ];                      /* each sequencer's step under the cursor (page 7) */        /* the matrix's cursor (source, destination) and its window */
 static uint32_t qsel;                           /* the global page's TUNING: the path SELECT picks */
 static uint32_t page_banks(uint32_t pg, uint32_t sb)
 {
     if (pg == PG_GRID) return 2u;
     if (pg == PG_STRIKE) return 3u;             /* SOUND, ENVELOPE, TRILL */
+    if (pg == PG_SEQ) return 2u;                /* STEPS, PLAY */
     if (pg == PG_SPLIT) return sb ? 2u : 1u;
     return 1u;
 }
 
 /* ---- the knobs: what K1..K4 turn on each page and bank */
-enum { F_INT, F_SLEW, F_TILT, F_STR, F_PCT, F_GMODE, F_DIV, F_MUT, F_ONOFF, F_SHIFT, F_KMODE, F_PART, F_VEL, F_SHAPE,
+enum { F_INT, F_SLEW, F_TILT, F_STR, F_PCT, F_GMODE, F_GRATE, F_MUT, F_ONOFF, F_SHIFT, F_KMODE, F_PART, F_VEL, F_SHAPE,
        F_DEC, F_FALL, F_SER, F_LSRC, F_OP, F_ROUTE, F_SRULE, F_POINT, F_WIDTH, F_SOFT, F_PMODE, F_FREQ, F_RES, F_BW,
        F_PAN, F_SEMI, F_CENT, F_CLK, F_TEMPO, F_PHOS, F_BRIGHT, F_BITS, F_TUN, F_SCL, F_SROOT, F_COUNT, F_SPACE, F_TPAT,
-       F_GOP, F_GMODE2, F_RATE, F_DUTY, F_FGT, F_CURVE, F_FMODE, F_SSGIN, F_DEPTH, F_NONE };
+       F_GOP, F_GMODE2, F_RATE, F_DUTY, F_FGT, F_CURVE, F_FMODE, F_SSGIN, F_DEPTH, F_QRATE, F_STEPN, F_SDIR, F_SADDR, F_NONE };
 typedef struct { const char *name; uint8_t *p; int16_t lo, hi; uint8_t fmt, step; } kn_t;
 static kn_t KN[4];
 static void kn_set(uint32_t i, const char *name, void *p, int32_t lo, int32_t hi, uint32_t fmt, uint32_t step)
@@ -1177,10 +1279,12 @@ static void knobs_for(uint32_t pg, uint32_t sb, uint32_t bk)
         kn_set(2, "STRETCH", &P.stretch, -30, 60, F_STR, 1); kn_set(3, "LEVEL", &P.level, 0, 127, F_PCT, 1);
     } else if (pg == PG_GRID) {
         gpar_t *g = &P.g[sb & 1u];
-        if (!bk) { kn_set(0, "RULE", &g->rule, 0, 255, F_INT, 1); kn_set(1, "STEP", &g->div, 0, 16, F_DIV, 1);
+        if (!bk) { kn_set(0, "RULE", &g->rule, 0, 255, F_INT, 1);
+                   kn_set(1, "RATE", (sb & 1u) && P.lock ? &P.g[0].rate : &g->rate, 0, 127, F_GRATE,
+                          (!(sb & 1u) || P.lock) && P.clk_midi ? 16u : 2u);   /* (lockstep: B's turns A's; MIDI: a division a step) */
                    kn_set(2, "MUTATE", &g->mut, 0, 30, F_MUT, 1); kn_set(3, "SHARE", &P.gmode, 0, NGM - 1, F_GMODE, 1); }
         else { kn_set(0, "RESCUE", &g->rescue, 0, 1, F_ONOFF, 1); kn_set(1, "SEED", &g->dens, 5, 95, F_MUT, 5);
-               kn_set(2, "SHIFT", &g->shift, 0, 31, F_SHIFT, 1); }
+               kn_set(2, "SHIFT", &g->shift, 0, 31, F_SHIFT, 1); kn_set(3, "LOCK", &P.lock, 0, 1, F_ONOFF, 1); }
     } else if (pg == PG_STRIKE) {
         kpar_t *k = &P.k[sb & 1u];
         trill_t *t = &P.tr[sb & 1u];
@@ -1209,8 +1313,16 @@ static void knobs_for(uint32_t pg, uint32_t sb, uint32_t bk)
         if (sb < NFG) { fgp_t *f = &P.fg[sb];
             kn_set(0, "RISE", &f->rise, 0, 127, F_FGT, 2); kn_set(1, "FALL", &f->fall, 0, 127, F_FGT, 2);
             kn_set(2, "CURVE", &f->curve, 0, 2, F_CURVE, 1); kn_set(3, "MODE", &f->mode, 0, 2, F_FMODE, 1); }
+        else if (sb >= NFG + NSSG) kn_set(0, "RATE", &P.qrate, 0, 127, F_QRATE, 2);
         else { ssgp_t *q = &P.ssg[sb - NFG];
             kn_set(0, "INPUT", &q->input, 0, NSRC, F_SSGIN, 1); kn_set(1, "SLEW", &q->slew, 0, 127, F_INT, 4); }
+    } else if (pg == PG_SEQ) {
+        seq_t *q = &P.seq[sb % NSEQ];
+        uint8_t *c = &scur[sb % NSEQ];
+        if (!bk) { kn_set(0, "STEP", c, 0, 7, F_STEPN, 1); kn_set(1, "VALUE", &q->val[*c & 7u], 0, 127, F_VEL, 2);
+                   kn_set(2, "GATE", &q->gate[*c & 7u], 0, 1, F_ONOFF, 1); kn_set(3, "LENGTH", &q->len, 1, 8, F_INT, 1); }
+        else { kn_set(0, "DIR", &q->dir, 0, 2, F_SDIR, 1); kn_set(1, "SLEW", &q->slew, 0, 127, F_INT, 2);
+               kn_set(2, "ADDR", &q->addr, 0, NSRC, F_SADDR, 1); kn_set(3, "CHAIN", &q->chain, 0, 1, F_ONOFF, 1); }
     } else if (pg == PG_MOD) {
         kn_set(2, "DEPTH", &P.dep[mrow][mcol], -63, 63, F_DEPTH, 1);
     } else if (pg == PG_GLOBAL) {
@@ -1218,7 +1330,7 @@ static void knobs_for(uint32_t pg, uint32_t sb, uint32_t bk)
                         kn_set(2, "ROOT", &P.sroot, 0, 11, F_SROOT, 1); kn_set(3, "GLIDE", &P.glide[qsel & 1u], 0, 127, F_INT, 4); }
         else if (sb == 1u) { kn_set(0, "PHOS", &gset.phos, 0, NPHOS - 1, F_PHOS, 1); kn_set(1, "BRIGHT", &gset.bright, 0, 10, F_BRIGHT, 1); }
         else { kn_set(0, "ENG VER", &P.engver, 1, 2, F_BITS, 1); kn_set(1, "CLOCK", &P.clk_midi, 0, 1, F_CLK, 1);
-               kn_set(2, "TEMPO", &P.tempo, 0, 127, F_TEMPO, 1); }
+               }
     }
 }
 static int32_t kn_get(const kn_t *k) { return k->lo < 0 ? (int32_t)*(int8_t *)k->p : (int32_t)*k->p; }
@@ -1238,7 +1350,12 @@ static void kn_text(char *s, const kn_t *k, uint32_t pathk)
     case F_STR: s_sdec(s, v, 1000u, 3u); break;
     case F_PCT: s_int(s, v * 100 / 127); s_cat(s, "%"); break;
     case F_GMODE: s_cat(s, GM_NAME[v % NGM]); break;
-    case F_DIV: if (!v) s_cat(s, "GATE"); else { s_cat(s, "/"); s_int(s, v); } break;
+    case F_GRATE: {                             /* a grid's clock: steps a second, a MIDI division, or GATE when pinned */
+        uint32_t gi = sub & 1u, onA = !gi || P.lock;
+        if (gated(gi)) s_cat(s, "GATE");
+        else if (onA && P.clk_midi) s_cat(s, MIDI_DIVN[(v >> 4) & 7]);
+        else { s_dec(s, Q_GRID_X100[v & 127], 100u, Q_GRID_X100[v & 127] < 1000u ? 2u : 1u); s_cat(s, "/S"); }
+    } break;
     case F_MUT: s_int(s, v); s_cat(s, "%"); break;
     case F_ONOFF: s_cat(s, v ? "ON" : "OFF"); break;
     case F_SHIFT: s_sdec(s, v, 1u, 0u); break;
@@ -1286,6 +1403,12 @@ static void kn_text(char *s, const kn_t *k, uint32_t pathk)
     case F_FGT: { uint32_t ms = (16777216u / LUT_FGINC[v & 127]) * 1000u / 1378u;   /* (the slope's length) */
         if (ms < 1000u) { s_int(s, (int32_t)ms); s_cat(s, "MS"); } else { s_dec(s, ms / 10u, 100u, ms < 10000u ? 2u : 1u); s_cat(s, "S"); } } break;
     case F_CURVE: s_cat(s, CV_NAME[v % 3]); break;
+    case F_STEPN: s_int(s, v + 1); break;
+    case F_SDIR: { static const char *const DN[3] = {"FWD", "PEND", "RAND"}; s_cat(s, DN[v % 3]); } break;
+    case F_SADDR: if (!v) s_cat(s, "CLOCK"); else src_name(s, (uint32_t)v - 1u); break;
+    case F_QRATE: { uint32_t cs = LUT_QPER[v & 127];   /* a cycle, 1/100 s (as S6) */
+        if (cs >= 1000u) s_int(s, (int32_t)((cs + 50u) / 100u)); else { s_int(s, (int32_t)(cs / 100u)); s_cat(s, "."); s_int(s, (int32_t)(cs / 10u % 10u)); }
+        s_cat(s, "S"); } break;
     case F_FMODE: s_cat(s, FM_NAME[v % 3]); break;
     case F_SSGIN: if (!v) s_cat(s, "NOISE"); else src_name(s, (uint32_t)v - 1u); break;
     case F_DEPTH: if (!v) s_cat(s, "--"); else s_sdec(s, v, 1u, 0u); break;
@@ -1306,7 +1429,10 @@ static void draw_header(void)
     if (page == PG_GRID) s_cat(s, sub ? "GRID B" : "GRID A");
     else if (page == PG_STRIKE) { s_cat(s, "STRIKE "); s_int(s, (int32_t)sub + 1); }
     else if (page == PG_LOGIC) { s_cat(s, "LOGIC GEN "); s_int(s, (int32_t)sub + 1); }
-    else if (page == PG_FG) { if (sub < NFG) { s_cat(s, "FUNC GEN "); s_int(s, (int32_t)sub + 1); } else { s_cat(s, "S&H "); s_int(s, (int32_t)(sub - NFG) + 1); } }
+    else if (page == PG_SEQ) { s_cat(s, "SEQ "); s_int(s, (int32_t)sub + 1); }
+    else if (page == PG_FG) { if (sub < NFG) { s_cat(s, "FUNC GEN "); s_int(s, (int32_t)sub + 1); }
+                              else if (sub < NFG + NSSG) { s_cat(s, "S&H "); s_int(s, (int32_t)(sub - NFG) + 1); }
+                              else s_cat(s, "QUAD LFO"); }
     else if (page == PG_SPLIT) s_cat(s, sub == 0u ? "SPLIT" : sub == 1u ? "PATH A" : "PATH B");
     else if (page == PG_GLOBAL) s_cat(s, sub == 0u ? "GLOBAL: TUNING" : sub == 1u ? "GLOBAL: VDU" : "GLOBAL: ENGINE");
     else s_cat(s, PG_NAME[page]);
@@ -1403,16 +1529,17 @@ static void draw_voice(void)
     cv_text(4, 4, &FONT_S, "H1", PH_LO);
     cv_text(236 - 24, 4, &FONT_S, "H64", PH_LO);
     s[0] = 0; s_cat(s, "ROOT "); s_note(s, P.root); s_cat(s, P.anchor ? "  F0 ON" : "  F0 OFF");
-    s_cat(s, "  CLK "); if (P.clk_midi) s_cat(s, "MIDI"); else s_dec(s, Q_TEMPO_X100[P.tempo], 100u, 1u);
+    s_cat(s, "  CLK "); if (P.clk_midi) s_cat(s, "MIDI"); else { s_dec(s, Q_GRID_X100[E.g[0].rate], 100u, 2u); s_cat(s, "/S"); }
     cv_text(4, 126, &FONT_S, s, PH_MID);
     s[0] = 0; s_cat(s, "LIVE "); s_int(s, (int32_t)live_v); s_cat(s, "  CPU "); s_dec(s, cpu_avg, 10u, 1u); s_cat(s, "%");
     s_cat(s, "  A/B");
     cv_text(4, 142, &FONT_S, s, PH_LO);
     knob_row(0);
-    footer("ALG ROOT  PRE CLOCK  SEL F0");
+    footer("ALG ROOT  SEL F0  (CLOCK: GRIDS)");
     cv_out(BODY_Y);
 }
 
+static void lamp(int32_t x, int32_t y, uint32_t on);
 static void draw_grid(void)
 {
     const grid_t *g = &G[sub & 1u];
@@ -1425,10 +1552,14 @@ static void draw_grid(void)
         for (c = 0; c < NC; c++)
             if ((r >> c) & 1u) cv_rect(8 + (int32_t)c * 7, 2 + (int32_t)y * 5, 6, 4, col);
     }
-    s[0] = 0; s_cat(s, sub ? "B" : "A"); s_cat(s, " RULE "); s_int(s, P.g[sub & 1u].rule);
-    s_cat(s, "  POP "); s_int(s, (int32_t)popc(g->row)); s_cat(s, "/32");
-    cv_text(4, 146, &FONT_S, s, PH_MID);
-    if (g->rescue_t && fm1_ms - g->rescue_t < 900u) { s[0] = 0; s_cat(s, "RESCUE "); s_cat(s, g->why); cv_text(236 - text_w(&FONT_S, s), 146, &FONT_S, s, PH_HI); }
+    s[0] = 0; s_cat(s, sub ? "B" : "A"); s_cat(s, " POP "); s_int(s, (int32_t)popc(g->row)); s_cat(s, "/32");
+    cv_text(4, 144, &FONT_S, s, PH_MID);
+    if (g->rescue_t && fm1_ms - g->rescue_t < 900u) { s[0] = 0; s_cat(s, "RESCUE "); s_cat(s, g->why); cv_text(236 - text_w(&FONT_S, s), 144, &FONT_S, s, PH_HI); }
+    else {                                      /* the clock: LOCK lit in lockstep; GATE when the gate matrix drives it */
+        int32_t x = 236 - 4 * 8 - 14;
+        if (gated(sub & 1u)) { x = 236 - 4 * 8 - 14 - 64; lamp(x + 64, 147, 1); cv_text(x + 78, 144, &FONT_S, "GATE", PH_HI); }
+        lamp(x, 147, P.lock); cv_text(x + 14, 144, &FONT_S, "LOCK", P.lock ? PH_HI : PH_LO);
+    }
     knob_row(0);
     footer("OCT A/B  SEL BANK  PLAY SEED");
     cv_out(BODY_Y);
@@ -1548,6 +1679,32 @@ static void draw_logic(void)                    /* a generator: its input, its L
     cv_out(BODY_Y);
 }
 
+static void draw_quad(void)                     /* the quadrature LFO: a dot round a circle, four bipolar bars */
+{
+    uint32_t i, k, d, n;
+    int32_t cx = 60, cy = 74, r = 48;
+    char s[40];
+    static const char *const QN[4] = {"SIN+", "SIN-", "COS+", "COS-"};
+    cv_begin(240, BODY_H, PH_BG);
+    for (i = 0; i < 96u; i++)
+        cv_pset(cx + ((sine(i * 0x02AAAAABu + 0x40000000u) * r) >> 15), cy - ((sine(i * 0x02AAAAABu) * r) >> 15), PH_LO);
+    cv_rect(cx - r, cy, 2 * r + 1, 1, PH_SEL); cv_rect(cx, cy - r, 1, 2 * r + 1, PH_SEL);
+    cv_rect(cx + ((src_v[S_QUAD(2)] * r) >> 15) - 3, cy - ((src_v[S_QUAD(0)] * r) >> 15) - 3, 7, 7, PH_HI);
+    for (k = 0; k < 4u; k++) {                  /* SIN+ SIN- COS+ COS-, bipolar bars, and where each goes */
+        int32_t y = 30 + (int32_t)k * 24, v = (src_v[S_QUAD(k)] * 42) >> 15;
+        cv_text(116, y - 4, &FONT_S, QN[k], PH_MID);
+        cv_rect(193, y - 2, 1, 11, PH_LO);
+        if (v >= 0) cv_rect(194, y, v, 7, PH_MID); else cv_rect(193 + v, y, -v, 7, PH_MID);
+    }
+    s[0] = 0; s_cat(s, "TO:");
+    for (k = 0, n = 0; k < 4u; k++)
+        for (d = 0; d < NDST && n < 6u; d++) if (P.dep[S_QUAD(k)][d]) { s_cat(s, " "); s_cat(s, DST_SHORT[d]); n++; }
+    if (!n) s_cat(s, " -");
+    cv_text(4, 134, &FONT_S, s, PH_LO);
+    knob_row(0);
+    footer("OCT FG/S&H/QUAD");
+    cv_out(BODY_Y);
+}
 static void draw_fg(void)                       /* a function generator or an S&H: its trace, its settings */
 {
     uint32_t k = sub, i;
@@ -1577,16 +1734,48 @@ static void draw_fg(void)                       /* a function generator or an S&
     cv_out(BODY_Y);
 }
 
-static uint32_t grow, gcol, gtop;              /* the gate matrix's cursor and window */
+static void draw_seq(void)                      /* a sequencer: its steps as bars, the one playing lit, the output's glide */
+{
+    uint32_t n = sub % NSEQ, i, len = P.seq[n].len < 1u ? 1u : P.seq[n].len, st = sq_step_v[n];
+    const seq_t *q = &P.seq[n];
+    char s[40];
+    int32_t out = src_v[S_SEQ(n)];
+    cv_begin(240, BODY_H, PH_BG);
+    for (i = 0; i < 8u; i++) {
+        int32_t x = 8 + (int32_t)i * 24, ht = q->val[i] * 88 / 127, in = i < len;
+        if (i == scur[n]) cv_rect(x - 3, 4, 24, 116, PH_SEL);            /* the cursor */
+        if (in) cv_rect(x, 104 - ht, 18, ht + 1, i == st ? PH_HI : PH_MID);
+        else { int32_t y; for (y = 104 - ht; y <= 104; y += 3) cv_rect(x, y, 18, 1, PH_LO); }
+        if (q->gate[i]) cv_rect(x + 5, 110, 8, 6, in ? (i == st && (sq_gate_v >> n & 1u) ? PH_HI : PH_MID) : PH_LO);
+        else cv_rect(x + 8, 112, 2, 2, PH_LO);
+    }
+    cv_rect(206, 16, 1, 89, PH_LO);             /* the output, gliding */
+    cv_rect(212, 104 - out * 88 / 32768, 18, 3, PH_HI);
+    s[0] = 0;
+    if (q->addr) { s_cat(s, "SWEPT BY "); src_name(s, q->addr - 1u); }
+    else { s_cat(s, "ADV < "); gins(s, GD_SQA1 + n); }
+    cv_text(4, 122, &FONT_S, s, PH_MID);
+    s[0] = 0;
+    if (!q->addr) { s_cat(s, "RST < "); gins(s, GD_SQR1 + n); }
+    if (q->chain && n) { s_cat(s, q->addr ? "" : "  "); s_cat(s, "CHAIN"); }
+    cv_text(4, 140, &FONT_S, s, PH_LO);
+    knob_row(0);
+    footer("OCT SEQ SEL BANK PLAY GATE");
+    cv_out(BODY_Y);
+}
+static uint32_t grow, gcol, gtop, gleft;       /* the gate matrix's cursor and window */
+#define GCOLS 10u
 static void draw_gmat(void)                     /* sources down, destinations across; a pin lights while its gate is high */
 {
     uint32_t r, c, gs = gsrc_v, gd = gdst_v;
     char s[40];
     if (grow < gtop) gtop = grow;
     if (grow >= gtop + 8u) gtop = grow - 7u;
+    if (gcol < gleft) gleft = gcol;
+    if (gcol >= gleft + GCOLS) gleft = gcol - GCOLS + 1u;
     cv_begin(240, BODY_H, PH_BG);
-    for (c = 0; c < NGD; c++) {                 /* the column names, two lines: K / 1, F / 3, G / A ... */
-        int32_t x = 64 + (int32_t)c * 17;
+    for (c = gleft; c < gleft + GCOLS && c < NGD; c++) {   /* the column names, two lines: K / 1, F / 3, G / A ... */
+        int32_t x = 64 + (int32_t)(c - gleft) * 17;
         char t[2] = {0, 0};
         uint16_t col = c == gcol ? PH_HI : (gd >> c & 1u) ? PH_MID : PH_LO;
         t[0] = GD_SHORT[c][0]; cv_text(x, 0, &FONT_S, t, col);
@@ -1597,8 +1786,8 @@ static void draw_gmat(void)                     /* sources down, destinations ac
         uint32_t i = gtop + r, on = gs >> i & 1u;
         int32_t y = 36 + (int32_t)r * 15;
         cv_text(2, y, &FONT_S, GS_NAME[i], i == grow ? PH_HI : on ? PH_MID : PH_LO);
-        for (c = 0; c < NGD; c++) {
-            int32_t x = 62 + (int32_t)c * 17;
+        for (c = gleft; c < gleft + GCOLS && c < NGD; c++) {
+            int32_t x = 62 + (int32_t)(c - gleft) * 17;
             uint32_t pin = P.gmat[i] >> c & 1u, cur = i == grow && c == gcol;
             if (cur) cv_rect(x, y - 1, 15, 15, PH_SEL);
             if (pin) cv_rect(x + 3, y + 2, 9, 9, on ? PH_HI : PH_MID);
@@ -1607,7 +1796,7 @@ static void draw_gmat(void)                     /* sources down, destinations ac
     }
     s[0] = 0; s_cat(s, GS_NAME[grow]); s_cat(s, " > "); s_cat(s, GD_NAME[gcol]);
     cv_text(2, 162, &FONT_S, s, PH_HI);
-    s[0] = 0; s_cat(s, P.gmat[grow] >> gcol & 1u ? "PIN IN" : "NO PIN"); s_cat(s, "  ("); s_int(s, (int32_t)grow + 1); s_cat(s, "/21)");
+    s[0] = 0; s_cat(s, P.gmat[grow] >> gcol & 1u ? "PIN IN" : "NO PIN"); s_cat(s, "  ("); s_int(s, (int32_t)grow + 1); s_cat(s, "/24)");
     cv_text(2, 180, &FONT_S, s, PH_MID);
     footer("K1 SRC K2 DST PLAY PIN  OR'D");
     cv_out(BODY_Y);
@@ -1870,18 +2059,22 @@ static int boot_wait(uint32_t ms)
 }
 
 /* ================================================================== the main loop */
+static uint32_t hdr_force;                      /* the header must be redrawn (a new phosphor or brightness) */
 static void after_change(uint32_t pg, uint32_t sb, uint32_t knob, uint32_t bk)
 {
     dirty_partials = 1;
     (void)bk;
-    if (pg == PG_GLOBAL && sb == 1u) crt_build();
+    if (pg == PG_GLOBAL && sb == 1u) { crt_build(); hdr_force = 1; }   /* (the bulge redraws the rows above the body,
+                                                                           not the header's top: redraw it, all of it) */
     if (pg == PG_GLOBAL && sb == 2u && knob == 0u) cpu_max = 0;   /* (a new engine: a new worst case) */
     if (pg == PG_GLOBAL && sb == 2u && knob >= 1u) t_half = fm1_ms;
+    if (pg == PG_GRID && knob == 3u && bk == 1u) { t_halfb = t_half; half_b = half_n; }   /* (lockstep on or off: B in phase with A) */
     if (pg == PG_GLOBAL && sb == 0u && knob == 0u) P.scl = 0;    /* (a new tuning: its first scale) */
 }
 static void app_main(void)
 {
     uint32_t i, b, rel, icur = PG_VOICE, t_draw = 0, t_cpu = 0, t_batt = 0, t_push = 0, t_hist = 0, prev_keys = 0, prev_up = 0, hdr = 1;
+    hdr_force = 0;
     int32_t e;
     int skip;
 
@@ -1923,7 +2116,6 @@ static void app_main(void)
             if (b & (1u << BTN_FX)) np = PG_FX;
             if (b & (1u << BTN_GLO)) np = PG_GLOBAL;
             if (b & (1u << BTN_SAVE)) np = PG_PATCH;
-            if (np == PG_LOGIC || np == PG_FG || np == PG_GMAT) b &= ~(1u << BTN_SEL);
             if (np != page) { page = np; sub = 0; bank = 0; hdr = 1; b &= ~(1u << BTN_SEL); }
         }
         nsub = page_subs(page);
@@ -1945,6 +2137,7 @@ static void app_main(void)
             if (page == PG_GLOBAL && sub == 2u) cpu_max = 0;
             if (page == PG_GLOBAL && sub == 0u) { P.qon[qsel & 1u] ^= 1u; dirty_partials = 1; }
             if (page == PG_GMAT) P.gmat[grow] ^= (uint16_t)(1u << gcol);   /* a pin in / out */
+            if (page == PG_SEQ) { uint32_t n = sub % NSEQ; P.seq[n].gate[scur[n] & 7u] ^= 1u; }   /* the step's gate */
             if (page == PG_STRIKE) {            /* fire it by hand (Bow / Breath: held 1.2 s) */
                 uint32_t s_ = sub & 1u;
                 if (P.k[s_].mode >= KM_BOW) { kman_until[s_] = fm1_ms + 1200u; kman_hold_v[s_] = 1; }
@@ -1977,7 +2170,7 @@ static void app_main(void)
             dirty_partials = 1;
         }
         if ((e = fm1_enc_take(ENC_PRESETS)) != 0) {
-            if (page == PG_VOICE) { P.tempo = (uint8_t)cl((int32_t)P.tempo + e, 0, 127); }
+            (void)0;
             if (page == PG_STRIKE) { P.route_pre = e > 0; dirty_partials = 1; }
             if (page == PG_MOD) mcol = (uint32_t)cl((int32_t)mcol + e, 0, NDST - 1);
         }
@@ -2020,15 +2213,16 @@ static void app_main(void)
         if (fm1_ms - t_draw >= 66u) {
             uint32_t blink = (fm1_ms / 250u) & 1u, row;
             t_draw = fm1_ms;
-            if (hdr) { hdr = 0; draw_header(); }
+            if (hdr || hdr_force) { hdr = 0; hdr_force = 0; draw_header(); }   /* (a new phosphor: the header too) */
             switch (page) {
             case PG_INDEX: draw_index(icur); break;
             case PG_VOICE: draw_voice(); break;
             case PG_GRID: draw_grid(); break;
             case PG_STRIKE: draw_strike(); break;
             case PG_GMAT: draw_gmat(); break;
+            case PG_SEQ: draw_seq(); break;
             case PG_LOGIC: draw_logic(); break;
-            case PG_FG: draw_fg(); break;
+            case PG_FG: if (sub >= NFG + NSSG) draw_quad(); else draw_fg(); break;
             case PG_MOD: draw_mod(); break;
             case PG_SPLIT: draw_split(); break;
             case PG_GLOBAL: if (sub == 0u) draw_tuning(); else if (sub == 1u) draw_vdu(); else draw_engine(); break;
@@ -2047,6 +2241,7 @@ static void app_main(void)
             fm1_led_key(BTN_HOME, page != PG_INDEX && blink);
             fm1_led_key(BTN_PLAY, (page == PG_STRIKE && (kgate_v[sub & 1u] || blink)) || (page == PG_GRID && blink)
                                   || (page == PG_GMAT && ((P.gmat[grow] >> gcol & 1u) || blink))
+                                  || (page == PG_SEQ && (P.seq[sub % NSEQ].gate[scur[sub % NSEQ] & 7u] || blink))
                                   || (page == PG_MOD && (P.dep[mrow][mcol] || blink))
                                   || (page == PG_GLOBAL && sub == 0u && (P.qon[qsel & 1u] || blink)) || (page == PG_GLOBAL && sub == 2u && blink));
         }

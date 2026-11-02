@@ -1,0 +1,19 @@
+# Quorum 0.3: grid clocks. A at 1/s, B at 2/s; B bank 2: LOCK on (B follows A); grid A pinned (GATE)
+3000 btn 5
+3500 shot
+4000 btn 1
+4100 btn 3
+4200 enc 5 1
+4800 shot
+5000 btn 3
+5100 enc 3 10
+5600 shot
+6000 btndown 3
+6100 btn 10
+6200 btnup 3
+6300 enc 2 4
+6400 enc 3 8
+6500 btn 12
+6700 btn 5
+7500 shot
+9000 end

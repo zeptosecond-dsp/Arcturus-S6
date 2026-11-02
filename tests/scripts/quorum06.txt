@@ -1,0 +1,18 @@
+# Quorum 0.3: the quadrature LFO (page 8, OCT- from FG1), pinned on the mod matrix (SIN+ -> FILTER A)
+3000 btndown 3
+3100 btn 4
+3200 btnup 3
+3300 btn 0
+3400 enc 2 -20
+4500 shot
+5000 btn 10
+5100 enc 2 12
+5200 enc 3 4
+5300 btn 12
+5600 shot
+6200 btndown 3
+6300 btn 4
+6400 btnup 3
+6500 btn 0
+7000 shot
+8000 end
