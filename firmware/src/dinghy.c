@@ -123,7 +123,8 @@ static int32_t soft_out(int32_t x)              /* linear to 20000, then bending
     int32_t a = iabs(x), y;
     if (a <= 20000) return x;
     a -= 20000;
-    y = 20000 + (int32_t)((int64_t)a * 12000 / (a + 12000));
+    if (a > 150000) a = 150000;                 /* (a x 12000 stays in 32 bits) */
+    y = 20000 + a * 12000 / (a + 12000);
     return x < 0 ? -y : y;
 }
 static void render(int32_t *out)                /* SUB frames at 44.1 kHz: 16 computed, each held twice */
@@ -370,7 +371,8 @@ static uint32_t split_w(uint32_t h, int32_t qb)
     default: x = iabs(qb - qc) - (int32_t)P.swidth * 256 * 12 / 20; break;   /* width in 1/10 octave: half of it each side */
     }
     if (soft <= 0) return x < 0 ? ONE : 0;
-    return (uint32_t)cl(16384 - (int32_t)((int64_t)x * 32768 / soft), 0, ONE);
+    x = cl(x, -60000, 60000);                   /* (x * 16384 stays in 32 bits: no 64-bit division on this chip) */
+    return (uint32_t)cl(16384 - x * 16384 / soft * 2, 0, ONE);
 }
 static void path_push(void)
 {
@@ -539,7 +541,7 @@ static uint32_t lop(uint32_t a, uint32_t b, uint32_t op)
 }
 static uint32_t kla[2], klb[2], klo[2], kprev[2];
 static uint32_t gcount[2], t_half, midi_clk;
-static volatile uint32_t dirty_partials = 1, clock_running = 1;
+static volatile uint32_t dirty_partials = 1;
 static void half_tick(void)
 {
     uint32_t s, i, rise;
