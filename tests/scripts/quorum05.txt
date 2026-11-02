@@ -1,0 +1,9 @@
+# Quorum 0.3: the top two keys strike by hand from any page (key 25: strike 1, key 26: strike 2)
+3000 keys 0x2000000
+3100 keys 0
+3600 keys 0x4000000
+3700 keys 0
+4200 keys 0x2000000
+4300 keys 0
+4400 shot
+6000 end
