@@ -10,7 +10,7 @@ Arcturus S6 is an experimental system for generative, evolving soundscapes, not 
 
 **The sound.** The engine runs natively at 12 bit and 22.05kHz, with 8-bit wavetables and no smoothing, so it aliases and steps the way early digital instruments did. Two machines are its direct influences:
 
-- **PPG Wave** (1981): gritty, stepped wavetables you sweep through, rather than clean modern ones.
+- **PPG Wave & Waveterm** (1981, 1983): gritty, stepped wavetables you sweep through, rather than clean modern ones.
 - **Fairlight CMI** (1979): low sample rates and short words, plus the look. The green phosphor screen, numbered pages and central index are taken from the Fairlight's monitor.
 
 Expect drones, pulses and slowly shifting textures with a distinct early digital edge, and expect surprises: it's an experimental instrument, written by machine with human guidance.
