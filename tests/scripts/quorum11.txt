@@ -1,0 +1,13 @@
+# Quorum 0.5: keyboard tracking per path (PLAY on PATH A / B); a key then moves path B only
+4000 btndown 3
+4100 btn 6
+4200 btnup 3
+4300 btn 1
+4400 btn 12
+5000 shot
+5100 keys 0x80
+5300 keys 0x0
+5600 shot
+5700 btn 1
+6200 shot
+7000 end

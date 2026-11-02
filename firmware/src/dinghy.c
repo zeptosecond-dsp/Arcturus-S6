@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-only */
-/* QUORUM Cellular Synthesis System: build 0.5 (the engine, its logic, modulation, sequencers, effects and disk). The sister of Arcturus S6 (the
+/* QUORUM Cellular Synthesis System: build 0.6 (the engine, its logic, modulation, sequencers, effects and disk). The sister of Arcturus S6 (the
  * main branch), on Dinghy (zvenson), on the platform of Felucca (Hügelton Instruments) as SLOOP (isod89) carries it.
  *
  * 64 sine partials at 22.05 kHz (each sample held twice) and 12 bit, as S6. Two 32-cell automata switch them; two
@@ -12,7 +12,8 @@
  *   EDIT   2 VOICE      K1 slew, K2 tilt, K3 stretch, K4 level; ALGORITHM root; PRESETS clock; SEL anchor
  *   LFO    3 GRIDS      OCT: grid A / B; K1-K4 the bank shown, SEL (flashing) the other bank; PLAY reseeds
  *   ENV    4 STRIKE     OCT: strike 1 / 2; SEL: SOUND, ENVELOPE, TRILL; ALGORITHM sum / filter; PRESETS routing; PLAY fires
- *   SEL+EDIT 5 SPLIT    OCT: SPLIT / PATH A / PATH B; K1-K4, SEL: two banks on the paths; ALGORITHM N
+ *   SEL+EDIT 5 SPLIT    OCT: SPLIT / PATH A / PATH B; K1-K4, SEL: two banks on the paths; ALGORITHM N; PLAY on a
+ *                       path: on / off the keys (off: it holds its note, a drone under the other)
  *   SEL+LFO 6 LOGIC     OCT: generator 1-4: an input AND/OR/... a square LFO (free or clocked); ALGORITHM free / clock
  *   SEL+ENV 8 FUNC GEN  OCT: FG 1-4, S&H 1-2 (their gates come from the gate matrix), the quadrature LFO
  *   ARP    9 MOD MATRIX K1 / SELECT the source, K2 / PRESETS the destination, K3 the depth, PLAY a pin in / out
@@ -31,7 +32,7 @@
  * Rules of the road (the chip has no FPU and no libgcc): integers only, no float, no 64-bit division.
  * tests/host.c runs this file on a computer: the screen as a PNG, the sound as a WAV. */
 #define APP_NAME "QUORUM"
-#define Q_VERSION "0.5"
+#define Q_VERSION "0.6"
 static void app_idle(void);
 #define LCD_IDLE app_idle                       /* while the screen's DMA runs: the clock and MIDI keep going */
 #define CV_MAX (240u * 218u)                    /* the page body's canvas */
@@ -202,6 +203,7 @@ typedef struct {
     dlx_t dl;
     rvx_t rv;
     rtx_t rt;
+    uint8_t kbd[2], droot[2];                   /* each path: the keys move it (1), or it holds droot (a drone) */
     /* (new settings go here, above the matrices: a saved patch keeps everything before them, and the matrices by
      * row and column) */
     int8_t dep[NSRC][NDST];                     /* the mod matrix: 0 = no pin, +-63 */
@@ -236,6 +238,7 @@ static patch_t P = {
     {{0, 0}, {80, 92}, 60, 20, 0, 80},          /* the delays */
     {{0, 0}, 100, 95, 50, 20, 40, 0, 70, 0, 0, 0},   /* the reverb (S6's), ready for a send */
     {0, 0, 30},                                 /* PHASER > DELAY > REVERB, the delay into the reverb */
+    {1, 1}, {45, 45},                           /* both paths on the keys */
     {{0}},
     {0},
 };
@@ -346,10 +349,15 @@ static uint32_t t_glide;
 static uint32_t offsets_update(void)            /* 1: an offset moved (the partials need pushing) */
 {
     uint32_t k, moved = 0, dt = fm1_ms - t_glide;
+    static int32_t root_was = -1;
     t_glide = fm1_ms;
+    if (root_was >= 0 && root_was != (int32_t)P.root)   /* a new root: a held path stays exactly where it is (no glide) */
+        for (k = 0; k < 2u; k++) if (!P.kbd[k]) { off_cur[k] += (root_was - (int32_t)P.root) * 256; moved = 1; }
+    root_was = P.root;
     if (dt > 100u) dt = 100u;
     for (k = 0; k < 2u; k++) {
         int32_t o = (int32_t)P.pth[k].coarse * 256 + (int32_t)P.pth[k].fine * 256 / 100 + pitch_mod[k], prev = off_cur[k];
+        if (!P.kbd[k]) o += ((int32_t)P.droot[k] - (int32_t)P.root) * 256;   /* off the keys: where it was held */
         if (P.qon[k]) {
             int32_t q = quantise((int32_t)P.root * 256 + o, &off_step[k]) - (int32_t)P.root * 256;
             if (q != off_tgt[k]) qpulse_v[k] = 7;   /* a new note: a ~5 ms gate */
@@ -359,7 +367,9 @@ static uint32_t offsets_update(void)            /* 1: an offset moved (the parti
         if (!P.glide[k] || iabs(o - off_cur[k]) < 2) off_cur[k] = o;
         else {                                  /* a glide: a one-pole, glide x 20 ms */
             int32_t tau = (int32_t)P.glide[k] * 20;
-            off_cur[k] += (o - off_cur[k]) * (int32_t)dt / (tau + (int32_t)dt);
+            int32_t st = (o - off_cur[k]) * (int32_t)dt / (tau + (int32_t)dt);
+            if (!st) st = o > off_cur[k] ? 1 : -1;   /* (a fast loop rounds the step to nothing: it would stall) */
+            off_cur[k] += st;
         }
         if (off_cur[k] != prev) moved = 1;
     }
@@ -2081,8 +2091,12 @@ static void draw_split(void)
         s[0] = 0; s_cat(s, PM_NAME[q->mode & 3u]); s_cat(s, "  PITCH "); s_sdec(s, q->coarse, 1u, 0u); s_cat(s, "ST ");
         s_sdec(s, q->fine, 1u, 0u); s_cat(s, "C");
         cv_text(4, 126, &FONT_S, s, PH_MID);
+        s[0] = 0;
+        if (P.kbd[k]) s_cat(s, "KEYS: TRACKING");
+        else { s_cat(s, "KEYS: OFF, HELD ON "); s_note(s, P.droot[k]); }
+        cv_text(4, 142, &FONT_S, s, P.kbd[k] ? PH_LO : PH_HI);
         knob_row(k);
-        footer("OCT PART  SEL BANK");
+        footer("OCT PART SEL BANK PLAY KEYS");
     }
     cv_out(BODY_Y);
 }
@@ -2415,6 +2429,7 @@ static void patch_clean(void)                   /* a loaded patch's values in ra
         t->mode &= 3u; t->freq &= 127u; t->res &= 127u; t->bw &= 127u; t->level &= 127u; t->pan &= 127u;
         t->coarse = (int8_t)cl(t->coarse, -24, 24); t->fine = (int8_t)cl(t->fine, -50, 50);
         P.qon[k] &= 1u; P.glide[k] &= 127u;
+        P.kbd[k] &= 1u; P.droot[k] = (uint8_t)cl(P.droot[k], 12, 96);
         P.tr[k].count = (uint8_t)cl(P.tr[k].count, 1, 8); P.tr[k].pattern %= 3u; P.tr[k].max &= 127u;
         P.ph.send[k] &= 127u; P.dl.send[k] &= 127u; P.rv.send[k] &= 127u; P.dl.time[k] &= 127u;
     }
@@ -2897,6 +2912,12 @@ static void app_main(void)
                 else kman_req_v[s_]++;
             }
             if (page == PG_MOD) { P.dep[mrow][mcol] = P.dep[mrow][mcol] ? 0 : 32; }   /* a pin in / out */
+            if (page == PG_SPLIT && sub) {      /* a path on / off the keys (off: it holds the note it is on) */
+                uint32_t k = sub - 1u;
+                if (P.kbd[k]) P.droot[k] = P.root;
+                P.kbd[k] ^= 1u;
+                dirty_partials = 1;
+            }
             if (page == PG_FX && sub == 0u) P.ph.fb = 64;   /* the phaser's feedback back to none */
             if (page == PG_FX && sub == 1u) { for (i = 0; i < QD_N; i++) qd_buf[0][i] = qd_buf[1][i] = 0; }   /* clear */
             if (page == PG_FX && sub == 2u) { P.rv.freeze ^= 1u; dirty_partials = 1; }
@@ -2919,7 +2940,11 @@ static void app_main(void)
                 knobs_for(page, sub, bank);     /* (a mode's change renames a knob) */
             }
         if ((e = fm1_enc_take(ENC_ALGORITHM)) != 0) {
-            if (page == PG_VOICE) P.root = (uint8_t)cl((int32_t)P.root + e, 21, 72);
+            if (page == PG_VOICE) {             /* the root: both paths, held ones too */
+                int32_t r0 = P.root;
+                P.root = (uint8_t)cl((int32_t)P.root + e, 21, 72);
+                for (i = 0; i < 2u; i++) P.droot[i] = (uint8_t)cl((int32_t)P.droot[i] + (int32_t)P.root - r0, 12, 96);
+            }
             if (page == PG_LOGIC) P.gen[sub & 3u].mode = e > 0;
             if (page == PG_STRIKE) P.k[sub & 1u].filt = e > 0;   /* with the grids: sum / filter */
             if (page == PG_SPLIT) P.sn = (uint8_t)cl((int32_t)P.sn + e, 2, 8);
@@ -3051,7 +3076,8 @@ static void app_main(void)
                                   || (page == PG_MOD && (P.dep[mrow][mcol] || blink))
                                   || (page == PG_GLOBAL && sub == 0u && (P.qon[qsel & 1u] || blink)) || (page == PG_GLOBAL && sub == 2u && blink)
                                   || (page == PG_FX && sub == 2u && (P.rv.freeze || blink)) || (page == PG_FX && sub < 2u && blink)
-                                  || (page == PG_PATCH && blink));
+                                  || (page == PG_PATCH && blink)
+                                  || (page == PG_SPLIT && sub && (P.kbd[(sub - 1u) & 1u] || blink)));
             fm1_led_key(BTN_FX, page == PG_FX && blink);   /* FX again: the next effect */
             fm1_led_key(BTN_SAVE, page == PG_PATCH && (pconf == PC_SAVE || blink));
         }
