@@ -1,0 +1,10 @@
+# Quorum 0.2: the engine smooth (3-9 s), 12 bit (9-15 s), 8 bit (15-21 s); the global page's screens
+3000 btn 7
+8000 shot
+9000 enc 4 1
+14000 shot
+15000 enc 4 1
+20000 shot
+20500 btn 3
+21000 shot
+21000 end

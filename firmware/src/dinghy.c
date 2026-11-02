@@ -18,7 +18,7 @@
  * Rules of the road (the chip has no FPU and no libgcc): integers only, no float, no 64-bit division.
  * tests/host.c runs this file on a computer: the screen as a PNG, the sound as a WAV. */
 #define APP_NAME "QUORUM"
-#define Q_VERSION "0.1"
+#define Q_VERSION "0.2"
 static void app_idle(void);
 #define LCD_IDLE app_idle                       /* while the screen's DMA runs: the clock and MIDI keep going */
 #define CV_MAX (240u * 218u)                    /* the page body's canvas */
@@ -71,6 +71,7 @@ typedef struct { int32_t lo, bp; } svf_t;
 static svf_t svf[2][2];
 
 static volatile uint32_t us_sum, us_n, us_peak; /* the interrupt's time, for the CPU line */
+static volatile uint32_t bits_v;                /* the engine: 0 smooth (16 bit inside, 12 at the output), 1 12 bit, 2 8 bit */
 static volatile uint32_t live_v;
 static volatile int32_t kshow_v[2][NP];         /* each strike's level now (for the screens) */
 
@@ -129,8 +130,9 @@ static int32_t soft_out(int32_t x)              /* linear to 20000, then bending
 }
 static void render(int32_t *out)                /* SUB frames at 44.1 kHz: 16 computed, each held twice */
 {
-    const uint32_t nf = SUB / 2u;
-    const int32_t qm = ~15, qh = 8;             /* 12 bit words on the bus */
+    const uint32_t nf = SUB / 2u, bq = bits_v;
+    const int32_t qm = bq == 2u ? ~255 : ~15, qh = bq == 2u ? 128 : 8;   /* the bus's word: 8 bit, else 12 */
+    const int32_t lm = bq == 2u ? ~63 : ~3, lh = bq == 2u ? 32 : 2;      /* a level's: 256 / 4096 steps of 16384 */
     int32_t ba[SUB / 2], bb[SUB / 2];
     uint32_t h, i, s, live = 0;
     for (i = 0; i < nf; i++) ba[i] = bb[i] = 0;
@@ -182,18 +184,32 @@ static void render(int32_t *out)                /* SUB frames at 44.1 kHz: 16 co
         a = pamp[0][h];
         b = pamp[1][h];
         if (!a1 && !b1 && !a && !b) continue;   /* silent: costs nothing */
-        da = (a1 - a) >> 4;                     /* (16 frames) a straight ramp across the block */
-        db = (b1 - b) >> 4;
         inc = inc_v[h] << 1;                    /* (22 kHz: twice the step) */
         p = ph[h];
-        for (i = 0; i < nf; i++) {
-            int32_t sv;
-            p += inc;
-            sv = SINT[p >> (32u - SIN_BITS)];
-            ba[i] += (sv * a) >> 15;
-            bb[i] += (sv * b) >> 15;
-            a += da;
-            b += db;
+        if (!bq) {                              /* smooth: a straight ramp across the block */
+            da = (a1 - a) >> 4;
+            db = (b1 - b) >> 4;
+            for (i = 0; i < nf; i++) {
+                int32_t sv;
+                p += inc;
+                sv = SINT[p >> (32u - SIN_BITS)];
+                ba[i] += (sv * a) >> 15;
+                bb[i] += (sv * b) >> 15;
+                a += da;
+                b += db;
+            }
+        } else {                                /* 12 / 8 bit: the level held for the block (it steps), in 4096 / 256
+                                                 * steps of the loudest a partial gets; the sine and every product in
+                                                 * words of that length too (rounded) */
+            a1 = (cl(a1, 0, 16383) + lh) & lm;
+            b1 = (cl(b1, 0, 16383) + lh) & lm;
+            for (i = 0; i < nf; i++) {
+                int32_t sv;
+                p += inc;
+                sv = (SINT[p >> (32u - SIN_BITS)] + qh) & qm;
+                ba[i] += (((sv * a1) >> 13) + qh) & qm;   /* (x 4 here, not at the output: the words are the DAC's) */
+                bb[i] += (((sv * b1) >> 13) + qh) & qm;
+            }
         }
         ph[h] = p;
         pamp[0][h] = a1;
@@ -210,12 +226,13 @@ static void render(int32_t *out)                /* SUB frames at 44.1 kHz: 16 co
                 y = svf_bp(&svf[k][0], y, pf_v[k][0], pq_v[k]);
                 if (m == 3u) y = svf_bp(&svf[k][1], y, pf_v[k][1], pq_v[k]);
                 y = (y * pmk_v[k]) >> 12;
+                if (bq) y = (y + qh) & qm;
             }
             l += (y * pgl_v[k]) >> 15;
             r += (y * pgr_v[k]) >> 15;
         }
-        l = (soft_out(l * 4) + qh) & qm;
-        r = (soft_out(r * 4) + qh) & qm;
+        l = (soft_out(bq ? l : l * 4) + qh) & qm;
+        r = (soft_out(bq ? r : r * 4) + qh) & qm;
         out[4u * i] += l; out[4u * i + 1u] += r;
         out[4u * i + 2u] += l; out[4u * i + 3u] += r;
     }
@@ -247,7 +264,7 @@ typedef struct { uint8_t rule, div, mut, rescue, dens, shift; } gpar_t;
 typedef struct { uint8_t mode, part, vel, level, shape, decay, fall, series, a, op, b, filt; } kpar_t;
 typedef struct { uint8_t mode, freq, res, bw, level, pan; int8_t coarse, fine; } ppar_t;
 static struct {
-    uint8_t root, slew, tilt, level, anchor, tempo, clk_midi, gmode;
+    uint8_t root, slew, tilt, level, anchor, tempo, clk_midi, gmode, bits;
     int8_t stretch;                             /* per mille of the exponent: -30 .. +60 */
     gpar_t g[2];
     kpar_t k[2];
@@ -255,7 +272,7 @@ static struct {
     uint8_t srule, spoint, swidth, ssoft, sn;
     ppar_t pth[2];
 } P = {
-    33, 32, 100, 100, 1, 64, 0, GM_LOWHIGH, 0,
+    33, 32, 100, 100, 1, 64, 0, GM_LOWHIGH, 0, 0,
     {{90, 4, 3, 1, 30, 0}, {30, 2, 4, 1, 30, 0}},
     {{KM_STRIKE, 3, 89, 100, 64, 70, 76, SE_ALL, 15, 0, 3, 0},       /* A cell 5 AND clock /3 */
      {KM_MALLET, 2, 76, 100, 44, 82, 51, SE_ALL, 46, 0, 5, 0}},      /* B cell 3 AND clock /5 */
@@ -435,6 +452,7 @@ static void push_partials(void)
         }
     }
     path_push();
+    bits_v = P.bits;
 }
 
 /* ================================================================== the strikes (main loop) */
@@ -828,13 +846,14 @@ static uint32_t page_banks(uint32_t pg, uint32_t sb)
     if (pg == PG_GRID) return 2u;
     if (pg == PG_STRIKE) return 3u;
     if (pg == PG_SPLIT) return sb ? 2u : 1u;
+    if (pg == PG_GLOBAL) return 2u;
     return 1u;
 }
 
 /* ---- the knobs: what K1..K4 turn on each page and bank */
 enum { F_INT, F_SLEW, F_TILT, F_STR, F_PCT, F_GMODE, F_DIV, F_MUT, F_ONOFF, F_SHIFT, F_KMODE, F_PART, F_VEL, F_SHAPE,
        F_DEC, F_FALL, F_SER, F_LSRC, F_OP, F_ROUTE, F_SRULE, F_POINT, F_WIDTH, F_SOFT, F_PMODE, F_FREQ, F_RES, F_BW,
-       F_PAN, F_SEMI, F_CENT, F_CLK, F_TEMPO, F_PHOS, F_BRIGHT, F_NONE };
+       F_PAN, F_SEMI, F_CENT, F_CLK, F_TEMPO, F_PHOS, F_BRIGHT, F_BITS, F_NONE };
 typedef struct { const char *name; uint8_t *p; int16_t lo, hi; uint8_t fmt, step; } kn_t;
 static kn_t KN[4];
 static void kn_set(uint32_t i, const char *name, void *p, int32_t lo, int32_t hi, uint32_t fmt, uint32_t step)
@@ -868,14 +887,15 @@ static void knobs_for(uint32_t pg, uint32_t sb, uint32_t bk)
                         kn_set(2, "WIDTH", &P.swidth, 2, 50, F_WIDTH, 1); kn_set(3, "SOFT", &P.ssoft, 0, 36, F_SOFT, 1); }
         else {
             ppar_t *q = &P.pth[sb - 1u];
-            if (!bk) { kn_set(0, "FILTER", &q->mode, 0, 3, F_PMODE, 1); kn_set(1, q->mode == 1u ? "VOWEL" : "FREQ", &q->freq, 0, 127, F_FREQ, 1);
-                       kn_set(2, "RESO", &q->res, 0, 127, F_RES, 1); kn_set(3, "BW", &q->bw, 0, 40, F_BW, 1); }
+            if (!bk) { kn_set(0, "FILTER", &q->mode, 0, 3, F_PMODE, 1); kn_set(1, q->mode == 1u ? "VOWEL" : "FREQ", &q->freq, 0, 127, F_FREQ, 4);
+                       kn_set(2, "RESO", &q->res, 0, 127, F_RES, 4); kn_set(3, "BW", &q->bw, 0, 40, F_BW, 2); }
             else { kn_set(0, "LEVEL", &q->level, 0, 127, F_PCT, 1); kn_set(1, "PAN", &q->pan, 0, 127, F_PAN, 1);
                    kn_set(2, "PITCH", &q->coarse, -24, 24, F_SEMI, 1); kn_set(3, "FINE", &q->fine, -50, 50, F_CENT, 1); }
         }
     } else if (pg == PG_GLOBAL) {
-        kn_set(0, "CLOCK", &P.clk_midi, 0, 1, F_CLK, 1); kn_set(1, "TEMPO", &P.tempo, 0, 127, F_TEMPO, 1);
-        kn_set(2, "PHOS", &gset.phos, 0, NPHOS - 1, F_PHOS, 1); kn_set(3, "BRIGHT", &gset.bright, 0, 10, F_BRIGHT, 1);
+        if (!bk) { kn_set(0, "CLOCK", &P.clk_midi, 0, 1, F_CLK, 1); kn_set(1, "TEMPO", &P.tempo, 0, 127, F_TEMPO, 1);
+                   kn_set(2, "ENGINE", &P.bits, 0, 2, F_BITS, 1); }
+        else { kn_set(0, "PHOS", &gset.phos, 0, NPHOS - 1, F_PHOS, 1); kn_set(1, "BRIGHT", &gset.bright, 0, 10, F_BRIGHT, 1); }
     }
 }
 static int32_t kn_get(const kn_t *k) { return k->lo < 0 ? (int32_t)*(int8_t *)k->p : (int32_t)*k->p; }
@@ -929,6 +949,7 @@ static void kn_text(char *s, const kn_t *k, uint32_t pathk)
     case F_TEMPO: s_dec(s, Q_TEMPO_X100[v], 100u, 2u); break;
     case F_PHOS: { static const char *const PN[NPHOS] = {"GREEN", "AQUA", "AMBER", "WHITE"}; s_cat(s, PN[v % NPHOS]); } break;
     case F_BRIGHT: s_int(s, v); break;
+    case F_BITS: { static const char *const BN[3] = {"SMOOTH", "12 BIT", "8 BIT"}; s_cat(s, BN[v % 3]); } break;
     default: break;
     }
 }
@@ -1161,10 +1182,12 @@ static void draw_global(void)
     cv_rect(4 + wp, 62, 2, 16, PH_HI);
     cv_rect(120, 62, 1, 16, PH_LO);
     cv_text(4, 84, &FONT_S, "THE LINE: HALF THE BUDGET", PH_LO);
+    s[0] = 0; s_cat(s, "ENGINE "); s_cat(s, P.bits == 2u ? "8 BIT: 256 LEVELS" : P.bits == 1u ? "12 BIT: 4096 LEVELS" : "SMOOTH");
+    cv_text(4, 108, &FONT_S, s, PH_MID);
     s[0] = 0; s_cat(s, "QUORUM "); s_cat(s, Q_VERSION); s_cat(s, " (STAGE 1)");
-    cv_text(4, 120, &FONT_S, s, PH_LO);
+    cv_text(4, 130, &FONT_S, s, PH_LO);
     knob_row(0);
-    footer("SEL: RESET MAX");
+    footer("SEL BANK  PLAY: RESET MAX");
     cv_out(BODY_Y);
 }
 
@@ -1251,8 +1274,9 @@ static void after_change(uint32_t pg, uint32_t sb, uint32_t knob, uint32_t bk)
 {
     dirty_partials = 1;
     if (pg == PG_STRIKE && bk == 0u && knob == 0u) strike_mode_changed(sb & 1u);
-    if (pg == PG_GLOBAL && knob >= 2u) crt_build();
-    if (pg == PG_GLOBAL && knob == 1u) t_half = fm1_ms;
+    if (pg == PG_GLOBAL && bk == 1u) crt_build();
+    if (pg == PG_GLOBAL && bk == 0u && knob == 1u) t_half = fm1_ms;
+    if (pg == PG_GLOBAL && bk == 0u && knob == 2u) cpu_max = 0;   /* (a new engine: a new worst case) */
 }
 static void app_main(void)
 {
@@ -1309,10 +1333,11 @@ static void app_main(void)
         } else if (b & (1u << BTN_SEL)) {
             if (nb > 1u) { bank = (bank + 1u) % nb; hdr = 1; }
             else if (page == PG_VOICE) { P.anchor ^= 1u; dirty_partials = 1; }
-            else if (page == PG_GLOBAL) cpu_max = 0;
+
         }
         if (b & (1u << BTN_PLAY)) {
             if (page == PG_GRID) { grid_seed(sub & 1u); dirty_partials = 1; }
+            if (page == PG_GLOBAL) cpu_max = 0;
             if (page == PG_STRIKE) {
                 uint32_t s_ = sub & 1u;
                 strike_fire(s_);
@@ -1377,7 +1402,7 @@ static void app_main(void)
             fm1_led_key(BTN_OCT_DOWN, page_subs(page) > 1u && blink);
             fm1_led_key(BTN_OCT_UP, page_subs(page) > 1u && !blink);
             fm1_led_key(BTN_HOME, page != PG_INDEX && blink);
-            fm1_led_key(BTN_PLAY, (page == PG_STRIKE && (klo[sub & 1u] || blink)) || (page == PG_GRID && blink));
+            fm1_led_key(BTN_PLAY, (page == PG_STRIKE && (klo[sub & 1u] || blink)) || ((page == PG_GRID || page == PG_GLOBAL) && blink));
         }
     }
 }
