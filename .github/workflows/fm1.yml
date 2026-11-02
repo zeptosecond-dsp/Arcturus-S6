@@ -6,7 +6,7 @@ name: fm1
 
 on:
   push:
-    branches: [main, cellular]
+    branches: [main, cellular-s6]
   workflow_dispatch:
 
 jobs:
