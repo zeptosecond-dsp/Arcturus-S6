@@ -1,0 +1,33 @@
+# Quorum 0.2: logic gens, strike + trill, FGs / S&Hs, the matrix (btn: 1 OCT+ 3 SEL 4 ENV 5 LFO 10 ARP 12 PLAY)
+3000 btndown 3
+3100 btn 5
+3200 btnup 3
+4500 shot
+4600 btn 1
+4700 btn 1
+4800 btn 1
+6000 shot
+6500 btn 4
+6600 btn 1
+6700 enc 2 5
+6800 enc 3 2
+7000 btn 12
+7300 shot
+8000 btn 0
+8100 enc 2 -2
+8200 btn 12
+8250 shot
+9000 btndown 3
+9100 btn 4
+9200 btnup 3
+11000 shot
+11100 btn 0
+11200 btn 0
+12000 shot
+12500 btn 10
+12600 enc 2 4
+12700 enc 3 8
+13000 shot
+13100 btn 12
+13500 shot
+16000 end

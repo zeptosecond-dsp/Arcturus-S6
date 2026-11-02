@@ -1,10 +1,8 @@
-# Quorum 0.2: the engine smooth (3-9 s), 12 bit (9-15 s), 8 bit (15-21 s); the global page's screens
+# Quorum 0.2: engine ver 2 (12 bit, the default) 3-9 s, ver 1 (8 bit) 10-15 s, on GLOBAL: ENGINE
 3000 btn 7
+3200 btn 1
+3400 btn 1
 8000 shot
-9000 enc 4 1
+9000 enc 2 -1
 14000 shot
-15000 enc 4 1
-20000 shot
-20500 btn 3
-21000 shot
-21000 end
+15000 end

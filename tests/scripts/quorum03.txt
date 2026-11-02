@@ -1,0 +1,20 @@
+# Quorum 0.2: GLOBAL as Arcturus: TUNING (path B +7 st, quantised to A minor penta, glide), VDU, ENGINE
+3000 btndown 3
+3100 btn 6
+3200 btnup 3
+3500 btn 1
+3800 btn 1
+4000 btn 3
+4200 enc 4 7
+4400 enc 5 30
+5000 btn 7
+5300 enc 3 10
+5500 enc 0 1
+5700 btn 12
+5900 enc 5 6
+7000 shot
+8000 btn 1
+8500 shot
+9000 btn 1
+9500 shot
+10000 end
