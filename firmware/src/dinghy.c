@@ -111,9 +111,9 @@ static int32_t svf_bp(svf_t *s, int32_t x, int32_t f, int32_t q)   /* a Chamberl
     for (k = 0; k < 2u; k++) {
         int32_t hp = x - s->lo - (int32_t)(((int64_t)q * s->bp) >> 14);
         s->bp += (int32_t)(((int64_t)f * hp) >> 14);
-        s->bp = cl(s->bp, -4000000, 4000000);
+        s->bp = cl(s->bp, -3000000, 3000000);
         s->lo += (int32_t)(((int64_t)f * s->bp) >> 14);
-        s->lo = cl(s->lo, -4000000, 4000000);
+        s->lo = cl(s->lo, -3000000, 3000000);
     }
     return (int32_t)(((int64_t)s->bp * q) >> 14);   /* the peak at 0 dB, whatever the resonance */
 }
