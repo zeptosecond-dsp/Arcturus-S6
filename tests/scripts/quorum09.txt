@@ -1,0 +1,10 @@
+# Quorum 0.5: sequencer addressing from the mod matrix; clocked when nothing is pinned
+3000 btn 11
+4000 shot
+4100 btn 1
+5000 shot
+5100 btn 1
+6500 shot
+6600 btn 3
+7000 shot
+12000 end

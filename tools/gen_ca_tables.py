@@ -47,3 +47,26 @@ o2="/* a grid's clock (0..127): 0.05 .. 12 steps a second, as half a step in ms 
 o2+=arr("Q_GRID_HMS",'uint16_t',[round(500/r) for r in GR])
 o2+=arr("Q_GRID_X100",'uint16_t',[max(5,round(r*100)) for r in GR])
 open('firmware/src/q_tables.h','a').write(o2)
+
+# ---- Quorum 0.5: the phaser's first-order allpasses, H = (a + z^-1) / (1 + a z^-1), their 90-degree point swept
+# over 40 Hz .. 9 kHz (at 22.05 kHz; at 11 kHz an octave lower), 256 steps even in pitch; a Q15
+PF=[40*(225**(i/255)) for i in range(256)]
+def ap_a(f,fs=22050):
+    t=math.tan(math.pi*f/fs); return (t-1)/(t+1)
+o3="/* the phaser: its allpasses' coefficient over the sweep (0..255: 40 Hz .. 9 kHz at 22.05 kHz), Q15; and the\n * centre knob (0..127) in Hz */\n"
+o3+=arr("Q_PH_A",'int16_t',[round(32767*ap_a(f)) for f in PF])
+o3+=arr("Q_PH_HZ",'uint16_t',[round(PF[i*2]) for i in range(128)])
+open('firmware/src/q_tables.h','a').write(o3)
+# the phaser's notches for 2..16 stages (N): where N first-order allpasses turn an odd multiple of 180 degrees,
+# f = f0 tan((2k+1) pi / 2N), as offsets from the sweep's position in its steps (255 over log2(225) octaves)
+SPO=255/math.log2(225)
+NT=[]
+for s in range(1,9):
+    N=2*s; row=[]
+    for k in range(8):
+        if 2*k+1<N: row.append(round(math.log2(math.tan((2*k+1)*math.pi/(2*N)))*SPO))
+        else: row.append(-32768)
+    NT+=row
+o4="/* the phaser's notches: 2..16 stages (8 rows), up to 8 each, as offsets in sweep steps (-32768: none) */\n"
+o4+=arr("Q_PH_NOTCH",'int16_t',NT,8)
+open('firmware/src/q_tables.h','a').write(o4)

@@ -1,0 +1,27 @@
+# Quorum 0.5: the power-on drone, FX pages, the disk
+3000 shot
+3500 btn 2
+4000 shot
+4500 btn 2
+5000 shot
+5500 btn 2
+6000 shot
+6500 btn 2
+7000 shot
+7500 btn 9
+8000 shot
+8100 enc 0 -1
+8200 btn 3
+8300 btn 3
+9000 shot
+9100 btn 2
+9200 btn 3
+9800 shot
+10000 btn 9
+10100 enc 0 2
+10200 btn 9
+10800 shot
+12000 btn 3
+12100 btn 3
+13000 shot
+20000 end
