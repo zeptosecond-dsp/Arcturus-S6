@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-only */
-/* QUORUM Cellular Synthesis System: version 1.0. The sister of Arcturus S6 (the
+/* QUORUM Cellular Synthesis System: version 1.0.1. The sister of Arcturus S6 (the
  * main branch), on Dinghy (zvenson), on the platform of Felucca (Hügelton Instruments) as SLOOP (isod89) carries it.
  *
  * 64 sine partials at 22.05 kHz (each sample held twice) and 12 bit, as S6. Two 32-cell automata switch them; two
@@ -9,7 +9,7 @@
  * and S6's reverb, chained in any order.
  *
  *   HOME   1 INDEX      SELECT: a page, SEL: open it
- *   EDIT   2 VOICE      K1 slew, K2 tilt, K3 stretch, K4 level; ALGORITHM root; PRESETS clock; SEL anchor
+ *   EDIT   2 VOICE      K1 slew, K2 tilt, K3 stretch, K4 level; ALGORITHM root; SEL F0 (the fundamental always on)
  *   LFO    3 GRIDS      OCT: grid A / B; K1-K4 the bank shown, SEL (flashing) the other bank; PLAY reseeds
  *   ENV    4 STRIKE     OCT: strike 1 / 2; SEL: SOUND, ENVELOPE, TRILL; ALGORITHM sum / filter; PRESETS routing; PLAY fires
  *   SEL+EDIT 5 SPLIT    OCT: SPLIT / PATH A / PATH B; K1-K4, SEL: two banks on the paths; ALGORITHM N; PLAY on a
@@ -24,7 +24,7 @@
  *                       ALGORITHM moves it along, PRESETS up / down, SELECT its length, PLAY puts it down, SEL drops it;
  *                       SEL held + PLAY clears. REC records from the keys as it runs; running, a key transposes it.
  *                       Its notes move the paths on the keys; its gate (KEYS) goes to the gate matrix
- *   SEL+ARP X GATE MATRIX  24 gate sources x 16 destinations (the strikes, FG triggers, S&H clocks, grid steps,
+ *   SEL+ARP X GATE MATRIX  25 gate sources x 16 destinations (the strikes, FG triggers, S&H clocks, grid steps,
  *                       the sequencers' advance and reset), OR'd
  *   FX     F FX         OCT (or FX again): PHASER, DELAY, REVERB, ROUTING; SEL the banks (sends A / B on each);
  *                       PRESETS 22 / 11 kHz; PLAY: phaser feedback off / clear the delays / freeze the reverb
@@ -36,7 +36,7 @@
  * Rules of the road (the chip has no FPU and no libgcc): integers only, no float, no 64-bit division.
  * tests/host.c runs this file on a computer: the screen as a PNG, the sound as a WAV. */
 #define APP_NAME "QUORUM"
-#define Q_VERSION "1.0"
+#define Q_VERSION "1.0.1"
 static void app_idle(void);
 #define LCD_IDLE app_idle                       /* while the screen's DMA runs: the clock and MIDI keep going */
 #define CV_MAX (240u * 218u)                    /* the page body's canvas */
@@ -163,7 +163,7 @@ enum { FM_CYCLE, FM_ONCE, FM_GATE };
 enum { D_TILT, D_STR, D_LVL, D_SPLIT, D_FILTA, D_FILTB, D_PANA, D_PANB, D_PITA, D_PITB,
        D_K1PART, D_K1VEL, D_K1SHP, D_K1LVL, D_K2PART, D_K2VEL, D_K2SHP, D_K2LVL,
        D_RULA, D_RULB, D_SPDA, D_SPDB, D_FG1, D_FG2, D_FG3, D_FG4, D_QRATE, D_SQ1, D_SQ2, D_SQ3,
-       D_PHL, D_PHR, D_DLT, D_DLF, D_RVD, D_RVR, NDST };   /* (the phaser's left / right sweep, the delays' time and
+       D_PHL, D_PHR, D_DLT, D_DLF, D_RVD, D_RVR, D_MUTA, D_MUTB, NDST };   /* (the phaser's left / right sweep, the delays' time and
                                                         feedback, the reverb's decay and return) */
 /* the gate matrix: rows (sources) and columns (destinations); pins OR'd into each column */
 enum { GS_GEN = 0, GS_LFO = 4, GS_EOC = 8, GS_QNT = 12, GS_CLK = 14, GS_POP = 19, GS_SEQ = 21, GS_KSQ = 24, NGS = 25 };
@@ -486,6 +486,7 @@ static void mod_apply(void)                     /* E = P, moved by the matrix (a
         E.k[k].vel = m8(P.k[k].vel, MK(b + 1u), 0, 127);
         E.k[k].shape = m8(P.k[k].shape, MK(b + 2u), 0, 127);
         E.k[k].level = m8(P.k[k].level, MK(b + 3u), 0, 127);
+        E.g[k].mut = m8(P.g[k].mut, MK(k ? D_MUTB : D_MUTA) / 4, 0, 50);
         E.g[k].rule = (uint8_t)(((int32_t)P.g[k].rule + MK(k ? D_RULB : D_RULA) * 2) & 255);   /* (round the wheel: a
                                                                  full source at 63 reaches every rule) */
         E.g[k].rate = m8(P.g[k].rate, MK(k ? D_SPDB : D_SPDA), 0, 127);   /* (up: faster) */
@@ -1281,13 +1282,14 @@ static void gins(char *s, uint32_t d)           /* what is pinned into destinati
 }
 static const char *const DST_SHORT[NDST] = {"TLT", "STR", "LVL", "SPL", "FLA", "FLB", "PNA", "PNB", "PTA", "PTB",
     "1PT", "1VL", "1SH", "1LV", "2PT", "2VL", "2SH", "2LV", "RLA", "RLB", "SPA", "SPB", "F1R", "F2R", "F3R", "F4R", "QRT", "SQ1", "SQ2", "SQ3",
-    "PHL", "PHR", "DLT", "DLF", "RVD", "RVR"};
+    "PHL", "PHR", "DLT", "DLF", "RVD", "RVR", "MTA", "MTB"};
 static const char *const DST_NAME[NDST] = {"TILT", "STRETCH", "OUT LEVEL", "SPLIT POINT", "FILTER A", "FILTER B",
     "PAN A", "PAN B", "PITCH A", "PITCH B", "STRIKE 1 PARTIAL", "STRIKE 1 VELOCITY", "STRIKE 1 SHAPE", "STRIKE 1 LEVEL",
     "STRIKE 2 PARTIAL", "STRIKE 2 VELOCITY", "STRIKE 2 SHAPE", "STRIKE 2 LEVEL", "GRID A RULE", "GRID B RULE",
     "GRID A SPEED", "GRID B SPEED", "FG1 RATE", "FG2 RATE", "FG3 RATE", "FG4 RATE", "QUAD RATE",
     "SEQ 1 ADDRESS", "SEQ 2 ADDRESS", "SEQ 3 ADDRESS",
-    "PHASER LEFT", "PHASER RIGHT", "DELAY TIME", "DELAY FEEDBACK", "REVERB DECAY", "REVERB RETURN"};
+    "PHASER LEFT", "PHASER RIGHT", "DELAY TIME", "DELAY FEEDBACK", "REVERB DECAY", "REVERB RETURN",
+    "GRID A MUTATION", "GRID B MUTATION"};
 static uint32_t isqrt32(uint32_t v) { uint32_t r = 0, b = 1u << 30; while (b > v) b >>= 2; while (b) { if (v >= r + b) { v -= r + b; r = (r >> 1) + b; } else r >>= 1; b >>= 2; } return r; }
 
 /* ================================================================== the screen: green phosphor */
@@ -2690,14 +2692,14 @@ static void randomize(void)
     else { pin(S_QUAD(0), D_PANA, rnd_in(20, 50)); pin(S_QUAD(2), D_PANB, rnd_in(20, 50)); }
     if (rnd(3)) P.dep[S_FG(rnd(NFG))][D_LVL] = (int8_t)-rnd_in(8, 25);   /* (down from full: a swell) */
     for (n = (uint32_t)rnd_in(1, 5); n; n--) {
-        static const uint8_t DD[] = {D_TILT, D_FILTA, D_FILTB, D_PANA, D_PANB, D_SPLIT, D_STR, D_SPDA, D_SPDB,
+        static const uint8_t DD[] = {D_TILT, D_FILTA, D_FILTB, D_PANA, D_PANB, D_SPLIT, D_STR, D_MUTA, D_MUTB, D_SPDA, D_SPDB,
                                      D_RVD, D_PHL, D_PHR, D_FG1, D_FG2, D_FG3, D_FG4, D_QRATE};
         uint32_t dst = DD[rnd(sizeof DD)];
         pin(rnd_src_slow(), dst, dst == D_STR ? rnd_in(3, 10) : rnd_in(8, 35));
     }
     if (rnd_wild) {                             /* RANDOM by hand: the strikes, the logic, melodies, the sequencers */
         static const uint8_t ANY[] = {D_TILT, D_STR, D_SPLIT, D_FILTA, D_FILTB, D_PANA, D_PANB, D_K1PART, D_K1VEL, D_K1SHP,
-                                      D_K2PART, D_K2VEL, D_K2SHP, D_RULA, D_RULB, D_SPDA, D_SPDB, D_FG1, D_FG2, D_FG3, D_FG4,
+                                      D_K2PART, D_K2VEL, D_K2SHP, D_RULA, D_RULB, D_MUTA, D_MUTB, D_SPDA, D_SPDB, D_FG1, D_FG2, D_FG3, D_FG4,
                                       D_QRATE, D_PHL, D_PHR, D_DLT, D_DLF, D_RVD, D_RVR};
         for (k = 0; k < NGEN; k++) {            /* 1: the logic: cells, clocks, each other, gated by LFOs */
             gen_t *g = &P.gen[k];

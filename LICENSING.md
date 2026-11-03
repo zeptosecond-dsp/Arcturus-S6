@@ -1,10 +1,11 @@
 # Licensing
 
-Arcturus S6 is free software under the GNU General Public License, version 3 only (`GPL-3.0-only`, full text in
-`LICENSE`), as Dinghy, which it is built on. The app (`firmware/src/dinghy.c`, `verb.h`, `tunings.h`, `luts.h`,
-`wt_tables.h`, `font_chunky.h`), `tools/gen_tables.py`, `tools/gen_font8.py`, `tools/preview_tables.py`,
-`tools/fm1_winmidi.py`, the host scripts in `tests/scripts/` and `docs/QUICKSTART.md` are by Zeptosecond DSP, written
-by machine (Claude, by Anthropic) with human guidance. Everything else is Dinghy's, as below.
+Quorum is free software under the GNU General Public License, version 3 only (`GPL-3.0-only`, full text in
+`LICENSE`), as Dinghy, which it is built on. The app (`firmware/src/dinghy.c`, `ca_tables.h`, `q_tables.h`, `verb.h`,
+`tunings.h`, `luts.h`, `font_chunky.h`), `tools/gen_ca_tables.py`, `tools/gen_tables.py`, `tools/gen_font8.py`,
+`tools/preview_tables.py`, `tools/fm1_winmidi.py`, the host scripts in `tests/scripts/` and `docs/QUICKSTART.md` are by
+Zeptosecond DSP, written by machine (Claude, by Anthropic) with human guidance; `verb.h` (the reverb), `tunings.h`,
+`luts.h` and `wt_tables.h` come from its sister, Arcturus S6 (the `main` branch). Everything else is Dinghy's, as below.
 
 ---
 
@@ -34,9 +35,9 @@ complete source under the same licence too.
 ## The logo
 
 Dinghy's logo (the designburg signet, all rights reserved, not under the GPL) marks Dinghy itself and is not part of
-this fork. `assets/card.png` is Arcturus S6's own (its boot screen).
+this fork. `assets/card.png` is Quorum's own (its boot screen).
 
 ## Trademarks
 
 "Felucca" and "Hügelton Instruments" are names of Hügelton Instruments; "M-VAVE", "FM-1", "SMK-37" and "MKE-P37"
-belong to their owners. Dinghy and Arcturus S6 are not made or endorsed by them.
+belong to their owners. Dinghy and Quorum are not made or endorsed by them.

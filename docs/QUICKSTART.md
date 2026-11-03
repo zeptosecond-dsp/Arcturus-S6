@@ -1,76 +1,141 @@
-# Arcturus S6 Quick Start Guide
+# Quorum Quick Start Guide
 
-Arcturus S6 turns the M-VAVE FM-1 into a four-oscillator wavetable instrument that plays itself: patch modulators into each other, set it going, and let it evolve. 
+Quorum turns the M-VAVE FM-1 into a 64-partial additive instrument that plays itself: two rows of cellular automata
+switch the harmonics on and off, logic and modulators patched into each other keep it moving, and you steer.
 
 ## What it is
 
-Arcturus S6 is an experimental system for generative, evolving soundscapes, not a keyboard synth. There is no sequencer and no filter section: sound comes from four wavetable oscillators, and movement comes from modulators patched into the oscillators, into each other and into themselves.
+Quorum is an experimental system for generative, evolving soundscapes, not a keyboard synth. It's the sister of
+Arcturus S6: where Arcturus sweeps wavetables, Quorum builds every sound from sine waves and lets simple rules decide
+which ones sound.
 
-**The Serge idea.** Serge synthesizers are built from small, general-purpose functions instead of fixed voices. A function generator can be an envelope, an LFO or a slew limiter depending on how it's patched; a gate can come from an LFO, a logic gate or the end of another envelope. The power is in the feedback: when modulators control each other, a few simple parts make patterns that never quite repeat. Arcturus S6 works the same way, with six Serge-style function generators, two sample-and-holds, a quadrature LFO, four gate generators with logic, and two patch matrices to connect them.
+**The additive idea.** Any sound can be built from sine waves at whole-number multiples of a fundamental: its
+partials. Quorum has 64 of them, as the Kawai K5 did. Their levels follow a slope (TILT), their spacing can be
+stretched out of tune for bells and metal (STRETCH), and each one fades in and out at the SLEW rate rather than
+clicking.
 
-**The sound.** The engine runs natively at 12 bit and 22.05kHz, with 8-bit wavetables and no smoothing, so it aliases and steps the way early digital instruments did. Two machines are its direct influences:
+**The cellular idea.** Each grid is a row of 32 cells, on or off. At every clock step each cell looks at itself and its
+two neighbours and follows a rule (one of 256, Wolfram's elementary automata) to decide its next state. Some rules
+settle, some repeat, some never do (rule 30, rule 110). A cell that's on lets its partial sound, so the rule plays the
+harmonic series. Two grids share the 64 partials (low / high, odd / even, or combined with AND, OR, XOR), each on its
+own clock or in lockstep. The name comes from quorum sensing, how bacteria act together once enough of them are
+present, hence the petri dish on the boot screen.
 
-- **PPG Wave & Waveterm** (1981, 1983): gritty, stepped wavetables you sweep through, rather than clean modern ones.
-- **Fairlight CMI** (1979): low sample rates and short words, plus the look. The green phosphor screen, numbered pages and central index are taken from the Fairlight's monitor.
+**The Serge idea.** As in Arcturus, the movement comes from small, general-purpose parts patched together. Logic
+generators turn cells and clocks into gates; function generators, sample-and-holds, a quadrature LFO and slew
+sequencers make control voltages; two matrices connect everything to everything, the grids' own rules included. When
+modulators control each other, a few simple parts make patterns that never quite repeat.
 
-Expect drones, pulses and slowly shifting textures with a distinct early digital edge, and expect surprises: it's an experimental instrument, written by machine with human guidance.
+**The sound.** The engine runs at 22.05kHz. ENGINE VER V2 (the default) works in 12 bit; V1 works in 8 bit throughout,
+levels and all, closer to the early Fairlight CMI. Two machines are its direct influences:
+
+- **Kawai K5** (1987): additive synthesis with banks of sine partials, here put under the cells' control.
+- **Fairlight CMI** (1979): short words and low rates in the sound, and the look. The phosphor screen, numbered pages
+  and central index are taken from the Fairlight's monitor.
+
+Expect drones, shimmering spectra, plucked and bowed harmonics and slowly shifting textures, and expect surprises:
+it's an experimental instrument, written by machine with human guidance.
 
 ## Getting around
 
 The rule of thumb: **a flashing button does something on this page.** If it's flashing, try it.
 
-- **The index.** The system boots to PAGE 1 INDEX. Turn **SELECT** to move the blinking cursor, press the flashing **SEL** to open a page.
+- **The index.** The system boots to PAGE 1 INDEX. Turn **SELECT** to move the blinking cursor, press the flashing
+  **SEL** to open a page.
 - **HOME** flashes whenever you're away from the index. Press it to go back; the cursor remembers where you were.
-- **Shortcut buttons** jump straight to a page (EDIT, ENV, LFO, ARP, SEQ, GLO, FX, SAVE); hold **SEL** with EDIT or ENV for their second page. The table below lists them.
-- **The knobs** edit what's on screen; hints along the bottom say which knob does what. **Hold SEL** for a second layer of controls on pages that have one.
-- **OCT− / OCT+** flash in turn on pages with more than one of something. They step to the previous or next one (FG, S&H, gate generator, oscillator, sub-page), wrapping round. On page 2 they shift the keyboard's octave instead.
-- **PLAY** flashes where it has a job: a manual gate or sample, setting a pin, freezing the reverb, naming a patch.
-- **The keys are a display.** On most pages the key LEDs follow what's on screen: an FG's slope travelling along the keys, an S&H value, gate states, an LFO dot. On page 2 the keys set oscillator pitches.
-- **INIT and RANDOM.** The top two keys flash on every page except page 2. **G5** (far right) rolls a new random patch and **F#5** loads INIT (four sines in fifths, nothing patched). Each needs a second press to confirm; anything else cancels.
-- **Power-on** always rolls a gentle random drone. RANDOM from the keys or the DISK page rolls busier, more heavily patched sounds.
+- **Shortcut buttons** jump straight to a page (EDIT, LFO, ENV, SEQ, ARP, FX, GLO, SAVE); hold **SEL** with EDIT,
+  LFO, ENV or ARP for their second page. The table below lists them.
+- **The knobs** K1 to K4 edit what's along the bottom of the screen. Where **SEL** flashes, it switches to the next bank
+  of four.
+- **OCT− / OCT+** flash in turn on pages with more than one of something. They step to the previous or next one (grid,
+  strike, generator, FG, sequencer, path, effect), wrapping round.
+- **PLAY** flashes where it has a job: reseeding a grid, firing a strike, setting a pin, a sequencer step's gate,
+  freezing the reverb, naming a patch. Where it's solid, the thing it toggles is on.
+- **The keys.** The lowest key you press (F1 to F3) sets the root for the paths that track the keyboard. The key LEDs
+  show grid A's cells (on the GRIDS page, the grid shown).
+- **The top two keys** are lit on every page: they fire strike 1 and strike 2 by hand. Bow and Breath sound for as long
+  as you hold the key.
+- **Power-on** always rolls a new slow drone. RANDOM on the DISK page rolls a busy, heavily patched patch (now and then
+  it's just noise: roll again), and INIT gives you a plain one to build from. Your phosphor, brightness, engine version
+  and clock source are remembered.
 
 ## Page by page
 
-Eleven pages, each reachable from the index or its shortcut button.
+Thirteen pages, each reachable from the index or its shortcut button.
 
 | Page | Button | What's there |
 | --- | --- | --- |
 | 1 INDEX | HOME | The central menu. SELECT moves, SEL opens. |
-| 2 OSCILLATORS | EDIT | The four oscillators: 1 and 2 phase-modulate each other, A and B have wavefolders. Note, fine, table, wave, PM/fold, threshold, hi cut, level, pan. SELECT picks the oscillator, keys set its note, SEL for more. |
-| 3 WAVETABLE | SEL + EDIT | The selected oscillator's table in 3D, the current wave lit. K1 wave, K2 table (13, the last generative: PLAY rerolls it), K3 smooth or stepped scanning. |
-| 4 FUNCTION GEN | ENV | Six Serge-style FGs: rise, fall, curve (lin / exp / log) and mode (cycle / gate / once). Each sends an end-of-cycle gate. PLAY is a manual gate. |
-| 5 S&H / QUAD | SEL + ENV | Two sample-and-holds (input: noise or any modulator, slew) with gate and sample lamps, and the quadrature LFO (SIN+, SIN−, COS+, COS−). PLAY samples by hand. |
-| 6 GATE GEN | LFO | Four gate generators: two square LFOs each (free or MIDI clock, rate, duty) into AND, NAND, OR, NOR, XOR, XNOR, plus a NOT. Shown as a live logic analyser. |
-| 7 MOD MATRIX | ARP | The EMS-style pin grid: 12 sources by every destination. K1 source, K2 destination, K3 depth (±), PLAY sets or pulls a pin. |
-| 8 GATE MATRIX | SEQ | Gate sources (logic outputs, EOCs, quantiser note gates) to gate destinations (FGs, S&Hs, logic inputs, reverb freeze). Pins light with live gate state. |
-| 9 GLOBAL | GLO | TUNING: 21 tunings and their scales, root, per-oscillator quantise and glide. OCT for VDU: phosphor colour, CRT brightness, a test card. |
-| R FX | FX | Four halves, stepped with FX or OCT: REVERB (a low-rate plate, freeze), DELAY (a shift register), FLANGER (its own LFO, 22 / 11k) and ROUTING (the order of the three, and links between them). Each effect has its own send per oscillator. |
-| D DISK | SAVE | A:\SYSTEM holds INIT and RANDOM, B:\PATCHES your 16 slots. SEL loads, SAVE saves (twice to overwrite), PLAY names a patch. |
+| 2 VOICE | EDIT | The 64 partials as bars (path A solid, path B lined). K1 SLEW (how fast partials fade in and out), K2 TILT (the spectrum's slope), K3 STRETCH (out of harmonic: bells), K4 LEVEL. ALGORITHM sets the root; SEL keeps the fundamental always on (F0). |
+| 3 GRIDS | LFO | Grid A or B (OCT), its last 28 rows scrolling. Bank 1: RULE (shown as 45>110 when the matrix moves it), RATE (steps a second, a MIDI division, or GATE when the gate matrix steps it), MUTATE, SHARE (how the grids split the partials). Bank 2: RESCUE (flips a few cells when a grid dies, fills or loops), SEED (density for reseeding), SHIFT, LOCK (grid B on grid A's clock). PLAY reseeds. |
+| 4 STRIKE | ENV | Strike 1 or 2. Bank 1: MODE (Strike, Mallet with marimba bar ratios, Bow, Breath), PARTIAL, VEL, LEVEL. Bank 2: the attack's shape, DECAY, FALL (higher partials die sooner, as a low-pass gate), SERIES (all, odd, even). Bank 3: the trill, COUNT, SPACE, PATTERN (rise, fall, hump), MAX VEL. ALGORITHM: summed with the grids or filtered by them; PRESETS: into its own path (strike 1 to A, 2 to B) or through the split. PLAY fires it. Its gate comes from the gate matrix. |
+| 5 SPLIT + FILTERS | SEL + EDIT | SPLIT: RULE (cutoff, band, odd / even, every Nth, grid A / B, source), POINT, WIDTH, SOFT; ALGORITHM sets N. PATH A and PATH B: bank 1 FILTER (off, vowel, 12dB or 24dB band pass), FREQ or VOWEL, RESO, BW; bank 2 LEVEL, PAN, PITCH, FINE. PLAY: the path on or off the keys (off: it holds its note). |
+| 6 LOGIC | SEL + LFO | Four generators drawn as a logic analyser: INPUT (a clock division, any cell of either grid, a grid's population, another generator, an FG's end of cycle), LOGIC (AND, OR, XOR, NAND, NOR, XNOR, or the input or LFO alone), RATE and DUTY of its square LFO. ALGORITHM: the LFO free or on the clock. |
+| 7 SEQUENCERS | SEQ | SEQ 1 to 3: eight steps each. Bank 1 STEP (the cursor), VALUE, GATE, LENGTH; bank 2 DIR (forward, pendulum, random), SLEW, CLOCK, CHAIN. PLAY sets the step's gate. A pin into SEQ ADDRESS on the mod matrix sweeps the steps, Serge style; otherwise ADVANCE gates move it, otherwise the master clock. KEYS: the keyboard sequencer (below). |
+| 8 FUNCTION GEN | SEL + ENV | FG 1 to 4 (RISE, FALL, CURVE lin / exp / log, MODE cycle / once / gate; each sends an end-of-cycle gate), S&H 1 and 2 (INPUT: noise or any modulator, SLEW; clocked from the gate matrix), and the QUAD LFO (SIN+, SIN−, COS+, COS−). |
+| 9 MOD MATRIX | ARP | The EMS-style pin grid: 19 sources by 38 destinations (tilt, stretch, split, the filters, pans and pitches, the strikes, the grids' rules, mutation and speed, the FGs' rates, the sequencers' addresses, the effects). K1 or SELECT the source, K2 or PRESETS the destination, K3 the depth (±), PLAY sets or pulls a pin. |
+| X GATE MATRIX | SEL + ARP | 25 gate sources (generators, their LFOs, EOCs, quantiser note gates, clock divisions, the grids' populations, the sequencers' step gates, KEYS) to 16 destinations (the strikes, FG triggers, S&H clocks, grid steps, sequencer advance and reset). Pins light with the live gate. |
+| F FX | FX | Four parts, stepped with FX or OCT. PHASER: stereo, 2 to 16 stages, its sides swept a quarter cycle apart by its LFO, or by the mod matrix (PHASER LEFT / RIGHT); PRESETS 22 / 11k, PLAY zeroes the feedback. DELAY: two shift registers, left and right, CROSS for ping-pong; PLAY clears. REVERB: Arcturus's plate; PRESETS 22 / 11k, PLAY freezes. ROUTING: the order of the three and the links between them. Each effect has a send from each path (SEND A, SEND B). |
+| G GLOBAL | GLO | TUNING: 21 tunings and their scales, the root; SELECT picks a path, PLAY quantises it, K4 its glide. VDU: phosphor colour (green, aqua, amber, white) and brightness. ENGINE: ENG VER (V1 8 bit, V2 12 bit), CLOCK (internal or MIDI) and the CPU meter. |
+| D DISK | SAVE | A:\SYSTEM holds INIT and RANDOM, B:\PATCHES your 16 slots. SEL loads (press twice), SAVE saves (twice to overwrite), PLAY names a patch. |
+
+### The keyboard sequencer
+
+On the SEQUENCERS page, OCT past SEQ 3 to KEYS: a piano roll of up to 32 steps, one note at a time.
+
+- **Placing notes.** PLAY brings up a note bar, flashing. PRESETS moves it up and down, ALGORITHM along, SELECT makes it
+  longer (clockwise) or shorter. PLAY again puts it down. PLAY on a note picks it up to move it; SEL drops the bar
+  (which deletes a note you picked up). Hold SEL and press PLAY to clear the roll.
+- **Knobs.** STEPS (1 to 32), DIR, CLOCK (turn left to follow the master clock, /32 to /1; turn right for its own,
+  0.05 to 12 steps a second), RUN.
+- **Recording.** REC records from the keys as it runs (and starts it): notes land on the nearest step, and a held key
+  makes a longer note.
+- **Playing.** Its notes move the paths that track the keyboard. While it runs, a key transposes it. Each note sends a
+  gate (KEYS) to the gate matrix: pin it to a strike to hear each note struck. The paths have no envelope of their
+  own, so empty steps hold the last pitch; the strikes and FGs give the notes their shape.
 
 ## Patch ideas
 
-Start from INIT (F#5, twice) and build up. These are loose starting points; the fun is in what goes wrong. Head over to the Disk page and try rolling a few random patches too, just to get a sense for how the system sounds and what its capabilities are. 
+Start from INIT (DISK page, SELECT up to INIT, SEL twice) and build up. These are loose starting points; the fun is in
+what goes wrong. Roll a few RANDOM patches first, just to get a sense for how the system sounds and what it can do.
 
-**Krell.** The classic self-varying patch: every event sets up the next one.
+**A drone with a line over it.**
 
-1. Set FG1 to ONCE with a short rise and a longer fall, and pin FG1 to an oscillator's LEVEL and HI CUT (page 7).
-2. In the gate matrix (page 8), send FG1's EOC to S1's sample input and to FG1's own gate, so it retriggers itself.
-3. Pin S1 to FG1's RISE and FALL, and to the oscillator's PITCH with quantise on (page 9). Each note now gets a new pitch, length and shape.
+1. On the SPLIT page, OCT to PATH A and press PLAY: path A comes off the keys and holds its note.
+2. On SEQUENCERS, OCT to KEYS. Place a few notes, turn CLOCK to the right for a rate of its own and RUN on.
+3. In the gate matrix, pin KEYS to STRIKE 2 and set strike 2 to Mallet: each note is struck on path B.
+4. Give path B some glide (GLOBAL, TUNING, K4) and press keys while it runs: the line moves, the drone stays.
 
-**A basic generative melody.**
+**A self-playing melody.**
 
-1. On a gate generator, run its two LFOs at unrelated rates and send the XOR output to S1's sample input.
-2. Pin S1 (input: noise, or a quad phase for something smoother) to an oscillator's PITCH, and turn its quantiser on with a scale you like.
-3. Send that oscillator's quantiser note gate (Q1 NOTE etc.) to an FG in ONCE mode, and pin the FG to the oscillator's LEVEL. Each new note now plucks itself.
+1. On LOGIC, set generator 1's input to one of grid A's cells, its logic to AND, its LFO on the clock.
+2. In the gate matrix, pin GEN1 to S&H 1 CLOCK.
+3. In the mod matrix, pin SSG1 to PITCH B. On GLOBAL, TUNING, SELECT path B and press PLAY to quantise it; pick a
+   scale you like.
+4. Pin QNT B to STRIKE 2 in the gate matrix: each new note strikes itself.
 
-**Rhythms from logic.**
+**Rhythms from the cells.**
 
-- Two square LFOs at related rates (try MIDI clock divisions) make polyrhythms through AND, OR and XOR; NOT turns a short pulse into a long one.
-- Send different logic outputs to FGs in ONCE mode, each opening a different oscillator, for interlocking parts.
-- Feed an FG's EOC back into a logic input, or pin the quad LFO to a gate LFO's RATE, for rhythms that break and drift.
+- Generators can take any single cell as their input: pick cells from both grids, gate them with clocked LFOs through
+  AND or XOR, and send them to the strikes and FG triggers.
+- Turn LOCK off and run grid B at a different rate from grid A for patterns that drift against each other.
+- A trill on strike 1 (bank 3) turns single hits into rolls; pin a generator to GRID A STEP to clock a grid from logic.
 
-**Slow drone motion.**
+**Rules that evolve.**
 
-- Pin SIN+ and COS+ to the WAVE of oscillators 1 and 2: their tables sweep a quarter cycle apart.
-- Slewed noise from S2 into PM/FOLD gives slow, unpredictable bite.
-- A long, slow gate on the reverb's FREEZE (page 8) catches and holds moments of the texture.
+- Pin a slow FG, or a slewed sequencer, to GRID A RULE: the grid passes through other rules as it moves, from order to
+  chaos and back. The RULE knob shows where it is (45>110).
+- A little MUTATE and RESCUE keep a grid alive; pin POP A (grid A's population) back into TILT or a strike's partial
+  to close the loop.
+
+**Vowel sequences, Serge style.**
+
+1. Set path A's filter to VOWEL and pin SEQ 1 to FILTER A.
+2. Pin FG1 to SEQ 1 ADDRESS and let FG1 cycle: it sweeps the vowel steps, speeding up and slowing down with its curve.
+
+**Slow motion and big spaces.**
+
+- Pin SIN+ and COS+ to PAN A and PAN B: the paths circle each other.
+- Send path A to the phaser, 16 stages, feedback well up and a slow rate, for the whoosh; pin two unrelated modulators
+  to PHASER LEFT and RIGHT to sweep the sides apart.
+- PLAY on the reverb freezes it and holds a moment of the texture while the grids move on.

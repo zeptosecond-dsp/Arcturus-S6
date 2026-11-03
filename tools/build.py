@@ -58,11 +58,11 @@ BOARD = "fm1"                       # fm1 (default) or smk37: BOARD env or --boa
 BOARD_PREFIX = {"fm1": "FM-1_95", "smk37": "SMK-37 Pro_95"}   # (the FM-1 uses FM1_ID below, whatever the version)
 BOARD_DEFS = {"fm1": [], "smk37": ["-DBOARD_SMK37=1"]}
 MODELS = {"pro": "SMK-37 Pro", "elite": "SMK-37 Elite", "mke": "MKE-P37"}   # smk37: one keyboard, three names
-DATA_FAMILY = "ARCTRS"              # the SMK store's owner tag (store.h): 1..7 of A-Z 0-9. Your fork: your own
-SCREEN_NAME = "ARCTURUS"              # the update loader's screen (FM-1, ldr_screen.c): the name and its colour (RGB565)
+DATA_FAMILY = "QUORUM"              # the SMK store's owner tag (store.h): 1..7 of A-Z 0-9. Your fork: your own
+SCREEN_NAME = "QUORUM"                # the update loader's screen (FM-1, ldr_screen.c): the name and its colour (RGB565)
 SCREEN_COLOUR = 0x464B              # phosphor green, #46C85F
-PRODUCT = "FM-1_67686970"           # Arcturus S6: one identity for every version (FM1_ID below)
-FM1_ID = "FM-1_67686970"            # (the Firmware Hub: unique, checked; Dinghy is FM-1_99N)
+PRODUCT = "FM-1_81858277"           # Quorum ("QURM"): one identity for every version (FM1_ID below)
+FM1_ID = "FM-1_81858277"            # (the Firmware Hub: unique, checked; Dinghy is FM-1_99N, Arcturus S6 FM-1_67686970)
 VERSION = None                      # APP_VER for release builds
 
 
@@ -320,14 +320,14 @@ def main():
         BOARD_PREFIX[BOARD] = BOARD_PREFIX[BOARD].replace(MODELS["pro"], MODELS[model])
         suffix += "-" + model
     PRODUCT = BOARD_PREFIX[BOARD] + "0"
-    name = f"arcturus-s6{suffix}.fwsc"
+    name = f"quorum{suffix}.fwsc"
     if a.release:                   # one digit each: the identity has room for two (X.Y; a .Z only in the text)
         m = re.fullmatch(r"(\d)\.(\d)(\.\d)?(-[A-Za-z0-9]+)?", a.release)
         if not m:
             raise SystemExit(f"--release {a.release}: use X.Y, X.Y.Z or X.Y-suffix, one digit each")
         PRODUCT = BOARD_PREFIX[BOARD] + m[2]
         VERSION = m[1] + "." + m[2] + (m[3] or "")
-        name = f"arcturus-s6-{a.release}{suffix}.fwsc"
+        name = f"quorum-{a.release}{suffix}.fwsc"
     if BOARD == "fm1":
         PRODUCT = FM1_ID                # (the same identity for dev and release builds: the version is in the name)
     fm1pkg_make.SDK = a.sdk

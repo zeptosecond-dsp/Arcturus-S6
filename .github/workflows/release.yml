@@ -1,4 +1,4 @@
-# Arcturus S6: on a tag vX.Y, build the FM-1 package on GitHub, run the host tests, and publish the release with a
+# Quorum: on a tag quorum-vX.Y (the Arcturus S6 releases on main keep vX.Y), build the FM-1 package on GitHub, run the host tests, and publish the release with a
 # build attestation (actions/attest-build-provenance): the Firmware Hub shows "Built from source" for exactly these
 # files. The JieLi toolchain comes from pkgman.jieliapp.com (tools/get_toolchain.sh), the AC79 SDK from gitee.com,
 # as in Dinghy's own workflow. Run by hand (workflow_dispatch) for a test build without a release.
@@ -6,11 +6,11 @@ name: release
 
 on:
   push:
-    tags: ['v*']
+    tags: ['quorum-v*']
   workflow_dispatch:
     inputs:
       release:
-        description: 'Publish a release X.Y (tags it vX.Y on this commit); empty: a test build only'
+        description: 'Publish a release X.Y (tags it quorum-vX.Y on this commit); empty: a test build only'
         required: false
         default: ''
 
@@ -59,32 +59,32 @@ jobs:
       - name: Release package (tags only)
         if: env.V != ''
         run: |
-          V="${V#v}"
+          V="${V#quorum-v}"; V="${V#v}"
           echo "V=$V" >> "$GITHUB_ENV"
           sh build.sh --release "$V"
-          ls -l build/arcturus-s6-"$V".fwsc
-          (cd build && sha256sum arcturus-s6-"$V".fwsc > SHA256SUMS)
+          ls -l build/quorum-"$V".fwsc
+          (cd build && sha256sum quorum-"$V".fwsc > SHA256SUMS)
 
       - uses: actions/upload-artifact@v4
         with:
-          name: arcturus-s6-fwsc
-          path: build/arcturus-s6*.fwsc
+          name: quorum-fwsc
+          path: build/quorum*.fwsc
           if-no-files-found: error
 
       - name: Attest the package (tags only)
         if: env.V != ''
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: build/arcturus-s6-[0-9]*.fwsc
+          subject-path: build/quorum-[0-9]*.fwsc
 
       - name: Release (tags only)
         if: env.V != ''
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            build/arcturus-s6-[0-9]*.fwsc
+            build/quorum-[0-9]*.fwsc
             build/SHA256SUMS
-          tag_name: v${{ env.V }}
+          tag_name: quorum-v${{ env.V }}
           target_commitish: ${{ github.sha }}
-          name: Arcturus S6 ${{ env.V }}
+          name: Quorum ${{ env.V }}
           generate_release_notes: true
