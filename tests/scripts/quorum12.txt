@@ -1,0 +1,32 @@
+# Quorum 0.7: the keyboard sequencer (SEQ, OCT- to KEYS): three notes placed, run; then recorded from the keys
+4000 btn 11
+4100 btn 0
+4200 btn 12
+4300 enc 6 3
+4400 enc 0 2
+4500 shot
+4600 btn 12
+4700 enc 1 4
+4800 btn 12
+4900 enc 6 -5
+5000 enc 0 3
+5100 btn 12
+5200 enc 1 6
+5300 btn 12
+5400 enc 6 7
+5500 btn 12
+5600 shot
+5700 enc 2 -8
+5800 enc 4 0
+5900 enc 5 1
+8000 shot
+8100 btn 13
+8500 keys 0x10
+9300 keys 0x0
+9800 keys 0x400
+10200 keys 0x0
+12000 shot
+12100 keys 0x2
+12300 keys 0x0
+14000 shot
+15000 end

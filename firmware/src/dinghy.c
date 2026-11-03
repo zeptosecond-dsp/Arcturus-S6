@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-only */
-/* QUORUM Cellular Synthesis System: build 0.6 (the engine, its logic, modulation, sequencers, effects and disk). The sister of Arcturus S6 (the
+/* QUORUM Cellular Synthesis System: build 0.7 (the engine, its logic, modulation, sequencers, effects and disk). The sister of Arcturus S6 (the
  * main branch), on Dinghy (zvenson), on the platform of Felucca (Hügelton Instruments) as SLOOP (isod89) carries it.
  *
  * 64 sine partials at 22.05 kHz (each sample held twice) and 12 bit, as S6. Two 32-cell automata switch them; two
@@ -19,7 +19,11 @@
  *   ARP    9 MOD MATRIX K1 / SELECT the source, K2 / PRESETS the destination, K3 the depth, PLAY a pin in / out
  *   SEQ    7 SEQUENCERS OCT: 1-3; bank 1 STEP (cursor) VALUE GATE LENGTH, bank 2 DIR SLEW CLOCK CHAIN; PLAY: the
  *                       step's gate. Moved by the mod matrix (ADDRESS: swept, Serge style), else its ADVANCE gates,
- *                       else the master clock (every CLOCK steps)
+ *                       else the master clock (every CLOCK steps). OCT on to KEYS: the keyboard sequencer, a piano
+ *                       roll of up to 32 steps (K1 STEPS, DIR, CLOCK, RUN). PLAY picks up a note (or a new bar),
+ *                       ALGORITHM moves it along, PRESETS up / down, SELECT its length, PLAY puts it down, SEL drops it;
+ *                       SEL held + PLAY clears. REC records from the keys as it runs; running, a key transposes it.
+ *                       Its notes move the paths on the keys; its gate (KEYS) goes to the gate matrix
  *   SEL+ARP X GATE MATRIX  24 gate sources x 16 destinations (the strikes, FG triggers, S&H clocks, grid steps,
  *                       the sequencers' advance and reset), OR'd
  *   FX     F FX         OCT (or FX again): PHASER, DELAY, REVERB, ROUTING; SEL the banks (sends A / B on each);
@@ -32,7 +36,7 @@
  * Rules of the road (the chip has no FPU and no libgcc): integers only, no float, no 64-bit division.
  * tests/host.c runs this file on a computer: the screen as a PNG, the sound as a WAV. */
 #define APP_NAME "QUORUM"
-#define Q_VERSION "0.6"
+#define Q_VERSION "0.7"
 static void app_idle(void);
 #define LCD_IDLE app_idle                       /* while the screen's DMA runs: the clock and MIDI keep going */
 #define CV_MAX (240u * 218u)                    /* the page body's canvas */
@@ -162,7 +166,7 @@ enum { D_TILT, D_STR, D_LVL, D_SPLIT, D_FILTA, D_FILTB, D_PANA, D_PANB, D_PITA, 
        D_PHL, D_PHR, D_DLT, D_DLF, D_RVD, D_RVR, NDST };   /* (the phaser's left / right sweep, the delays' time and
                                                         feedback, the reverb's decay and return) */
 /* the gate matrix: rows (sources) and columns (destinations); pins OR'd into each column */
-enum { GS_GEN = 0, GS_LFO = 4, GS_EOC = 8, GS_QNT = 12, GS_CLK = 14, GS_POP = 19, GS_SEQ = 21, NGS = 24 };
+enum { GS_GEN = 0, GS_LFO = 4, GS_EOC = 8, GS_QNT = 12, GS_CLK = 14, GS_POP = 19, GS_SEQ = 21, GS_KSQ = 24, NGS = 25 };
 enum { GD_K1, GD_K2, GD_FG1, GD_FG2, GD_FG3, GD_FG4, GD_SH1, GD_SH2, GD_GA, GD_GB,
        GD_SQA1, GD_SQA2, GD_SQA3, GD_SQR1, GD_SQR2, GD_SQR3, NGD };   /* (16: one uint16 a row) */
 enum { SD_FWD, SD_PEND, SD_RND };
@@ -181,7 +185,12 @@ typedef struct { uint8_t send[2], rate, depth, centre, fb, stages, ret, slow; } 
                                                                                          stages 1..8 = 2..16; slow: 11 kHz */
 typedef struct { uint8_t send[2], time[2], fb, cross, crush, ret; } dlx_t;   /* the two delays: left, right */
 typedef struct { uint8_t send[2], size, decay, damp, pre, mod, crush, ret, fb, rate, freeze; } rvx_t;   /* as S6's */
-typedef struct { uint8_t order, link1, link2; } rtx_t;   /* the chain: one of 6 orders (P D R ...), two links */
+typedef struct { uint8_t order, link1, link2; } rtx_t;
+#define KS_N 32u
+typedef struct { uint8_t note[KS_N], len[KS_N], steps, dir, clk, run; } kseq_t;   /* clk 0..10: the master clock /32 .. /1;
+                                                                                    11..138: its own, 0.05 .. 12 steps a second */
+#define KS_CLK_MAX 138u   /* the keyboard sequencer: a note
+    (0: none) starting at each step, lasting len steps; one at a time (mono) */   /* the chain: one of 6 orders (P D R ...), two links */
 typedef struct {
     uint8_t root, slew, tilt, level, anchor, tempo, clk_midi, gmode, engver;   /* engver: 1 (8 bit), 2 (12 bit) */
     int8_t stretch;                             /* per mille of the exponent: -30 .. +60 */
@@ -204,6 +213,7 @@ typedef struct {
     rvx_t rv;
     rtx_t rt;
     uint8_t kbd[2], droot[2];                   /* each path: the keys move it (1), or it holds droot (a drone) */
+    kseq_t ks;
     /* (new settings go here, above the matrices: a saved patch keeps everything before them, and the matrices by
      * row and column) */
     int8_t dep[NSRC][NDST];                     /* the mod matrix: 0 = no pin, +-63 */
@@ -239,6 +249,7 @@ static patch_t P = {
     {{0, 0}, 100, 95, 50, 20, 40, 0, 70, 0, 0, 0},   /* the reverb (S6's), ready for a send */
     {0, 0, 30},                                 /* PHASER > DELAY > REVERB, the delay into the reverb */
     {1, 1}, {45, 45},                           /* both paths on the keys */
+    {{0}, {0}, 16, SD_FWD, 96, 0},              /* the keyboard sequencer: empty, 16 steps, stopped; its own clock, 2.5/s */
     {{0}},
     {0},
 };
@@ -344,6 +355,8 @@ static int32_t quantise(int32_t q, int32_t *stepn)   /* a pitch (1/256 semitone)
     return (int32_t)P.sroot * 256 + k * per + bv;
 }
 static volatile uint32_t qpulse_v[2];           /* a quantiser's note-change gate: blocks still high */
+static volatile uint32_t ks_pos_v, ks_note_v, ks_gate_v, ks_tick_v, ks_restart_v, ks_kick_v, ks_start_v;
+static int32_t ks_base = 45;                    /* the root when the keyboard sequencer started: a key since transposes it */
 static int32_t off_tgt[2], off_cur[2], off_step[2], pitch_mod[2];   /* (pitch_mod: the matrix, 1/256 semitone) */   /* each path's pitch offset (1/256 semitone): where it goes, where it is */
 static uint32_t t_glide;
 static uint32_t offsets_update(void)            /* 1: an offset moved (the partials need pushing) */
@@ -358,6 +371,8 @@ static uint32_t offsets_update(void)            /* 1: an offset moved (the parti
     for (k = 0; k < 2u; k++) {
         int32_t o = (int32_t)P.pth[k].coarse * 256 + (int32_t)P.pth[k].fine * 256 / 100 + pitch_mod[k], prev = off_cur[k];
         if (!P.kbd[k]) o += ((int32_t)P.droot[k] - (int32_t)P.root) * 256;   /* off the keys: where it was held */
+        else if (P.ks.run && ks_note_v) o += ((int32_t)ks_note_v - ks_base) * 256;   /* the keyboard sequencer's note,
+                                                                                       moved by the key last pressed */
         if (P.qon[k]) {
             int32_t q = quantise((int32_t)P.root * 256 + o, &off_step[k]) - (int32_t)P.root * 256;
             if (q != off_tgt[k]) qpulse_v[k] = 7;   /* a new note: a ~5 ms gate */
@@ -809,6 +824,48 @@ static void seq_block(void)
     }
     sq_adv_prev = adv; sq_rst_prev = rst; sq_wrap = wraps; sq_gate_v = gates;
 }
+/* the keyboard sequencer: on the master clock (every CLOCK steps), a note's start sets the pitch the keys would
+ * (the tracking paths move to it, transposed by the key last pressed) and raises its gate for len steps (a gate source:
+ * KEYS); a note straight after another drops the gate for ~3 ms first, so the strikes fire again */
+static uint32_t ks_clk_prev, ks_pend, ks_left, ks_low, ks_ph;
+static void ks_block(void)
+{
+    const kseq_t *q = &P.ks;
+    uint32_t steps = q->steps < 1u ? 1u : q->steps > KS_N ? KS_N : q->steps, stp = half_n >> 1, pos = ks_pos_v;
+    if (!q->run) { ks_left = 0; ks_low = 0; ks_gate_v = 0; ks_clk_prev = stp; return; }
+    if (ks_kick_v) { ks_low = ks_left ? 4u : 0u; ks_left = ks_kick_v; ks_kick_v = 0; }   /* (a key recorded: heard at once) */
+    {
+        uint32_t go;
+        if (q->clk > 10u) {                     /* its own clock: 0.05 .. 12 steps a second */
+            uint32_t ph = ks_ph + (uint32_t)Q_GRID_X100[(q->clk - 11u) & 127u] * 31168u;   /* (2^32 / 137800) */
+            go = ph < ks_ph;
+            ks_ph = ph;
+        } else go = stp != ks_clk_prev && stp % DIVS[10u - q->clk] == 0u;   /* the master clock, every /n steps */
+        ks_clk_prev = stp;
+        if (go) {
+            if (ks_restart_v) { pos = 0; ks_pend = 0; ks_restart_v = 0; }
+            else if (q->dir == SD_RND) { isr_rnd ^= isr_rnd << 13; isr_rnd ^= isr_rnd >> 17; isr_rnd ^= isr_rnd << 5; pos = (isr_rnd >> 16) % steps; }
+            else if (q->dir == SD_PEND && steps > 1u) {
+                if (ks_pend) { pos = pos ? pos - 1u : 1u; if (!pos) ks_pend = 0; }
+                else { pos = pos + 1u >= steps ? steps - 2u : pos + 1u; if (pos == steps - 1u) ks_pend = 1; }
+            } else pos = pos + 1u >= steps ? 0u : pos + 1u;
+            if (pos >= steps) pos = 0;
+            if (ks_left) ks_left--;
+            if (q->note[pos]) {
+                uint32_t l = q->len[pos] ? q->len[pos] : 1u;
+                if (l > steps - pos) l = steps - pos;
+                ks_low = ks_left ? 4u : 0u;
+                ks_left = l;
+                ks_note_v = q->note[pos];
+                ks_start_v = pos;
+            }
+            ks_pos_v = pos;
+            ks_tick_v++;
+        }
+    }
+    if (ks_low) ks_low--;
+    ks_gate_v = ks_left && !ks_low;
+}
 static void logic_block(void)                   /* once a block (1378 Hz): generators, FGs, SSGs, strikes */
 {
     uint32_t g, k, s, outs = 0, ins = 0, lfos = 0;
@@ -831,12 +888,14 @@ static void logic_block(void)                   /* once a block (1378 Hz): gener
         for (k = 0; k < 5u; k++) gs |= (uint32_t)((half_n / CD[k]) % 2u == 0u) << (GS_CLK + k);
         for (k = 0; k < 2u; k++) gs |= (uint32_t)(popc(G[k].row) > NC / 2u) << (GS_POP + k);
         gs |= sq_gate_v << GS_SEQ;              /* (the sequencers' step gates, as they were a block ago) */
+        gs |= (ks_gate_v & 1u) << GS_KSQ;
         for (r = 0; r < NGS; r++) if (gs >> r & 1u) gd |= P.gmat[r];
         for (k = 0; k < 2u; k++) if ((gd >> (GD_GA + k) & 1u) && !(gdst_v >> (GD_GA + k) & 1u)) gstep_req_v[k]++;
         gsrc_v = gs; gdst_v = gd;
     }
     for (k = 0; k < NFG; k++) fg_step(k, gdst_v >> (GD_FG1 + k) & 1u);
     seq_block();
+    ks_block();
     for (k = 0; k < NSSG; k++) {                /* sample on the clock's rise; glide to it at SLEW */
         uint32_t c = gdst_v >> (GD_SH1 + k) & 1u;
         if (c && !ssg_prev[k]) {
@@ -1208,7 +1267,7 @@ static void src_name(char *s, uint32_t k)       /* a matrix source */
     else { s_cat(s, "SEQ"); s_int(s, (int32_t)(k - S_SEQ(0)) + 1); }
 }
 static const char *const GS_NAME[NGS] = {"GEN1", "GEN2", "GEN3", "GEN4", "LFO1", "LFO2", "LFO3", "LFO4", "EOC1", "EOC2",
-    "EOC3", "EOC4", "QNT A", "QNT B", "CLK", "CLK/2", "CLK/4", "CLK/8", "CLK16", "POP A", "POP B", "SEQ1", "SEQ2", "SEQ3"};
+    "EOC3", "EOC4", "QNT A", "QNT B", "CLK", "CLK/2", "CLK/4", "CLK/8", "CLK16", "POP A", "POP B", "SEQ1", "SEQ2", "SEQ3", "KEYS"};
 static const char *const GD_SHORT[NGD] = {"K1", "K2", "F1", "F2", "F3", "F4", "S1", "S2", "GA", "GB", "Q1", "Q2", "Q3", "R1", "R2", "R3"};
 static const char *const GD_NAME[NGD] = {"STRIKE 1", "STRIKE 2", "FG1 TRIGGER", "FG2 TRIGGER", "FG3 TRIGGER", "FG4 TRIGGER",
     "S&H 1 CLOCK", "S&H 2 CLOCK", "GRID A STEP", "GRID B STEP", "SEQ 1 ADVANCE", "SEQ 2 ADVANCE", "SEQ 3 ADVANCE",
@@ -1429,7 +1488,7 @@ static uint32_t page_subs(uint32_t pg)
     if (pg == PG_GRID) return 2u;
     if (pg == PG_STRIKE) return 2u;
     if (pg == PG_LOGIC) return 4u;
-    if (pg == PG_SEQ) return NSEQ;
+    if (pg == PG_SEQ) return NSEQ + 1u;        /* SEQ 1-3, KEYS (the keyboard sequencer) */
     if (pg == PG_SPLIT || pg == PG_GLOBAL) return 3u;
     if (pg == PG_FX) return 4u;                 /* PHASER, DELAY, REVERB, ROUTING */
     if (pg == PG_FG) return NFG + NSSG + 1u;    /* FG 1-4, S&H 1-2, the quad LFO */
@@ -1442,7 +1501,7 @@ static uint32_t page_banks(uint32_t pg, uint32_t sb)
 {
     if (pg == PG_GRID) return 2u;
     if (pg == PG_STRIKE) return 3u;             /* SOUND, ENVELOPE, TRILL */
-    if (pg == PG_SEQ) return 2u;                /* STEPS, PLAY */
+    if (pg == PG_SEQ) return sb < NSEQ ? 2u : 1u;   /* STEPS, PLAY; KEYS: one */
     if (pg == PG_SPLIT) return sb ? 2u : 1u;
     if (pg == PG_FX) return sb == 2u ? 3u : sb < 2u ? 2u : 1u;
     return 1u;
@@ -1453,7 +1512,7 @@ enum { F_INT, F_SLEW, F_TILT, F_STR, F_PCT, F_GMODE, F_GRATE, F_MUT, F_ONOFF, F_
        F_DEC, F_FALL, F_SER, F_LSRC, F_OP, F_ROUTE, F_SRULE, F_POINT, F_WIDTH, F_SOFT, F_PMODE, F_FREQ, F_RES, F_BW,
        F_PAN, F_SEMI, F_CENT, F_CLK, F_TEMPO, F_PHOS, F_BRIGHT, F_BITS, F_TUN, F_SCL, F_SROOT, F_COUNT, F_SPACE, F_TPAT,
        F_GOP, F_GMODE2, F_RATE, F_DUTY, F_FGT, F_CURVE, F_FMODE, F_SSGIN, F_DEPTH, F_QRATE, F_STEPN, F_SDIR, F_SADDR,
-       F_PHRATE, F_PHHZ, F_BIP, F_STAGES, F_DMS, F_ORDER, F_CRUSH, F_NONE };
+       F_PHRATE, F_PHHZ, F_BIP, F_STAGES, F_DMS, F_ORDER, F_CRUSH, F_KRATE, F_NONE };
 typedef struct { const char *name; uint8_t *p; int16_t lo, hi; uint8_t fmt, step; } kn_t;
 static kn_t KN[4];
 static void kn_set(uint32_t i, const char *name, void *p, int32_t lo, int32_t hi, uint32_t fmt, uint32_t step)
@@ -1507,6 +1566,10 @@ static void knobs_for(uint32_t pg, uint32_t sb, uint32_t bk)
         else if (sb >= NFG + NSSG) kn_set(0, "RATE", &P.qrate, 0, 127, F_QRATE, 2);
         else { ssgp_t *q = &P.ssg[sb - NFG];
             kn_set(0, "INPUT", &q->input, 0, NSRC, F_SSGIN, 1); kn_set(1, "SLEW", &q->slew, 0, 127, F_INT, 4); }
+    } else if (pg == PG_SEQ && sb >= NSEQ) {
+        kn_set(0, "STEPS", &P.ks.steps, 1, KS_N, F_INT, 1); kn_set(1, "DIR", &P.ks.dir, 0, 2, F_SDIR, 1);
+        kn_set(2, "CLOCK", &P.ks.clk, 0, KS_CLK_MAX, F_KRATE, 1);
+        kn_set(3, "RUN", &P.ks.run, 0, 1, F_ONOFF, 1);
     } else if (pg == PG_SEQ) {
         seq_t *q = &P.seq[sb % NSEQ];
         uint8_t *c = &scur[sb % NSEQ];
@@ -1622,6 +1685,8 @@ static void kn_text(char *s, const kn_t *k, uint32_t pathk)
     case F_STAGES: s_int(s, v * 2); break;
     case F_DMS: s_int(s, LUT_DMS[v & 127]); s_cat(s, "MS"); break;
     case F_ORDER: { static const char *const OR[6] = {"P D R", "P R D", "D P R", "D R P", "R P D", "R D P"}; s_cat(s, OR[v % 6]); } break;
+    case F_KRATE: if (v <= 10) { s_cat(s, P.clk_midi ? "MIDI/" : "MAST/"); s_int(s, DIVS[10 - v]); }
+                  else { uint32_t x = Q_GRID_X100[(v - 11) & 127]; s_dec(s, x, 100u, x < 1000u ? 2u : 1u); s_cat(s, "/S"); } break;
     case F_CRUSH: if (!v) s_cat(s, "OFF"); else { s_int(s, v); s_cat(s, "B"); } break;
     case F_QRATE: { uint32_t cs = LUT_QPER[v & 127];   /* a cycle, 1/100 s (as S6) */
         if (cs >= 1000u) s_int(s, (int32_t)((cs + 50u) / 100u)); else { s_int(s, (int32_t)(cs / 100u)); s_cat(s, "."); s_int(s, (int32_t)(cs / 10u % 10u)); }
@@ -1646,6 +1711,7 @@ static void draw_header(void)
     if (page == PG_GRID) s_cat(s, sub ? "GRID B" : "GRID A");
     else if (page == PG_STRIKE) { s_cat(s, "STRIKE "); s_int(s, (int32_t)sub + 1); }
     else if (page == PG_LOGIC) { s_cat(s, "LOGIC GEN "); s_int(s, (int32_t)sub + 1); }
+    else if (page == PG_SEQ && sub >= NSEQ) s_cat(s, "KEY SEQUENCER");
     else if (page == PG_SEQ) { s_cat(s, "SEQ "); s_int(s, (int32_t)sub + 1); }
     else if (page == PG_FG) { if (sub < NFG) { s_cat(s, "FUNC GEN "); s_int(s, (int32_t)sub + 1); }
                               else if (sub < NFG + NSSG) { s_cat(s, "S&H "); s_int(s, (int32_t)(sub - NFG) + 1); }
@@ -1946,6 +2012,77 @@ static void draw_fg(void)                       /* a function generator or an S&
     cv_out(BODY_Y);
 }
 
+/* the keyboard sequencer: a piano roll, 32 steps across, an octave and a bit down the side (the black keys' rows
+ * shaded); the notes as bars, the one playing bright, the playhead; the cursor, or the bar being placed (flashing) */
+static uint32_t kc_pos, kc_note = 45, kc_len = 1, kc_place, kc_picked, kv_top = 52, ks_rec;
+#define KV_ROWS 14u
+static uint32_t kt_seen, kt_tick, kt_dur, rec_key, rec_pos, rec_note, rec_tick0;
+static void draw_keys(void)
+{
+    const kseq_t *q = &P.ks;
+    uint32_t steps = q->steps < 1u ? 1u : q->steps, r, j, pos = ks_pos_v, blink = (fm1_ms / 200u) & 1u;
+    const int32_t x0 = 26, sw = 6, y0 = 4, rh = 8;
+    char s[40];
+    if (kc_note > kv_top) kv_top = kc_note;
+    if (kc_note + KV_ROWS - 1u < kv_top) kv_top = kc_note + KV_ROWS - 1u;
+    cv_begin(240, BODY_H, PH_BG);
+    for (r = 0; r < KV_ROWS; r++) {             /* the keys down the side */
+        uint32_t n = kv_top - r, bk = (0x54Au >> (n % 12u)) & 1u;
+        int32_t y = y0 + (int32_t)r * rh;
+        if (bk) cv_rect(x0, y, sw * (int32_t)KS_N, rh, PH_SEL);
+        cv_rect(18, y + 1, 6, rh - 2, bk ? PH_LO : PH_MID);
+        if (n % 12u == 0u) { s[0] = 0; s_note(s, n); cv_text(0, y - 4, &FONT_S, s, PH_LO); }
+    }
+    for (j = 0; j <= KS_N; j += 4u) cv_rect(x0 + (int32_t)j * sw, y0, 1, (int32_t)KV_ROWS * rh, PH_SEL);
+    for (j = steps; j < KS_N; j++)              /* past the end: dotted out */
+        for (r = 0; r < KV_ROWS * (uint32_t)rh; r += 3u) cv_pset(x0 + (int32_t)j * sw + 3, y0 + (int32_t)r, PH_LO);
+    cv_rect(x0 + (int32_t)steps * sw, y0, 1, (int32_t)KV_ROWS * rh, PH_MID);
+    for (j = 0; j < steps; j++) {               /* the notes */
+        uint32_t n = q->note[j], l = q->len[j] ? q->len[j] : 1u;
+        int32_t y;
+        if (!n || n > kv_top || n + KV_ROWS <= kv_top) continue;
+        if (l > steps - j) l = steps - j;
+        y = y0 + (int32_t)(kv_top - n) * rh;
+        cv_rect(x0 + (int32_t)j * sw, y + 1, (int32_t)l * sw - 1, rh - 2, q->run && j == ks_start_v && ks_gate_v ? PH_HI : PH_MID);
+    }
+    if (q->run) cv_rect(x0 + (int32_t)pos * sw + 2, y0 - 3, 2, 3, PH_HI);   /* the playhead */
+    {                                           /* the cursor: the bar being placed, flashing, or where it would go */
+        int32_t y = y0 + (int32_t)(kv_top - kc_note) * rh, x = x0 + (int32_t)kc_pos * sw, w = (int32_t)kc_len * sw - 1;
+        if (kc_place) { if (blink) cv_rect(x, y, w, rh, PH_HI); else { cv_rect(x, y, w, 1, PH_HI); cv_rect(x, y + rh - 1, w, 1, PH_HI); } }
+        else { cv_rect(x, y, 1, rh, PH_HI); cv_rect(x, y + rh - 1, w, 1, PH_HI); }
+    }
+    s[0] = 0; s_note(s, kc_note); s_cat(s, "  STEP "); s_int(s, (int32_t)kc_pos + 1); s_cat(s, "  LEN "); s_int(s, (int32_t)kc_len);
+    cv_text(4, 120, &FONT_S, s, PH_MID);
+    s[0] = 0;
+    if (kc_place) s_cat(s, kc_picked ? "MOVING: PLAY PUT, SEL DELETE" : "PLACING: PLAY PUT, SEL DROP");
+    else if (ks_rec) s_cat(s, "RECORDING: PLAY THE KEYS");
+    else if (q->run) { s_cat(s, "RUNNING  KEYS TRANSPOSE "); s_sdec(s, (int32_t)P.root - ks_base, 1u, 0u); }
+    else s_cat(s, "STOPPED  (REC RECORDS)");
+    cv_text(4, 138, &FONT_S, s, kc_place || ks_rec ? PH_HI : PH_LO);
+    knob_row(0);
+    footer("ALG STEP PRES NOTE SELECT LEN");
+    cv_out(BODY_Y);
+}
+static void ks_put(uint32_t pos, uint32_t note, uint32_t len)   /* a note in: anything under it out, the one before cut short */
+{
+    kseq_t *q = &P.ks;
+    uint32_t steps = q->steps < 1u ? 1u : q->steps, j;
+    if (pos >= steps) return;
+    if (len < 1u) len = 1u;
+    if (len > steps - pos) len = steps - pos;
+    for (j = 0; j < KS_N; j++) {
+        if (!q->note[j]) continue;
+        if (j >= pos && j < pos + len) { q->note[j] = 0; q->len[j] = 0; }
+        else if (j < pos && j + q->len[j] > pos) q->len[j] = (uint8_t)(pos - j);
+    }
+    q->note[pos] = (uint8_t)note; q->len[pos] = (uint8_t)len;
+}
+static int32_t ks_at(uint32_t pos)              /* the note sounding at a step (its start), or -1 */
+{
+    uint32_t j;
+    for (j = 0; j <= pos && j < KS_N; j++) if (P.ks.note[j] && j + P.ks.len[j] > pos) return (int32_t)j;
+    return -1;
+}
 static void draw_seq(void)                      /* a sequencer: its steps as bars, the one playing lit, the output's glide */
 {
     uint32_t n = sub % NSEQ, i, len = P.seq[n].len < 1u ? 1u : P.seq[n].len, st = sq_step_v[n];
@@ -2445,6 +2582,11 @@ static void patch_clean(void)                   /* a loaded patch's values in ra
     P.rv.size &= 127u; P.rv.decay &= 127u; P.rv.damp &= 127u; P.rv.pre &= 127u; P.rv.mod &= 127u;
     P.rv.crush = (uint8_t)cl(P.rv.crush, 0, 10); P.rv.ret &= 127u; P.rv.fb &= 127u; P.rv.rate &= 1u; P.rv.freeze &= 1u;
     P.rt.order %= 6u; P.rt.link1 &= 127u; P.rt.link2 &= 127u;
+    P.ks.steps = (uint8_t)cl(P.ks.steps, 1, KS_N); P.ks.dir %= 3u; if (P.ks.clk > KS_CLK_MAX) P.ks.clk = 96; P.ks.run &= 1u;
+    for (k = 0; k < KS_N; k++) {
+        if (P.ks.note[k] && (P.ks.note[k] < 12u || P.ks.note[k] > 96u)) P.ks.note[k] = 0;
+        P.ks.len[k] = P.ks.note[k] ? (uint8_t)cl(P.ks.len[k], 1, KS_N) : 0u;
+    }
     for (k = 0; k < NGS; k++) P.gmat[k] &= (uint16_t)((1u << NGD) - 1u);
 }
 static void init_patch(void)                    /* INIT: the grids, two plain paths, nothing pinned, dry */
@@ -2905,7 +3047,21 @@ static void app_main(void)
             if (page == PG_GLOBAL && sub == 2u) cpu_max = 0;
             if (page == PG_GLOBAL && sub == 0u) { P.qon[qsel & 1u] ^= 1u; dirty_partials = 1; }
             if (page == PG_GMAT) P.gmat[grow] ^= (uint16_t)(1u << gcol);   /* a pin in / out */
-            if (page == PG_SEQ) { uint32_t n = sub % NSEQ; P.seq[n].gate[scur[n] & 7u] ^= 1u; }   /* the step's gate */
+            if (page == PG_SEQ && sub < NSEQ) { uint32_t n = sub % NSEQ; P.seq[n].gate[scur[n] & 7u] ^= 1u; }   /* the step's gate */
+            if (page == PG_SEQ && sub >= NSEQ) {    /* the piano roll: PLAY picks up a note, or a new bar; PLAY puts it
+                                                       down; SEL held + PLAY clears the lot */
+                if (shift) { uint32_t j; for (j = 0; j < KS_N; j++) P.ks.note[j] = P.ks.len[j] = 0; kc_place = 0; }
+                else if (kc_place) { ks_put(kc_pos, kc_note, kc_len); kc_place = 0; }
+                else {
+                    int32_t at = ks_at(kc_pos);
+                    kc_picked = at >= 0;
+                    if (at >= 0) {
+                        kc_pos = (uint32_t)at; kc_note = P.ks.note[at]; kc_len = P.ks.len[at];
+                        P.ks.note[at] = 0; P.ks.len[at] = 0;
+                    }
+                    kc_place = 1;
+                }
+            }
             if (page == PG_STRIKE) {            /* fire it by hand (Bow / Breath: held 1.2 s) */
                 uint32_t s_ = sub & 1u;
                 if (P.k[s_].mode >= KM_BOW) { kman_until[s_] = fm1_ms + 1200u; kman_hold_v[s_] = 1; }
@@ -2939,6 +3095,19 @@ static void app_main(void)
                 after_change(page, sub, i, bank);
                 knobs_for(page, sub, bank);     /* (a mode's change renames a knob) */
             }
+        if (page == PG_SEQ && sub >= NSEQ) {    /* the piano roll: ALGORITHM along, PRESETS up / down, SELECT the length */
+            uint32_t steps = P.ks.steps < 1u ? 1u : P.ks.steps;
+            if ((e = fm1_enc_take(ENC_ALGORITHM)) != 0) kc_pos = (uint32_t)cl((int32_t)kc_pos + e, 0, (int32_t)steps - 1);
+            if ((e = fm1_enc_take(ENC_PRESETS)) != 0) kc_note = (uint32_t)cl((int32_t)kc_note + e, 21, 96);
+            if (kc_pos >= steps) kc_pos = steps - 1u;
+            if ((e = fm1_enc_take(ENC_SELECT)) != 0) kc_len = (uint32_t)cl((int32_t)kc_len + e, 1, (int32_t)(steps - kc_pos));
+            if (kc_len > steps - kc_pos) kc_len = steps - kc_pos;
+            if ((b & (1u << BTN_SEL)) && kc_place) kc_place = 0;   /* drop the bar (a note picked up: deleted) */
+        }
+        if (b & (1u << BTN_REC)) {              /* REC: record from the keys (and run, if it was stopped) */
+            ks_rec ^= 1u;
+            if (ks_rec) P.ks.run = 1;
+        }
         if ((e = fm1_enc_take(ENC_ALGORITHM)) != 0) {
             if (page == PG_VOICE) {             /* the root: both paths, held ones too */
                 int32_t r0 = P.root;
@@ -3018,11 +3187,31 @@ static void app_main(void)
         }
         prev_up = keys;
         down &= (1u << 25u) - 1u;
+        {                                       /* the keyboard sequencer started: the root now is its key (a key since
+                                                   transposes it); stopped: no recording */
+            static uint32_t run_was;
+            if (P.ks.run && !run_was) { ks_base = P.root; ks_restart_v = 1; ks_note_v = 0; }
+            if (!P.ks.run) { ks_rec = 0; ks_note_v = 0; }
+            run_was = P.ks.run;
+        }
         if (down) {                             /* the lowest key pressed (below the top two): the root, F1 .. F3 */
             for (i = 0; i < 25u; i++) if ((down >> i) & 1u) break;
-            P.root = (uint8_t)(29u + i);
+            if (P.ks.run && ks_rec) {           /* recording: the note in at the step playing (or the next, if nearer) */
+                uint32_t steps = P.ks.steps < 1u ? 1u : P.ks.steps, pos = ks_pos_v, note = 29u + i;
+                if (kt_dur && (fm1_ms - kt_tick) * 2u > kt_dur) { pos = pos + 1u >= steps ? 0u : pos + 1u; rec_tick0 = ks_tick_v + 1u; }
+                else { rec_tick0 = ks_tick_v; ks_note_v = note; ks_start_v = pos; ks_kick_v = 1; }   /* (heard at once) */
+                if (pos < steps) { ks_put(pos, note, 1); rec_key = 1u << i; rec_pos = pos; rec_note = note; kc_note = note; }
+            } else P.root = (uint8_t)(29u + i);
             dirty_partials = 1;
         }
+        if (ks_tick_v != kt_seen) {             /* a step: its length (for the recording's rounding); a key held while
+                                                   recording: its note longer */
+            uint32_t t = ks_tick_v;
+            kt_dur = fm1_ms - kt_tick; kt_tick = fm1_ms; kt_seen = t;
+            if (rec_key && (keys & rec_key) && (int32_t)(t - rec_tick0) > 0 && P.ks.note[rec_pos] == rec_note)
+                ks_put(rec_pos, rec_note, t - rec_tick0 + 1u);
+        }
+        if (rec_key && !(keys & rec_key)) rec_key = 0;
 
         if (offsets_update()) dirty_partials = 1;
         if ((dirty_partials || any_pin) && fm1_ms - t_push >= 8u) { dirty_partials = 0; t_push = fm1_ms; mod_apply(); push_partials(); }
@@ -3049,7 +3238,7 @@ static void app_main(void)
             case PG_GRID: draw_grid(); break;
             case PG_STRIKE: draw_strike(); break;
             case PG_GMAT: draw_gmat(); break;
-            case PG_SEQ: draw_seq(); break;
+            case PG_SEQ: if (sub >= NSEQ) draw_keys(); else draw_seq(); break;
             case PG_LOGIC: draw_logic(); break;
             case PG_FG: if (sub >= NFG + NSSG) draw_quad(); else draw_fg(); break;
             case PG_MOD: draw_mod(); break;
@@ -3072,7 +3261,8 @@ static void app_main(void)
             fm1_led_key(BTN_HOME, page != PG_INDEX && blink);
             fm1_led_key(BTN_PLAY, (page == PG_STRIKE && (kgate_v[sub & 1u] || blink)) || (page == PG_GRID && blink)
                                   || (page == PG_GMAT && ((P.gmat[grow] >> gcol & 1u) || blink))
-                                  || (page == PG_SEQ && (P.seq[sub % NSEQ].gate[scur[sub % NSEQ] & 7u] || blink))
+                                  || (page == PG_SEQ && sub < NSEQ && (P.seq[sub % NSEQ].gate[scur[sub % NSEQ] & 7u] || blink))
+                                  || (page == PG_SEQ && sub >= NSEQ && (kc_place ? (fm1_ms / 120u) & 1u : blink))
                                   || (page == PG_MOD && (P.dep[mrow][mcol] || blink))
                                   || (page == PG_GLOBAL && sub == 0u && (P.qon[qsel & 1u] || blink)) || (page == PG_GLOBAL && sub == 2u && blink)
                                   || (page == PG_FX && sub == 2u && (P.rv.freeze || blink)) || (page == PG_FX && sub < 2u && blink)
@@ -3080,6 +3270,7 @@ static void app_main(void)
                                   || (page == PG_SPLIT && sub && (P.kbd[(sub - 1u) & 1u] || blink)));
             fm1_led_key(BTN_FX, page == PG_FX && blink);   /* FX again: the next effect */
             fm1_led_key(BTN_SAVE, page == PG_PATCH && (pconf == PC_SAVE || blink));
+            fm1_led_key(BTN_REC, ks_rec || (page == PG_SEQ && sub >= NSEQ && blink));   /* solid: recording */
         }
     }
 }
