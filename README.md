@@ -25,8 +25,8 @@ pages.
   and play the other).
 - **4 logic generators:** a cell, a clock division or another generator into AND, OR, XOR, NAND, NOR or XNOR with a
   square LFO, free or clocked.
-- **Modulation:** 4 Serge-style function generators, 2 sample-and-holds, a quadrature LFO, 3 slew sequencers (swept
-  Serge-style by any modulator) and a **keyboard sequencer** with a piano roll, step and live recording.
+- **Modulation:** 4 Serge-style function generators, 2 SSGs (Serge-style sample-and-holds), a quadrature LFO, 3 slew sequencers (swept
+  Serge-style by any modulator) and a **keyboard sequencer**: a piano roll after the Fairlight's page R, four steps a page, step and live recording.
 - **An EMS-style mod matrix** (19 sources, 38 destinations, the grids' rules among them) and a **gate matrix**.
 - **21 tunings** (just intonation, shruti, Bohlen-Pierce, the Carlos scales and more) with per-path quantisers.
 - **Effects:** a stereo phaser (2 to 16 stages, 22 or 11kHz), two shift-register delays, Arcturus's plate reverb with

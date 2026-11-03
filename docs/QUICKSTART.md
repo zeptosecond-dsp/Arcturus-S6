@@ -22,7 +22,7 @@ own clock or in lockstep. The name comes from quorum sensing, how bacteria act t
 present, hence the petri dish on the boot screen.
 
 **The Serge idea.** As in Arcturus, the movement comes from small, general-purpose parts patched together. Logic
-generators turn cells and clocks into gates; function generators, sample-and-holds, a quadrature LFO and slew
+generators turn cells and clocks into gates; function generators, SSGs (Serge-style sample-and-holds), a quadrature LFO and slew
 sequencers make control voltages; two matrices connect everything to everything, the grids' own rules included. When
 modulators control each other, a few simple parts make patterns that never quite repeat.
 
@@ -72,21 +72,23 @@ Thirteen pages, each reachable from the index or its shortcut button.
 | 5 SPLIT + FILTERS | SEL + EDIT | SPLIT: RULE (cutoff, band, odd / even, every Nth, grid A / B, source), POINT, WIDTH, SOFT; ALGORITHM sets N. PATH A and PATH B: bank 1 FILTER (off, vowel, 12dB or 24dB band pass), FREQ or VOWEL, RESO, BW; bank 2 LEVEL, PAN, PITCH, FINE. PLAY: the path on or off the keys (off: it holds its note). |
 | 6 LOGIC | SEL + LFO | Four generators drawn as a logic analyser: INPUT (a clock division, any cell of either grid, a grid's population, another generator, an FG's end of cycle), LOGIC (AND, OR, XOR, NAND, NOR, XNOR, or the input or LFO alone), RATE and DUTY of its square LFO. ALGORITHM: the LFO free or on the clock. |
 | 7 SEQUENCERS | SEQ | SEQ 1 to 3: eight steps each. Bank 1 STEP (the cursor), VALUE, GATE, LENGTH; bank 2 DIR (forward, pendulum, random), SLEW, CLOCK, CHAIN. PLAY sets the step's gate. A pin into SEQ ADDRESS on the mod matrix sweeps the steps, Serge style; otherwise ADVANCE gates move it, otherwise the master clock. KEYS: the keyboard sequencer (below). |
-| 8 FUNCTION GEN | SEL + ENV | FG 1 to 4 (RISE, FALL, CURVE lin / exp / log, MODE cycle / once / gate; each sends an end-of-cycle gate), S&H 1 and 2 (INPUT: noise or any modulator, SLEW; clocked from the gate matrix), and the QUAD LFO (SIN+, SIN−, COS+, COS−). |
+| 8 FUNCTION GEN | SEL + ENV | FG 1 to 4 (RISE, FALL, CURVE lin / exp / log, MODE cycle / once / gate; each sends an end-of-cycle gate), SSG 1 and 2 (INPUT: noise or any modulator, SLEW; clocked from the gate matrix), and the QUAD LFO (SIN+, SIN−, COS+, COS−). |
 | 9 MOD MATRIX | ARP | The EMS-style pin grid: 19 sources by 38 destinations (tilt, stretch, split, the filters, pans and pitches, the strikes, the grids' rules, mutation and speed, the FGs' rates, the sequencers' addresses, the effects). K1 or SELECT the source, K2 or PRESETS the destination, K3 the depth (±), PLAY sets or pulls a pin. |
-| X GATE MATRIX | SEL + ARP | 25 gate sources (generators, their LFOs, EOCs, quantiser note gates, clock divisions, the grids' populations, the sequencers' step gates, KEYS) to 16 destinations (the strikes, FG triggers, S&H clocks, grid steps, sequencer advance and reset). Pins light with the live gate. |
+| X GATE MATRIX | SEL + ARP | 25 gate sources (generators, their LFOs, EOCs, quantiser note gates, clock divisions, the grids' populations, the sequencers' step gates, KEYS) to 16 destinations (the strikes, FG triggers, SSG clocks, grid steps, sequencer advance and reset). Pins light with the live gate. |
 | F FX | FX | Four parts, stepped with FX or OCT. PHASER: stereo, 2 to 16 stages, its sides swept a quarter cycle apart by its LFO, or by the mod matrix (PHASER LEFT / RIGHT); PRESETS 22 / 11k, PLAY zeroes the feedback. DELAY: two shift registers, left and right, CROSS for ping-pong; PLAY clears. REVERB: Arcturus's plate; PRESETS 22 / 11k, PLAY freezes. ROUTING: the order of the three and the links between them. Each effect has a send from each path (SEND A, SEND B). |
 | G GLOBAL | GLO | TUNING: 21 tunings and their scales, the root; SELECT picks a path, PLAY quantises it, K4 its glide. VDU: phosphor colour (green, aqua, amber, white) and brightness. ENGINE: ENG VER (V1 8 bit, V2 12 bit), CLOCK (internal or MIDI) and the CPU meter. |
 | D DISK | SAVE | A:\SYSTEM holds INIT and RANDOM, B:\PATCHES your 16 slots. SEL loads (press twice), SAVE saves (twice to overwrite), PLAY names a patch. |
 
 ### The keyboard sequencer
 
-On the SEQUENCERS page, OCT past SEQ 3 to KEYS: a piano roll of up to 32 steps, one note at a time.
+On the SEQUENCERS page, OCT past SEQ 3 to KEYS: a piano roll of up to 16 steps, one note at a time, laid out as the
+Fairlight's page R. Four steps show at a time, with a page for each four (PG 1/4 and so on); the page follows the cursor
+while you edit, and the playhead while it runs. Under the steps is a row of triangles: the step playing "boops" up.
 
-- **Placing notes.** PLAY brings up a note bar, flashing. PRESETS moves it up and down, ALGORITHM along, SELECT makes it
+- **Placing notes.** PLAY brings up a note bar, flashing. PRESETS moves it up and down, ALGORITHM along (on to the next page and back), SELECT makes it
   longer (clockwise) or shorter. PLAY again puts it down. PLAY on a note picks it up to move it; SEL drops the bar
   (which deletes a note you picked up). Hold SEL and press PLAY to clear the roll.
-- **Knobs.** STEPS (1 to 32), DIR, CLOCK (turn left to follow the master clock, /32 to /1; turn right for its own,
+- **Knobs.** STEPS (1 to 16), DIR, CLOCK (turn left to follow the master clock, /32 to /1; turn right for its own,
   0.05 to 12 steps a second), RUN.
 - **Recording.** REC records from the keys as it runs (and starts it): notes land on the nearest step, and a held key
   makes a longer note.
@@ -109,7 +111,7 @@ what goes wrong. Roll a few RANDOM patches first, just to get a sense for how th
 **A self-playing melody.**
 
 1. On LOGIC, set generator 1's input to one of grid A's cells, its logic to AND, its LFO on the clock.
-2. In the gate matrix, pin GEN1 to S&H 1 CLOCK.
+2. In the gate matrix, pin GEN1 to SSG 1 CLOCK.
 3. In the mod matrix, pin SSG1 to PITCH B. On GLOBAL, TUNING, SELECT path B and press PLAY to quantise it; pick a
    scale you like.
 4. Pin QNT B to STRIKE 2 in the gate matrix: each new note strikes itself.
