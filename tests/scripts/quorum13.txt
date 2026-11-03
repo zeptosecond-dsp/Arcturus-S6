@@ -1,0 +1,10 @@
+# Quorum 1.0: grid A's rule on the mod matrix (FG1 -> GRID A RULE), the grid page showing the rule it is moved to
+4000 btn 10
+4100 enc 3 18
+4200 btn 12
+4300 enc 4 31
+4500 shot
+4600 btn 5
+6000 shot
+9000 shot
+9500 end

@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-only */
-/* QUORUM Cellular Synthesis System: build 0.7 (the engine, its logic, modulation, sequencers, effects and disk). The sister of Arcturus S6 (the
+/* QUORUM Cellular Synthesis System: version 1.0. The sister of Arcturus S6 (the
  * main branch), on Dinghy (zvenson), on the platform of Felucca (Hügelton Instruments) as SLOOP (isod89) carries it.
  *
  * 64 sine partials at 22.05 kHz (each sample held twice) and 12 bit, as S6. Two 32-cell automata switch them; two
@@ -36,7 +36,7 @@
  * Rules of the road (the chip has no FPU and no libgcc): integers only, no float, no 64-bit division.
  * tests/host.c runs this file on a computer: the screen as a PNG, the sound as a WAV. */
 #define APP_NAME "QUORUM"
-#define Q_VERSION "0.7"
+#define Q_VERSION "1.0"
 static void app_idle(void);
 #define LCD_IDLE app_idle                       /* while the screen's DMA runs: the clock and MIDI keep going */
 #define CV_MAX (240u * 218u)                    /* the page body's canvas */
@@ -162,7 +162,7 @@ enum { FM_CYCLE, FM_ONCE, FM_GATE };
 #define NSRC (NFG + NSSG + 2u + NGEN + 4u + NSEQ)
 enum { D_TILT, D_STR, D_LVL, D_SPLIT, D_FILTA, D_FILTB, D_PANA, D_PANB, D_PITA, D_PITB,
        D_K1PART, D_K1VEL, D_K1SHP, D_K1LVL, D_K2PART, D_K2VEL, D_K2SHP, D_K2LVL,
-       D_MUTA, D_MUTB, D_SPDA, D_SPDB, D_FG1, D_FG2, D_FG3, D_FG4, D_QRATE, D_SQ1, D_SQ2, D_SQ3,
+       D_RULA, D_RULB, D_SPDA, D_SPDB, D_FG1, D_FG2, D_FG3, D_FG4, D_QRATE, D_SQ1, D_SQ2, D_SQ3,
        D_PHL, D_PHR, D_DLT, D_DLF, D_RVD, D_RVR, NDST };   /* (the phaser's left / right sweep, the delays' time and
                                                         feedback, the reverb's decay and return) */
 /* the gate matrix: rows (sources) and columns (destinations); pins OR'd into each column */
@@ -286,7 +286,7 @@ static void grid_seed(uint32_t i)
 static void grid_step(uint32_t i)
 {
     grid_t *g = &G[i];
-    uint32_t c, n = 0, rule = P.g[i].rule, l = rotl1(g->row), r = rotr1(g->row), k;
+    uint32_t c, n = 0, rule = E.g[i].rule, l = rotl1(g->row), r = rotr1(g->row), k;
     for (c = 0; c < NC; c++) {                  /* cell c: its left neighbour is c - 1 (wrapping) */
         uint32_t idx = ((l >> c) & 1u) << 2 | ((g->row >> c) & 1u) << 1 | ((r >> c) & 1u);
         n |= ((rule >> idx) & 1u) << c;
@@ -486,7 +486,8 @@ static void mod_apply(void)                     /* E = P, moved by the matrix (a
         E.k[k].vel = m8(P.k[k].vel, MK(b + 1u), 0, 127);
         E.k[k].shape = m8(P.k[k].shape, MK(b + 2u), 0, 127);
         E.k[k].level = m8(P.k[k].level, MK(b + 3u), 0, 127);
-        E.g[k].mut = m8(P.g[k].mut, MK(k ? D_MUTB : D_MUTA) / 4, 0, 50);
+        E.g[k].rule = (uint8_t)(((int32_t)P.g[k].rule + MK(k ? D_RULB : D_RULA) * 2) & 255);   /* (round the wheel: a
+                                                                 full source at 63 reaches every rule) */
         E.g[k].rate = m8(P.g[k].rate, MK(k ? D_SPDB : D_SPDA), 0, 127);   /* (up: faster) */
     }
     for (k = 0; k < NFG; k++) fgmod_v[k] = (int8_t)cl(-MK(D_FG1 + k), -127, 127);   /* (up: faster) */
@@ -1279,11 +1280,11 @@ static void gins(char *s, uint32_t d)           /* what is pinned into destinati
     if (!n) s_cat(s, "-");
 }
 static const char *const DST_SHORT[NDST] = {"TLT", "STR", "LVL", "SPL", "FLA", "FLB", "PNA", "PNB", "PTA", "PTB",
-    "1PT", "1VL", "1SH", "1LV", "2PT", "2VL", "2SH", "2LV", "MTA", "MTB", "SPA", "SPB", "F1R", "F2R", "F3R", "F4R", "QRT", "SQ1", "SQ2", "SQ3",
+    "1PT", "1VL", "1SH", "1LV", "2PT", "2VL", "2SH", "2LV", "RLA", "RLB", "SPA", "SPB", "F1R", "F2R", "F3R", "F4R", "QRT", "SQ1", "SQ2", "SQ3",
     "PHL", "PHR", "DLT", "DLF", "RVD", "RVR"};
 static const char *const DST_NAME[NDST] = {"TILT", "STRETCH", "OUT LEVEL", "SPLIT POINT", "FILTER A", "FILTER B",
     "PAN A", "PAN B", "PITCH A", "PITCH B", "STRIKE 1 PARTIAL", "STRIKE 1 VELOCITY", "STRIKE 1 SHAPE", "STRIKE 1 LEVEL",
-    "STRIKE 2 PARTIAL", "STRIKE 2 VELOCITY", "STRIKE 2 SHAPE", "STRIKE 2 LEVEL", "GRID A MUTATION", "GRID B MUTATION",
+    "STRIKE 2 PARTIAL", "STRIKE 2 VELOCITY", "STRIKE 2 SHAPE", "STRIKE 2 LEVEL", "GRID A RULE", "GRID B RULE",
     "GRID A SPEED", "GRID B SPEED", "FG1 RATE", "FG2 RATE", "FG3 RATE", "FG4 RATE", "QUAD RATE",
     "SEQ 1 ADDRESS", "SEQ 2 ADDRESS", "SEQ 3 ADDRESS",
     "PHASER LEFT", "PHASER RIGHT", "DELAY TIME", "DELAY FEEDBACK", "REVERB DECAY", "REVERB RETURN"};
@@ -1512,7 +1513,7 @@ enum { F_INT, F_SLEW, F_TILT, F_STR, F_PCT, F_GMODE, F_GRATE, F_MUT, F_ONOFF, F_
        F_DEC, F_FALL, F_SER, F_LSRC, F_OP, F_ROUTE, F_SRULE, F_POINT, F_WIDTH, F_SOFT, F_PMODE, F_FREQ, F_RES, F_BW,
        F_PAN, F_SEMI, F_CENT, F_CLK, F_TEMPO, F_PHOS, F_BRIGHT, F_BITS, F_TUN, F_SCL, F_SROOT, F_COUNT, F_SPACE, F_TPAT,
        F_GOP, F_GMODE2, F_RATE, F_DUTY, F_FGT, F_CURVE, F_FMODE, F_SSGIN, F_DEPTH, F_QRATE, F_STEPN, F_SDIR, F_SADDR,
-       F_PHRATE, F_PHHZ, F_BIP, F_STAGES, F_DMS, F_ORDER, F_CRUSH, F_KRATE, F_NONE };
+       F_PHRATE, F_PHHZ, F_BIP, F_STAGES, F_DMS, F_ORDER, F_CRUSH, F_KRATE, F_RULE, F_NONE };
 typedef struct { const char *name; uint8_t *p; int16_t lo, hi; uint8_t fmt, step; } kn_t;
 static kn_t KN[4];
 static void kn_set(uint32_t i, const char *name, void *p, int32_t lo, int32_t hi, uint32_t fmt, uint32_t step)
@@ -1529,7 +1530,7 @@ static void knobs_for(uint32_t pg, uint32_t sb, uint32_t bk)
         kn_set(2, "STRETCH", &P.stretch, -30, 60, F_STR, 1); kn_set(3, "LEVEL", &P.level, 0, 127, F_PCT, 1);
     } else if (pg == PG_GRID) {
         gpar_t *g = &P.g[sb & 1u];
-        if (!bk) { kn_set(0, "RULE", &g->rule, 0, 255, F_INT, 1);
+        if (!bk) { kn_set(0, "RULE", &g->rule, 0, 255, F_RULE, 1);
                    kn_set(1, "RATE", (sb & 1u) && P.lock ? &P.g[0].rate : &g->rate, 0, 127, F_GRATE,
                           (!(sb & 1u) || P.lock) && P.clk_midi ? 16u : 2u);   /* (lockstep: B's turns A's; MIDI: a division a step) */
                    kn_set(2, "MUTATE", &g->mut, 0, 30, F_MUT, 1); kn_set(3, "SHARE", &P.gmode, 0, NGM - 1, F_GMODE, 1); }
@@ -1685,6 +1686,7 @@ static void kn_text(char *s, const kn_t *k, uint32_t pathk)
     case F_STAGES: s_int(s, v * 2); break;
     case F_DMS: s_int(s, LUT_DMS[v & 127]); s_cat(s, "MS"); break;
     case F_ORDER: { static const char *const OR[6] = {"P D R", "P R D", "D P R", "D R P", "R P D", "R D P"}; s_cat(s, OR[v % 6]); } break;
+    case F_RULE: s_int(s, v); if (E.g[sub & 1u].rule != (uint8_t)v) { s_cat(s, ">"); s_int(s, E.g[sub & 1u].rule); } break;   /* (moved by the matrix) */
     case F_KRATE: if (v <= 10) { s_cat(s, P.clk_midi ? "MIDI/" : "MAST/"); s_int(s, DIVS[10 - v]); }
                   else { uint32_t x = Q_GRID_X100[(v - 11) & 127]; s_dec(s, x, 100u, x < 1000u ? 2u : 1u); s_cat(s, "/S"); } break;
     case F_CRUSH: if (!v) s_cat(s, "OFF"); else { s_int(s, v); s_cat(s, "B"); } break;
@@ -2688,14 +2690,14 @@ static void randomize(void)
     else { pin(S_QUAD(0), D_PANA, rnd_in(20, 50)); pin(S_QUAD(2), D_PANB, rnd_in(20, 50)); }
     if (rnd(3)) P.dep[S_FG(rnd(NFG))][D_LVL] = (int8_t)-rnd_in(8, 25);   /* (down from full: a swell) */
     for (n = (uint32_t)rnd_in(1, 5); n; n--) {
-        static const uint8_t DD[] = {D_TILT, D_FILTA, D_FILTB, D_PANA, D_PANB, D_SPLIT, D_STR, D_MUTA, D_MUTB, D_SPDA, D_SPDB,
+        static const uint8_t DD[] = {D_TILT, D_FILTA, D_FILTB, D_PANA, D_PANB, D_SPLIT, D_STR, D_SPDA, D_SPDB,
                                      D_RVD, D_PHL, D_PHR, D_FG1, D_FG2, D_FG3, D_FG4, D_QRATE};
         uint32_t dst = DD[rnd(sizeof DD)];
         pin(rnd_src_slow(), dst, dst == D_STR ? rnd_in(3, 10) : rnd_in(8, 35));
     }
     if (rnd_wild) {                             /* RANDOM by hand: the strikes, the logic, melodies, the sequencers */
         static const uint8_t ANY[] = {D_TILT, D_STR, D_SPLIT, D_FILTA, D_FILTB, D_PANA, D_PANB, D_K1PART, D_K1VEL, D_K1SHP,
-                                      D_K2PART, D_K2VEL, D_K2SHP, D_MUTA, D_MUTB, D_SPDA, D_SPDB, D_FG1, D_FG2, D_FG3, D_FG4,
+                                      D_K2PART, D_K2VEL, D_K2SHP, D_RULA, D_RULB, D_SPDA, D_SPDB, D_FG1, D_FG2, D_FG3, D_FG4,
                                       D_QRATE, D_PHL, D_PHR, D_DLT, D_DLF, D_RVD, D_RVR};
         for (k = 0; k < NGEN; k++) {            /* 1: the logic: cells, clocks, each other, gated by LFOs */
             gen_t *g = &P.gen[k];
