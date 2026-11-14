@@ -77,3 +77,5 @@ Arcturus S6 by Zeptosecond DSP. Built on [Dinghy](https://github.com/zvenson/din
 [SLOOP](https://github.com/isod89/sloop-fm1) (isod89) carries it, with the SMK-37 layer by M. Geisler (genkigenki)
 and the loader's screen after [Skiff](https://github.com/illuminus5/skiff) (illuminus5). The screen font is
 font8x8 by Daniel Hepper (public domain). Not made or endorsed by M-VAVE.
+
+You can also try Arcturus S6 in the browser, no flashing needed, in the free community [FM-1 Emulator](https://fm1-emulator.atst.tools/).
